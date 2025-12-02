@@ -1,5 +1,4 @@
 // Wisp Language Showcase
-
 import "../std/io"
 
 // Data Structures
