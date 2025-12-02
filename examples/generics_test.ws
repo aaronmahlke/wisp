@@ -20,8 +20,19 @@ struct Pair<T> {
     second: T,
 }
 
+fn print_result(label: str, value: i32) {
+    print(&label);
+    print(&value);
+    println();
+}
+
+fn print_line(s: str) {
+    print(&s);
+    println();
+}
+
 fn main() -> i32 {
-    print_line("=== Generics Test ===")
+    print_line("=== Generics Test ===");
     
     // Test identity with different types
     let x = identity(42);
@@ -42,12 +53,6 @@ fn main() -> i32 {
     print_result("identity(identity(5)) = ", c);
     
     println();
-    print_line("=== All generics tests passed! ===")
+    print_line("=== All generics tests passed! ===");
     0
-}
-
-fn print_result(label: String, value: i32) {
-    print(label);
-    print_i32(value);
-    println();
 }

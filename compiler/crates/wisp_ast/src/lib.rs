@@ -180,8 +180,8 @@ pub enum ExprKind {
     Binary(Box<Expr>, BinOp, Box<Expr>),
     /// Unary operation: -x, !x
     Unary(UnaryOp, Box<Expr>),
-    /// Function call: foo(a, b)
-    Call(Box<Expr>, Vec<Expr>),
+    /// Function call: foo(a, b) or foo(x: a, y: b)
+    Call(Box<Expr>, Vec<CallArg>),
     /// Field access: foo.bar
     Field(Box<Expr>, Ident),
     /// Struct literal: Point { x: 1, y: 2 }
@@ -244,6 +244,38 @@ pub struct FieldInit {
     pub name: Ident,
     pub value: Expr,
     pub span: Span,
+}
+
+/// Function call argument - can be positional or named
+#[derive(Debug, Clone)]
+pub struct CallArg {
+    /// If Some, this is a named argument (name: value)
+    pub name: Option<Ident>,
+    pub value: Expr,
+    pub span: Span,
+}
+
+impl CallArg {
+    /// Pretty print with indentation for full AST display
+    pub fn pretty_print_indented(&self, indent: usize) -> String {
+        let ind = "  ".repeat(indent);
+        if let Some(name) = &self.name {
+            let mut out = format!("{}NamedArg({}):\n", ind, name.name);
+            out.push_str(&self.value.pretty_print_indented(indent + 1));
+            out
+        } else {
+            self.value.pretty_print_indented(indent)
+        }
+    }
+    
+    /// Compact pretty print (for inline display)
+    pub fn pretty_print(&self) -> String {
+        if let Some(name) = &self.name {
+            format!("{}: {}", name.name, self.value.pretty_print())
+        } else {
+            self.value.pretty_print()
+        }
+    }
 }
 
 /// Binary operators

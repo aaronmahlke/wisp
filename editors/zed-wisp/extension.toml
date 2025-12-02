@@ -7,10 +7,14 @@ description = "Wisp language support"
 repository = "https://github.com/aaronmahlke/wisp"
 languages = ["languages/wisp"]
 
+[lib]
+kind = "Rust"
+version = "0.5.0"
+
 [grammars.wisp]
 repository = "https://github.com/aaronmahlke/wisp"
 path = "tree-sitter-wisp"
-rev = "f03593d3595fe08e7101d4e0a6688e77a632701a"
+rev = "d7bd6c77356b36ed57228373f6c72e61efcd8aea"
 
 [language_servers.wisp-lsp]
 language = "Wisp"

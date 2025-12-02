@@ -273,6 +273,22 @@ impl<'a> BorrowChecker<'a> {
                 }
             }
 
+            TypedExprKind::AssociatedFunctionCall { args, .. } => {
+                // Check all arguments
+                for arg in args {
+                    self.check_expr(arg);
+                    self.check_move_or_copy(arg);
+                }
+            }
+
+            TypedExprKind::PrimitiveMethodCall { receiver, args, .. } => {
+                self.check_expr(receiver);
+                for arg in args {
+                    self.check_expr(arg);
+                    self.check_move_or_copy(arg);
+                }
+            }
+
             TypedExprKind::Error => {}
         }
     }

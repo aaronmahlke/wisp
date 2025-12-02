@@ -17,28 +17,36 @@ struct Number {
 // Implement Printable for Point
 impl Printable for Point {
     fn print_value(&self) {
-        print("Point(");
-        print_i32(self.x);
-        print(", ");
-        print_i32(self.y);
-        print(")");
+        let x = self.x;
+        let y = self.y;
+        print(&"Point(");
+        print(&x);
+        print(&", ");
+        print(&y);
+        print(&")");
     }
 }
 
 // Implement Printable for Number
 impl Printable for Number {
     fn print_value(&self) {
-        print("Number(");
-        print_i32(self.value);
-        print(")");
+        let v = self.value;
+        print(&"Number(");
+        print(&v);
+        print(&")");
     }
 }
 
 // Generic function with trait bound
 fn print_twice<T: Printable>(x: &T) {
     x.print_value();
-    print(" and ");
+    print(&" and ");
     x.print_value();
+    println();
+}
+
+fn print_line(s: str) {
+    print(&s);
     println();
 }
 
@@ -48,10 +56,10 @@ fn main() -> i32 {
     let p = Point { x: 3, y: 4 };
     let n = Number { value: 42 };
 
-    print("Printing Point twice: ");
+    print(&"Printing Point twice: ");
     print_twice(&p);
 
-    print("Printing Number twice: ");
+    print(&"Printing Number twice: ");
     print_twice(&n);
 
     print_line("=== Done! ===");

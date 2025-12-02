@@ -1,13 +1,28 @@
-// Test string support
-
 import "../std/io"
+import "../std/string"
 
 fn main() -> i32 {
-    print_str("Hello, Wisp!")
-    print_str("This is a string test.")
-    print_str("Numbers work too:")
-    print_i32(42)
-    println()
+    print_line("=== String Test ===");
+    
+    // Create a String from a str literal
+    let s = String.from("Hello, World!");
+    
+    print("Length: ");
+    print_i64(s.len());
+    println();
+    
+    print("Is empty: ");
+    if s.is_empty() {
+        print("yes");
+    } else {
+        print("no");
+    }
+    println();
+    
+    // Clean up
+    s.drop();
+    
+    print_line("=== Done! ===");
     0
 }
 

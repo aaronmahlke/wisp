@@ -849,11 +849,58 @@ impl<'src> Parser<'src> {
         Ok(expr)
     }
 
-    fn parse_arg_list(&mut self) -> ParseResult<Vec<Expr>> {
+    fn parse_arg_list(&mut self) -> ParseResult<Vec<CallArg>> {
         let mut args = Vec::new();
+        let mut seen_named = false;
         
         while !self.check(&Token::RParen) && !self.is_at_end() {
-            args.push(self.parse_expr()?);
+            let start = self.peek_span();
+            
+            // Check if this is a named argument: ident ':'
+            let (name, value) = if let Token::Ident(id) = self.peek().clone() {
+                // Peek ahead to see if there's a colon
+                let current_pos = self.pos;
+                self.advance();
+                
+                if self.check(&Token::Colon) {
+                    // This is a named argument
+                    self.advance(); // consume ':'
+                    seen_named = true;
+                    let name = Ident { name: id, span: start };
+                    let value = self.parse_expr()?;
+                    (Some(name), value)
+                } else {
+                    // Not a named argument, backtrack
+                    self.pos = current_pos;
+                    
+                    if seen_named {
+                        return Err(ParseError {
+                            message: "positional arguments cannot follow named arguments".to_string(),
+                            span: start,
+                        });
+                    }
+                    
+                    let value = self.parse_expr()?;
+                    (None, value)
+                }
+            } else {
+                if seen_named {
+                    return Err(ParseError {
+                        message: "positional arguments cannot follow named arguments".to_string(),
+                        span: start,
+                    });
+                }
+                
+                let value = self.parse_expr()?;
+                (None, value)
+            };
+            
+            let end = value.span.end;
+            args.push(CallArg {
+                name,
+                value,
+                span: Span::new(start.start, end),
+            });
             
             if !self.check(&Token::RParen) {
                 self.expect(Token::Comma)?;

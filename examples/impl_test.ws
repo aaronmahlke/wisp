@@ -15,11 +15,13 @@ impl Point {
     }
     
     fn print_point(&self) {
-        print("(");
-        print_i32(self.x);
-        print(", ");
-        print_i32(self.y);
-        print(")");
+        let x = self.x;
+        let y = self.y;
+        print(&"(");
+        print(&x);
+        print(&", ");
+        print(&y);
+        print(&")");
     }
 }
 
@@ -28,21 +30,21 @@ fn main() -> i32 {
     let p2 = Point { x: 1, y: 2 };
     
     // Method calls: expr.method(args)
-    print("p1 = ");
+    print(&"p1 = ");
     p1.print_point();
     println();
     
-    print("p2 = ");
+    print(&"p2 = ");
     p2.print_point();
     println();
     
     let p3 = p1.add(&p2);
-    print("p1 + p2 = ");
+    print(&"p1 + p2 = ");
     p3.print_point();
     println();
     
     let p4 = p1.scale(2);
-    print("p1 * 2 = ");
+    print(&"p1 * 2 = ");
     p4.print_point();
     println();
     

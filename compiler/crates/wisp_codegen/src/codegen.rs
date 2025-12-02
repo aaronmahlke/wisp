@@ -399,8 +399,7 @@ impl Codegen {
             Type::F64 => types::F64,
             Type::Bool => types::I8,
             Type::Char => types::I32,
-            Type::String => types::I64, // String is a pointer
-            Type::Str => types::I64, // &str is a pointer
+            Type::Str => types::I64, // str is a pointer to C string
             Type::Unit => types::INVALID, // Unit is zero-sized
             Type::Ref { .. } => types::I64, // Pointers are 64-bit
             Type::Struct(_) => types::I64, // Structs passed as pointers for now
@@ -634,7 +633,7 @@ impl<'a, 'b> FunctionCompiler<'a, 'b> {
             Type::I8 | Type::U8 | Type::Bool => 1,
             Type::I16 | Type::U16 => 2,
             Type::I32 | Type::U32 | Type::Char | Type::F32 => 4,
-            Type::I64 | Type::U64 | Type::F64 | Type::Ref { .. } | Type::String | Type::Str => 8,
+            Type::I64 | Type::U64 | Type::F64 | Type::Ref { .. } | Type::Str => 8,
             Type::Struct(def_id) => {
                 if let Some(s) = self.structs.get(def_id) {
                     self.struct_size(s)
@@ -812,9 +811,74 @@ impl<'a, 'b> FunctionCompiler<'a, 'b> {
             }
 
             Rvalue::Ref { place, .. } => {
-                // For now, just return the variable's value
-                // A real implementation would compute the address
-                self.load_from_place(place)
+                // Compute the address of the place
+                // For locals, we use stack_addr; for struct fields, we compute the offset
+                if let Some(&(slot, def_id)) = self.struct_slots.get(&place.local) {
+                    // Reference to a struct or struct field
+                    if place.projections.is_empty() {
+                        // Reference to the whole struct
+                        let addr = self.builder.ins().stack_addr(types::I64, slot, 0);
+                        Ok(Some(addr))
+                    } else {
+                        // Reference to a struct field
+                        if let Some(mir_struct) = self.structs.get(&def_id) {
+                            for proj in &place.projections {
+                                if let PlaceProjection::Field(idx, _) = proj {
+                                    let offset = self.field_offset(mir_struct, *idx);
+                                    let addr = self.builder.ins().stack_addr(types::I64, slot, offset as i32);
+                                    return Ok(Some(addr));
+                                }
+                            }
+                        }
+                        Ok(None)
+                    }
+                } else if let Some(&var) = self.locals.get(&place.local) {
+                    // Check if this is a reference to a struct field through a pointer
+                    if !place.projections.is_empty() {
+                        // Find the local's type to check if it's a reference to a struct
+                        let local_ty = self.mir_func.params.iter()
+                            .find(|p| p.id == place.local)
+                            .map(|p| &p.ty)
+                            .or_else(|| self.mir_func.locals.iter().find(|l| l.id == place.local).map(|l| &l.ty));
+                        
+                        if let Some(Type::Ref { inner, .. }) = local_ty {
+                            if let Type::Struct(def_id) = inner.as_ref() {
+                                if let Some(mir_struct) = self.structs.get(def_id) {
+                                    // Get the pointer from the variable
+                                    let ptr = self.builder.use_var(var);
+                                    
+                                    // Handle field projections
+                                    for proj in &place.projections {
+                                        if let PlaceProjection::Field(idx, _) = proj {
+                                            let offset = self.field_offset(mir_struct, *idx);
+                                            // Compute address of field within the struct
+                                            let field_addr = self.builder.ins().iadd_imm(ptr, offset as i64);
+                                            return Ok(Some(field_addr));
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    
+                    // Reference to a scalar local - need to spill to stack first
+                    // Create a stack slot, store the value, and return its address
+                    let val = self.builder.use_var(var);
+                    let val_ty = self.builder.func.dfg.value_type(val);
+                    let size = val_ty.bytes();
+                    let slot = self.builder.create_sized_stack_slot(
+                        cranelift_codegen::ir::StackSlotData::new(
+                            cranelift_codegen::ir::StackSlotKind::ExplicitSlot,
+                            size,
+                            0, // default alignment
+                        )
+                    );
+                    self.builder.ins().stack_store(val, slot, 0);
+                    let addr = self.builder.ins().stack_addr(types::I64, slot, 0);
+                    Ok(Some(addr))
+                } else {
+                    Ok(None)
+                }
             }
 
             Rvalue::Aggregate { operands, .. } => {
@@ -925,18 +989,30 @@ impl<'a, 'b> FunctionCompiler<'a, 'b> {
                     .or_else(|| self.mir_func.locals.iter().find(|l| l.id == place.local).map(|l| &l.ty));
                 
                 if let Some(Type::Ref { inner, .. }) = local_ty {
-                    if let Type::Struct(def_id) = inner.as_ref() {
-                        if let Some(mir_struct) = self.structs.get(def_id) {
-                            // Get the pointer from the variable
-                            let ptr = self.builder.use_var(var);
-                            
-                            // Handle field projections
+                    // Get the pointer from the variable
+                    let ptr = self.builder.use_var(var);
+                    
+                    match inner.as_ref() {
+                        Type::Struct(def_id) => {
+                            if let Some(mir_struct) = self.structs.get(def_id) {
+                                // Handle field projections on struct references
+                                for proj in &place.projections {
+                                    if let PlaceProjection::Field(idx, _) = proj {
+                                        let offset = self.field_offset(mir_struct, *idx);
+                                        let field_ty = &mir_struct.fields[*idx].1;
+                                        let cl_ty = self.convert_type(field_ty);
+                                        let val = self.builder.ins().load(cl_ty, cranelift_codegen::ir::MemFlags::new(), ptr, offset as i32);
+                                        return Ok(Some(val));
+                                    }
+                                }
+                            }
+                        }
+                        _ => {
+                            // Handle dereference of primitive references
                             for proj in &place.projections {
-                                if let PlaceProjection::Field(idx, _) = proj {
-                                    let offset = self.field_offset(mir_struct, *idx);
-                                    let field_ty = &mir_struct.fields[*idx].1;
-                                    let cl_ty = self.convert_type(field_ty);
-                                    let val = self.builder.ins().load(cl_ty, cranelift_codegen::ir::MemFlags::new(), ptr, offset as i32);
+                                if let PlaceProjection::Deref = proj {
+                                    let inner_ty = self.convert_type(inner);
+                                    let val = self.builder.ins().load(inner_ty, cranelift_codegen::ir::MemFlags::new(), ptr, 0);
                                     return Ok(Some(val));
                                 }
                             }
@@ -1057,25 +1133,33 @@ impl<'a, 'b> FunctionCompiler<'a, 'b> {
                     Operand::Constant(Constant::TraitMethodCall { receiver_type, method_name, .. }) => {
                         // Resolve the trait method to a concrete implementation
                         // The method is mangled as "TypeName::method_name"
-                        // Unwrap references to get the underlying struct type
-                        let struct_def_id = match receiver_type {
-                            Type::Struct(def_id) => Some(*def_id),
-                            Type::Ref { inner, .. } => {
-                                if let Type::Struct(def_id) = inner.as_ref() {
-                                    Some(*def_id)
-                                } else {
-                                    None
-                                }
-                            }
+                        // Unwrap references to get the underlying type
+                        let inner_type = match receiver_type {
+                            Type::Ref { inner, .. } => inner.as_ref(),
+                            other => other,
+                        };
+                        
+                        // Get the type name for mangling
+                        let type_name = match inner_type {
+                            Type::Struct(def_id) => self.struct_names.get(def_id).cloned(),
+                            Type::I8 => Some("i8".to_string()),
+                            Type::I16 => Some("i16".to_string()),
+                            Type::I32 => Some("i32".to_string()),
+                            Type::I64 => Some("i64".to_string()),
+                            Type::U8 => Some("u8".to_string()),
+                            Type::U16 => Some("u16".to_string()),
+                            Type::U32 => Some("u32".to_string()),
+                            Type::U64 => Some("u64".to_string()),
+                            Type::F32 => Some("f32".to_string()),
+                            Type::F64 => Some("f64".to_string()),
+                            Type::Bool => Some("bool".to_string()),
+                            Type::Str => Some("str".to_string()),
                             _ => None,
                         };
-                        if let Some(def_id) = struct_def_id {
-                            if let Some(type_name) = self.struct_names.get(&def_id) {
-                                let mangled = format!("{}::{}", type_name, method_name);
-                                (None, Some(mangled))
-                            } else {
-                                (None, None)
-                            }
+                        
+                        if let Some(name) = type_name {
+                            let mangled = format!("{}::{}", name, method_name);
+                            (None, Some(mangled))
                         } else {
                             (None, None)
                         }

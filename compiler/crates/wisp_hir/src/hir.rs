@@ -359,7 +359,7 @@ pub enum ResolvedExprKind {
     /// Function/method call
     Call {
         callee: Box<ResolvedExpr>,
-        args: Vec<ResolvedExpr>,
+        args: Vec<ResolvedCallArg>,
     },
     
     /// Field access
@@ -420,6 +420,15 @@ pub enum ResolvedExprKind {
     
     /// Error (for recovery)
     Error,
+}
+
+/// Resolved function call argument
+#[derive(Debug, Clone)]
+pub struct ResolvedCallArg {
+    /// If Some, this is a named argument
+    pub name: Option<String>,
+    pub value: ResolvedExpr,
+    pub span: Span,
 }
 
 /// Resolved else branch

@@ -386,15 +386,22 @@ impl Resolver {
             self.self_type = Some(*id);
             Some(*id)
         } else {
+            // For primitive types, we still need to mark methods as methods
+            // We use a sentinel value to indicate "this is a method but for a primitive"
             None
         };
+        
+        // For primitive types, we still need methods to get their own DefIds
+        // We pass true to indicate this is an impl block context
+        let is_impl_context = true;
         
         self.push_scope();
         
         let mut methods = Vec::new();
         for method in &i.methods {
             // Pass the impl target as parent so methods get their own DefId
-            if let Some(resolved) = self.resolve_function(method, impl_target_id) {
+            // For primitives (impl_target_id = None), we still want to create methods
+            if let Some(resolved) = self.resolve_impl_method(method, impl_target_id, is_impl_context) {
                 methods.push(resolved);
             }
         }
@@ -404,9 +411,102 @@ impl Resolver {
 
         Some(ResolvedImpl {
             trait_def,
-            target_type,
+            target_type: target_type.clone(),
             methods,
             span: i.span,
+        })
+    }
+
+    /// Resolve a method inside an impl block (always creates a new DefId)
+    fn resolve_impl_method(&mut self, f: &FnDef, parent: Option<DefId>, _is_impl_context: bool) -> Option<ResolvedFunction> {
+        // Always create a new DefId for impl methods (even for primitives)
+        let def_id = {
+            let id = self.fresh_id();
+            let info = DefInfo {
+                id,
+                name: f.name.name.clone(),
+                kind: DefKind::Method,
+                span: f.span,
+                parent,
+            };
+            self.defs.insert(id, info);
+            id
+        };
+        
+        self.push_scope();
+        self.current_locals.clear();
+        
+        // Add type parameters to scope and collect them
+        let mut type_params = Vec::new();
+        for type_param in &f.type_params {
+            let param_id = self.fresh_id();
+            let param_info = DefInfo {
+                id: param_id,
+                name: type_param.name.name.clone(),
+                kind: DefKind::TypeParam,
+                span: type_param.span,
+                parent: Some(def_id),
+            };
+            self.defs.insert(param_id, param_info);
+            self.scope.define(type_param.name.name.clone(), param_id);
+            
+            // Resolve bounds
+            let mut bounds = Vec::new();
+            for bound in &type_param.bounds {
+                let bound_type = self.resolve_type(bound);
+                bounds.push(bound_type);
+            }
+            
+            type_params.push(ResolvedTypeParam {
+                def_id: param_id,
+                name: type_param.name.name.clone(),
+                bounds,
+                span: type_param.span,
+            });
+        }
+        
+        // Resolve parameters
+        let mut params = Vec::new();
+        for p in &f.params {
+            let param_def_id = self.fresh_id();
+            let info = DefInfo {
+                id: param_def_id,
+                name: p.name.name.clone(),
+                kind: DefKind::Local,
+                span: p.name.span,
+                parent: Some(def_id),
+            };
+            self.defs.insert(param_def_id, info.clone());
+            self.scope.define(p.name.name.clone(), param_def_id);
+            self.current_locals.push(param_def_id);
+            
+            params.push(ResolvedParam {
+                def_id: param_def_id,
+                name: p.name.name.clone(),
+                ty: self.resolve_type(&p.ty),
+                is_mut: p.is_mut,
+                span: p.span,
+            });
+        }
+        
+        let return_type = f.return_type.as_ref()
+            .map(|t| self.resolve_type(t));
+        
+        let body = f.body.as_ref().map(|b| self.resolve_block(b));
+        
+        let locals = self.current_locals.clone();
+        
+        self.pop_scope();
+        
+        Some(ResolvedFunction {
+            def_id,
+            name: f.name.name.clone(),
+            type_params,
+            params,
+            return_type,
+            body,
+            locals,
+            span: f.span,
         })
     }
 
@@ -565,7 +665,16 @@ impl Resolver {
                     return ResolvedType::SelfType;
                 }
                 
-                // Check for primitives
+                // Look up user-defined type first (allows shadowing primitives like String)
+                if let Some(def_id) = self.lookup(name) {
+                    return ResolvedType::Named {
+                        name: name.clone(),
+                        def_id: Some(def_id),
+                        type_args: resolved_args,
+                    };
+                }
+                
+                // Fall back to primitives
                 if is_primitive(name) {
                     return ResolvedType::Named {
                         name: name.clone(),
@@ -574,18 +683,9 @@ impl Resolver {
                     };
                 }
                 
-                // Look up user-defined type
-                match self.lookup(name) {
-                    Some(def_id) => ResolvedType::Named {
-                        name: name.clone(),
-                        def_id: Some(def_id),
-                        type_args: resolved_args,
-                    },
-                    None => {
-                        self.error(format!("undefined type '{}'", name), ident.span);
-                        ResolvedType::Error
-                    }
-                }
+                // Unknown type
+                self.error(format!("undefined type '{}'", name), ident.span);
+                ResolvedType::Error
             }
             TypeKind::Ref(is_mut, inner) => {
                 let inner_resolved = self.resolve_type(inner);
@@ -692,7 +792,11 @@ impl Resolver {
             ExprKind::Call(callee, args) => {
                 ResolvedExprKind::Call {
                     callee: Box::new(self.resolve_expr(callee)),
-                    args: args.iter().map(|a| self.resolve_expr(a)).collect(),
+                    args: args.iter().map(|a| ResolvedCallArg {
+                        name: a.name.as_ref().map(|n| n.name.clone()),
+                        value: self.resolve_expr(&a.value),
+                        span: a.span,
+                    }).collect(),
                 }
             }
             
@@ -876,7 +980,7 @@ fn is_primitive(name: &str) -> bool {
         "i8" | "i16" | "i32" | "i64" | "i128" |
         "u8" | "u16" | "u32" | "u64" | "u128" |
         "f32" | "f64" |
-        "bool" | "char" | "str" | "String"
+        "bool" | "char" | "str"
     )
 }
 

@@ -75,7 +75,6 @@ fn mangle_type(ty: &Type) -> String {
         Type::F64 => "f64".to_string(),
         Type::Bool => "bool".to_string(),
         Type::Char => "char".to_string(),
-        Type::String => "String".to_string(),
         Type::Str => "str".to_string(),
         Type::Unit => "unit".to_string(),
         Type::Never => "never".to_string(),
@@ -199,6 +198,19 @@ fn get_type_name(ty: &Type, ctx: &TypeContext) -> String {
         Type::Enum(def_id) => {
             ctx.get_type_name(*def_id).unwrap_or_else(|| format!("enum_{}", def_id.0))
         }
+        // Primitive types
+        Type::I8 => "i8".to_string(),
+        Type::I16 => "i16".to_string(),
+        Type::I32 => "i32".to_string(),
+        Type::I64 => "i64".to_string(),
+        Type::U8 => "u8".to_string(),
+        Type::U16 => "u16".to_string(),
+        Type::U32 => "u32".to_string(),
+        Type::U64 => "u64".to_string(),
+        Type::F32 => "f32".to_string(),
+        Type::F64 => "f64".to_string(),
+        Type::Bool => "bool".to_string(),
+        Type::Str => "str".to_string(),
         _ => format!("{:?}", ty),
     }
 }
@@ -625,6 +637,95 @@ impl<'a> FunctionLowerer<'a> {
                 Operand::Copy(Place::local(temp))
             }
             
+            TypedExprKind::AssociatedFunctionCall { type_id: _, function: _, function_def_id, args } => {
+                // Lower all arguments (no receiver/self for associated functions)
+                let arg_ops: Vec<_> = args.iter().map(|a| self.lower_expr(a)).collect();
+                
+                // Get function name
+                let fn_name = self.ctx.get_type_name(*function_def_id).unwrap_or_default();
+                let func_op = Operand::Constant(Constant::FnPtr(*function_def_id, fn_name));
+                
+                let temp = self.new_temp(expr.ty.clone());
+                
+                // Create continuation block
+                let cont_block = self.new_block();
+                
+                self.terminate(Terminator::Call {
+                    func: func_op,
+                    args: arg_ops,
+                    destination: Place::local(temp),
+                    target: cont_block,
+                });
+                
+                self.switch_to_block(cont_block);
+                Operand::Copy(Place::local(temp))
+            }
+
+            TypedExprKind::PrimitiveMethodCall { receiver, method: _, method_def_id, args } => {
+                // Lower the receiver
+                let receiver_op = self.lower_expr(receiver);
+                
+                // Check if receiver is already a reference type
+                let receiver_ref = if matches!(&receiver.ty, Type::Ref { .. }) {
+                    // Already a reference, use it directly
+                    receiver_op
+                } else {
+                    // Create a reference to the receiver for &self parameter
+                    match receiver_op {
+                        Operand::Copy(place) | Operand::Move(place) => {
+                            let ref_ty = Type::Ref { 
+                                is_mut: false, 
+                                inner: Box::new(receiver.ty.clone()) 
+                            };
+                            let ref_temp = self.new_temp(ref_ty);
+                            self.assign(
+                                Place::local(ref_temp),
+                                Rvalue::Ref { is_mut: false, place }
+                            );
+                            Operand::Copy(Place::local(ref_temp))
+                        }
+                        Operand::Constant(_) => {
+                            // Constants can't be referenced directly - store to temp first
+                            let temp = self.new_temp(receiver.ty.clone());
+                            self.assign(Place::local(temp), Rvalue::Use(receiver_op));
+                            let ref_ty = Type::Ref { 
+                                is_mut: false, 
+                                inner: Box::new(receiver.ty.clone()) 
+                            };
+                            let ref_temp = self.new_temp(ref_ty);
+                            self.assign(
+                                Place::local(ref_temp),
+                                Rvalue::Ref { is_mut: false, place: Place::local(temp) }
+                            );
+                            Operand::Copy(Place::local(ref_temp))
+                        }
+                    }
+                };
+                
+                // Lower the other arguments
+                let mut arg_ops: Vec<_> = vec![receiver_ref];
+                arg_ops.extend(args.iter().map(|a| self.lower_expr(a)));
+                
+                // Get method name for the function reference
+                let method_name = self.ctx.get_type_name(*method_def_id).unwrap_or_default();
+                let func_op = Operand::Constant(Constant::FnPtr(*method_def_id, method_name));
+
+                let temp = self.new_temp(expr.ty.clone());
+                
+                // Create continuation block
+                let cont_block = self.new_block();
+                
+                self.terminate(Terminator::Call {
+                    func: func_op,
+                    args: arg_ops,
+                    destination: Place::local(temp),
+                    target: cont_block,
+                });
+
+                self.switch_to_block(cont_block);
+                Operand::Copy(Place::local(temp))
+            }
+
             TypedExprKind::TraitMethodCall { receiver, method, trait_bounds, args } => {
                 // For trait method calls on type parameters, we need to resolve the actual
                 // method based on the concrete type. During monomorphization, the receiver's
@@ -636,33 +737,39 @@ impl<'a> FunctionLowerer<'a> {
                 // Get the receiver's concrete type (after substitution)
                 let receiver_ty = self.subst_type(&receiver.ty);
                 
-                // Create a reference to the receiver for &self parameter
-                let receiver_ref = match receiver_op {
-                    Operand::Copy(place) | Operand::Move(place) => {
-                        let ref_ty = Type::Ref { 
-                            is_mut: false, 
-                            inner: Box::new(receiver_ty.clone()) 
-                        };
-                        let ref_temp = self.new_temp(ref_ty);
-                        self.assign(
-                            Place::local(ref_temp),
-                            Rvalue::Ref { is_mut: false, place }
-                        );
-                        Operand::Copy(Place::local(ref_temp))
-                    }
-                    Operand::Constant(_) => {
-                        let temp = self.new_temp(receiver_ty.clone());
-                        self.assign(Place::local(temp), Rvalue::Use(receiver_op));
-                        let ref_ty = Type::Ref { 
-                            is_mut: false, 
-                            inner: Box::new(receiver_ty.clone()) 
-                        };
-                        let ref_temp = self.new_temp(ref_ty);
-                        self.assign(
-                            Place::local(ref_temp),
-                            Rvalue::Ref { is_mut: false, place: Place::local(temp) }
-                        );
-                        Operand::Copy(Place::local(ref_temp))
+                // Check if receiver is already a reference type
+                let receiver_ref = if matches!(&receiver_ty, Type::Ref { .. }) {
+                    // Already a reference, use it directly
+                    receiver_op
+                } else {
+                    // Create a reference to the receiver for &self parameter
+                    match receiver_op {
+                        Operand::Copy(place) | Operand::Move(place) => {
+                            let ref_ty = Type::Ref { 
+                                is_mut: false, 
+                                inner: Box::new(receiver_ty.clone()) 
+                            };
+                            let ref_temp = self.new_temp(ref_ty);
+                            self.assign(
+                                Place::local(ref_temp),
+                                Rvalue::Ref { is_mut: false, place }
+                            );
+                            Operand::Copy(Place::local(ref_temp))
+                        }
+                        Operand::Constant(_) => {
+                            let temp = self.new_temp(receiver_ty.clone());
+                            self.assign(Place::local(temp), Rvalue::Use(receiver_op));
+                            let ref_ty = Type::Ref { 
+                                is_mut: false, 
+                                inner: Box::new(receiver_ty.clone()) 
+                            };
+                            let ref_temp = self.new_temp(ref_ty);
+                            self.assign(
+                                Place::local(ref_temp),
+                                Rvalue::Ref { is_mut: false, place: Place::local(temp) }
+                            );
+                            Operand::Copy(Place::local(ref_temp))
+                        }
                     }
                 };
                 

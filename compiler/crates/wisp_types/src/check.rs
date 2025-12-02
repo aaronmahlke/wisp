@@ -57,6 +57,14 @@ pub struct TypeChecker {
     trait_methods: HashMap<DefId, Vec<(String, Type)>>,
     /// Trait implementations: (type DefId, trait DefId) -> impl methods
     trait_impls: HashMap<(DefId, DefId), Vec<(String, DefId, Type)>>,
+    /// Function parameter names: function DefId -> [param names]
+    function_param_names: HashMap<DefId, Vec<String>>,
+    /// Associated functions (no self): (struct DefId, fn name) -> (fn DefId, fn type)
+    associated_functions: HashMap<(DefId, String), (DefId, Type)>,
+    /// Methods on primitive types: (primitive type name, method name) -> (method DefId, method type)
+    primitive_methods: HashMap<(String, String), (DefId, Type)>,
+    /// Trait implementations for primitives: (primitive type name, trait DefId) -> true
+    primitive_trait_impls: HashSet<(String, DefId)>,
 }
 
 impl TypeChecker {
@@ -72,6 +80,10 @@ impl TypeChecker {
             generic_functions: HashMap::new(),
             trait_methods: HashMap::new(),
             trait_impls: HashMap::new(),
+            function_param_names: HashMap::new(),
+            associated_functions: HashMap::new(),
+            primitive_methods: HashMap::new(),
+            primitive_trait_impls: HashSet::new(),
         }
     }
 
@@ -150,6 +162,10 @@ impl TypeChecker {
             self.ctx.register_def_type(f.def_id, fn_type);
             self.ctx.register_type_name(f.def_id, f.name.clone());
             
+            // Register parameter names for named argument support
+            let param_names: Vec<String> = f.params.iter().map(|p| p.name.clone()).collect();
+            self.function_param_names.insert(f.def_id, param_names);
+            
             // Track generic functions with their bounds
             if !f.type_params.is_empty() {
                 let type_params: Vec<_> = f.type_params.iter()
@@ -176,11 +192,16 @@ impl TypeChecker {
         }
         
         for imp in &program.impls {
-            // Get the struct DefId from the target type
-            let target_struct_id = match &imp.target_type {
-                ResolvedType::Named { def_id: Some(id), .. } => Some(*id),
-                _ => None,
+            // Get the target type info
+            let (target_struct_id, primitive_name) = match &imp.target_type {
+                ResolvedType::Named { name, def_id: Some(id), .. } => (Some(*id), None),
+                ResolvedType::Named { name, def_id: None, .. } => (None, Some(name.clone())), // Primitive type
+                _ => (None, None),
             };
+            
+            // Set current_self_type so function_type can resolve &self correctly
+            let target_type = self.resolve_type(&imp.target_type);
+            self.current_self_type = Some(target_type);
             
             let mut impl_methods = Vec::new();
             
@@ -189,18 +210,42 @@ impl TypeChecker {
                 self.ctx.register_def_type(m.def_id, fn_type.clone());
                 self.ctx.register_type_name(m.def_id, m.name.clone());
                 
-                // Register in method lookup table
+                // Check if this is a method (has self) or associated function (no self)
+                let has_self = m.params.first().map(|p| p.name == "self").unwrap_or(false);
+                
                 if let Some(struct_id) = target_struct_id {
-                    self.methods.insert((struct_id, m.name.clone()), (m.def_id, fn_type.clone()));
+                    if has_self {
+                        // Method: called as instance.method(args)
+                        self.methods.insert((struct_id, m.name.clone()), (m.def_id, fn_type.clone()));
+                    } else {
+                        // Associated function: called as Type.function(args)
+                        self.associated_functions.insert((struct_id, m.name.clone()), (m.def_id, fn_type.clone()));
+                    }
+                } else if let Some(ref prim_name) = primitive_name {
+                    if has_self {
+                        // Method on primitive type
+                        self.primitive_methods.insert((prim_name.clone(), m.name.clone()), (m.def_id, fn_type.clone()));
+                    }
                 }
+                
+                // Register parameter names for named argument support
+                let param_names: Vec<String> = m.params.iter().map(|p| p.name.clone()).collect();
+                self.function_param_names.insert(m.def_id, param_names);
                 
                 impl_methods.push((m.name.clone(), m.def_id, fn_type));
             }
             
             // Register trait implementation
-            if let (Some(trait_def), Some(struct_id)) = (imp.trait_def, target_struct_id) {
-                self.trait_impls.insert((struct_id, trait_def), impl_methods);
+            if let Some(trait_def) = imp.trait_def {
+                if let Some(struct_id) = target_struct_id {
+                    self.trait_impls.insert((struct_id, trait_def), impl_methods);
+                } else if let Some(ref prim_name) = primitive_name {
+                    // Primitive trait impl
+                    self.primitive_trait_impls.insert((prim_name.clone(), trait_def));
+                }
             }
+            
+            self.current_self_type = None;
         }
         
         // Register extern function types
@@ -208,6 +253,10 @@ impl TypeChecker {
             let fn_type = self.extern_function_type(f);
             self.ctx.register_def_type(f.def_id, fn_type);
             self.ctx.register_type_name(f.def_id, f.name.clone());
+            
+            // Register parameter names for named argument support
+            let param_names: Vec<String> = f.params.iter().map(|p| p.name.clone()).collect();
+            self.function_param_names.insert(f.def_id, param_names);
         }
         
         // Register extern static types
@@ -252,6 +301,7 @@ impl TypeChecker {
                     name: p.name.clone(),
                     is_mut: p.is_mut,
                     ty: self.resolve_type(&p.ty),
+                    span: p.span,
                 })
                 .collect();
             let return_type = f.return_type.as_ref()
@@ -384,10 +434,12 @@ impl TypeChecker {
                     name: p.name.clone(),
                     is_mut: p.is_mut,
                     ty: self.resolve_type(&p.ty),
+                    span: p.span,
                 }
             }).collect(),
             return_type,
             body,
+            span: f.span,
         }
     }
 
@@ -465,6 +517,156 @@ impl TypeChecker {
         }
     }
 
+    /// Reorder named arguments to match parameter order
+    /// Returns references to the argument expressions in the correct order
+    fn reorder_named_args<'a>(
+        &mut self,
+        args: &'a [ResolvedCallArg],
+        func_def_id: DefId,
+        span: Span,
+    ) -> Vec<&'a ResolvedExpr> {
+        // Check if any args are named
+        let has_named = args.iter().any(|a| a.name.is_some());
+        
+        if !has_named {
+            // All positional - return in order
+            return args.iter().map(|a| &a.value).collect();
+        }
+        
+        // Get parameter names for this function
+        let param_names = match self.function_param_names.get(&func_def_id) {
+            Some(names) => names.clone(),
+            None => {
+                // No param names registered, use positional
+                return args.iter().map(|a| &a.value).collect();
+            }
+        };
+        
+        // Check if all args are named (no mixing allowed)
+        let has_positional = args.iter().any(|a| a.name.is_none());
+        if has_positional {
+            self.error("cannot mix positional and named arguments".to_string(), span);
+            return args.iter().map(|a| &a.value).collect();
+        }
+        
+        // Build reordered args
+        let mut result: Vec<Option<&'a ResolvedExpr>> = (0..param_names.len()).map(|_| None).collect();
+        let mut used_params: HashSet<String> = HashSet::new();
+        
+        for arg in args {
+            let name = arg.name.as_ref().unwrap();
+            
+            if let Some(idx) = param_names.iter().position(|p| p == name) {
+                if used_params.contains(name) {
+                    self.error(format!("argument '{}' specified more than once", name), arg.span);
+                    continue;
+                }
+                used_params.insert(name.clone());
+                result[idx] = Some(&arg.value);
+            } else {
+                self.error(format!("unknown parameter '{}'", name), arg.span);
+            }
+        }
+        
+        // Check all required parameters are provided
+        for (i, name) in param_names.iter().enumerate() {
+            if result[i].is_none() {
+                self.error(format!("missing argument for parameter '{}'", name), span);
+            }
+        }
+        
+        // Return the reordered args (or original if something went wrong)
+        result.into_iter().filter_map(|o| o).collect()
+    }
+
+    /// Check and reorder function call arguments based on parameter names
+    /// Returns the typed arguments in the correct order, or None if there's an error
+    fn check_call_args(
+        &mut self,
+        args: &[ResolvedCallArg],
+        param_names: &[String],
+        param_types: &[Type],
+        span: Span,
+    ) -> Vec<TypedExpr> {
+        // Check if all args are named or all are positional
+        let has_named = args.iter().any(|a| a.name.is_some());
+        let has_positional = args.iter().any(|a| a.name.is_none());
+        
+        if has_named && has_positional {
+            self.error("cannot mix positional and named arguments".to_string(), span);
+            return args.iter().map(|a| self.check_expr(&a.value)).collect();
+        }
+        
+        if has_named {
+            // Named arguments - reorder to match parameter order
+            let mut result: Vec<Option<TypedExpr>> = (0..param_names.len()).map(|_| None).collect();
+            let mut used_params: HashSet<&str> = HashSet::new();
+            
+            for arg in args {
+                let name = arg.name.as_ref().unwrap();
+                
+                // Find the parameter index
+                if let Some(idx) = param_names.iter().position(|p| p == name) {
+                    if used_params.contains(name.as_str()) {
+                        self.error(format!("argument '{}' specified more than once", name), arg.span);
+                        continue;
+                    }
+                    used_params.insert(name);
+                    
+                    let typed = self.check_expr(&arg.value);
+                    
+                    // Check type
+                    if let Err(e) = self.ctx.unify(&typed.ty, &param_types[idx]) {
+                        self.error(
+                            format!("argument '{}' type mismatch: {}", name, e),
+                            arg.span
+                        );
+                    }
+                    
+                    result[idx] = Some(typed);
+                } else {
+                    self.error(format!("unknown parameter '{}'", name), arg.span);
+                }
+            }
+            
+            // Check all required parameters are provided
+            for (i, name) in param_names.iter().enumerate() {
+                if result[i].is_none() {
+                    self.error(format!("missing argument for parameter '{}'", name), span);
+                    // Create error placeholder
+                    result[i] = Some(TypedExpr {
+                        kind: TypedExprKind::IntLiteral(0),
+                        ty: Type::Error,
+                        span,
+                    });
+                }
+            }
+            
+            result.into_iter().map(|o| o.unwrap()).collect()
+        } else {
+            // Positional arguments - just type check in order
+            if args.len() != param_types.len() {
+                self.error(
+                    format!("expected {} arguments, got {}", param_types.len(), args.len()),
+                    span
+                );
+            }
+            
+            args.iter().enumerate().map(|(i, arg)| {
+                let typed = self.check_expr(&arg.value);
+                if i < param_types.len() {
+                    if let Err(e) = self.ctx.unify(&typed.ty, &param_types[i]) {
+                        self.error(
+                            format!("argument {} type mismatch: {}", i + 1, e),
+                            arg.span
+                        );
+                    }
+                }
+                typed
+            }).collect()
+        }
+    }
+
     fn check_expr(&mut self, expr: &ResolvedExpr) -> TypedExpr {
         let (kind, ty) = match &expr.kind {
             ResolvedExprKind::IntLiteral(n) => {
@@ -477,7 +679,7 @@ impl TypeChecker {
                 (TypedExprKind::BoolLiteral(*b), Type::Bool)
             }
             ResolvedExprKind::StringLiteral(s) => {
-                (TypedExprKind::StringLiteral(s.clone()), Type::String)
+                (TypedExprKind::StringLiteral(s.clone()), Type::Str)
             }
             
             ResolvedExprKind::Var { name, def_id } => {
@@ -514,8 +716,55 @@ impl TypeChecker {
             }
             
             ResolvedExprKind::Call { callee, args } => {
-                // Check if this is a method call: expr.method(args)
+                // Check if this is a method call or associated function call: expr.method(args) or Type.function(args)
                 if let ResolvedExprKind::Field { expr: receiver, field: method_name, .. } = &callee.kind {
+                    // Check if receiver is a type name (for associated function calls like Point.new())
+                    if let ResolvedExprKind::Var { def_id, .. } = &receiver.kind {
+                        // Check if this def_id refers to a struct type
+                        if let Some(Type::Struct(struct_id)) = self.ctx.get_def_type(*def_id) {
+                            let struct_id = *struct_id; // Copy the DefId
+                            // This is potentially an associated function call
+                            if let Some((fn_def_id, fn_type)) = self.associated_functions.get(&(struct_id, method_name.clone())).cloned() {
+                                // This is an associated function call!
+                                let args_typed: Vec<_> = args.iter().map(|a| self.check_expr(&a.value)).collect();
+                                
+                                let result_type = if let Type::Function { params, ret } = &fn_type {
+                                    // Check argument count and types (no self parameter)
+                                    if args_typed.len() != params.len() {
+                                        self.error(
+                                            format!("function '{}' expected {} arguments, got {}", 
+                                                method_name, params.len(), args_typed.len()),
+                                            expr.span
+                                        );
+                                    } else {
+                                        for (i, (arg, param)) in args_typed.iter().zip(params.iter()).enumerate() {
+                                            if let Err(e) = self.ctx.unify(&arg.ty, param) {
+                                                self.error(
+                                                    format!("argument {} type mismatch: {}", i + 1, e),
+                                                    expr.span
+                                                );
+                                            }
+                                        }
+                                    }
+                                    (**ret).clone()
+                                } else {
+                                    Type::Error
+                                };
+                                
+                                return TypedExpr {
+                                    kind: TypedExprKind::AssociatedFunctionCall {
+                                        type_id: struct_id,  // struct_id is already owned from the match
+                                        function: method_name.clone(),
+                                        function_def_id: fn_def_id,
+                                        args: args_typed,
+                                    },
+                                    ty: result_type,
+                                    span: expr.span,
+                                };
+                            }
+                        }
+                    }
+                    
                     // First, check the receiver type
                     let receiver_typed = self.check_expr(receiver);
                     
@@ -552,7 +801,8 @@ impl TypeChecker {
                     if let Some(struct_id) = struct_id {
                         if let Some((method_def_id, method_type)) = self.methods.get(&(struct_id, method_name.clone())).cloned() {
                             // This is a method call!
-                            let args_typed: Vec<_> = args.iter().map(|a| self.check_expr(a)).collect();
+                            // TODO: Handle named arguments for methods
+                            let args_typed: Vec<_> = args.iter().map(|a| self.check_expr(&a.value)).collect();
                             
                             let result_type = if let Type::Function { params, ret } = &method_type {
                                 // Method's first param is &self or &mut self
@@ -596,7 +846,8 @@ impl TypeChecker {
                     // Look up method via trait bounds on type parameter
                     if let Some(bounds) = type_param_info {
                         if let Some(method_type) = self.lookup_trait_method(&bounds, method_name) {
-                            let args_typed: Vec<_> = args.iter().map(|a| self.check_expr(a)).collect();
+                            // TODO: Handle named arguments for trait methods
+                            let args_typed: Vec<_> = args.iter().map(|a| self.check_expr(&a.value)).collect();
                             
                             let result_type = if let Type::Function { params, ret } = &method_type {
                                 let method_params = &params[1..]; // Skip self param
@@ -628,19 +879,85 @@ impl TypeChecker {
                         }
                     }
                     
+                    // Look up method on primitive type
+                    let primitive_name = match &receiver_typed.ty {
+                        Type::I8 => Some("i8"),
+                        Type::I16 => Some("i16"),
+                        Type::I32 => Some("i32"),
+                        Type::I64 => Some("i64"),
+                        Type::U8 => Some("u8"),
+                        Type::U16 => Some("u16"),
+                        Type::U32 => Some("u32"),
+                        Type::U64 => Some("u64"),
+                        Type::F32 => Some("f32"),
+                        Type::F64 => Some("f64"),
+                        Type::Bool => Some("bool"),
+                        Type::Str => Some("str"),
+                        Type::Ref { inner, .. } => match inner.as_ref() {
+                            Type::I32 => Some("i32"),
+                            Type::I64 => Some("i64"),
+                            Type::Bool => Some("bool"),
+                            Type::Str => Some("str"),
+                            _ => None,
+                        },
+                        _ => None,
+                    };
+                    
+                    if let Some(prim_name) = primitive_name {
+                        if let Some((method_def_id, method_type)) = self.primitive_methods.get(&(prim_name.to_string(), method_name.clone())).cloned() {
+                            // Method call on primitive type
+                            let args_typed: Vec<_> = args.iter().map(|a| self.check_expr(&a.value)).collect();
+                            
+                            let result_type = if let Type::Function { params, ret } = &method_type {
+                                let method_params = &params[1..]; // Skip self param
+                                
+                                if args_typed.len() != method_params.len() {
+                                    self.error(
+                                        format!("method '{}' expected {} arguments, got {}", 
+                                            method_name, method_params.len(), args_typed.len()),
+                                        expr.span
+                                    );
+                                }
+                                (**ret).clone()
+                            } else {
+                                Type::Error
+                            };
+                            
+                            return TypedExpr {
+                                kind: TypedExprKind::PrimitiveMethodCall {
+                                    receiver: Box::new(receiver_typed),
+                                    method: method_name.clone(),
+                                    method_def_id,
+                                    args: args_typed,
+                                },
+                                ty: result_type,
+                                span: expr.span,
+                            };
+                        }
+                    }
+                    
                     // Not a method - fall through to regular field access + call
                     // This will error on the field access
                 }
                 
                 // Regular function call
                 let callee_typed = self.check_expr(callee);
-                let args_typed: Vec<_> = args.iter().map(|a| self.check_expr(a)).collect();
                 
                 // Check if this is a call to a generic function
                 let callee_def_id = match &callee_typed.kind {
                     TypedExprKind::Var { def_id, .. } => Some(*def_id),
                     _ => None,
                 };
+                
+                // Handle named arguments - reorder if needed
+                let reordered_args = if let Some(def_id) = callee_def_id {
+                    self.reorder_named_args(args, def_id, expr.span)
+                } else {
+                    // No def_id, just use args in order
+                    args.iter().map(|a| &a.value).collect()
+                };
+                
+                let args_typed: Vec<_> = reordered_args.iter().map(|a| self.check_expr(a)).collect();
                 
                 let (result_type, type_args) = match &callee_typed.ty {
                     Type::Function { params, ret } => {
@@ -1176,7 +1493,20 @@ impl TypeChecker {
             Type::Enum(enum_def_id) => {
                 self.trait_impls.contains_key(&(*enum_def_id, trait_def_id))
             }
-            // Primitives could have built-in trait impls, but for now return false
+            // Check primitive trait impls
+            Type::I8 => self.primitive_trait_impls.contains(&("i8".to_string(), trait_def_id)),
+            Type::I16 => self.primitive_trait_impls.contains(&("i16".to_string(), trait_def_id)),
+            Type::I32 => self.primitive_trait_impls.contains(&("i32".to_string(), trait_def_id)),
+            Type::I64 => self.primitive_trait_impls.contains(&("i64".to_string(), trait_def_id)),
+            Type::U8 => self.primitive_trait_impls.contains(&("u8".to_string(), trait_def_id)),
+            Type::U16 => self.primitive_trait_impls.contains(&("u16".to_string(), trait_def_id)),
+            Type::U32 => self.primitive_trait_impls.contains(&("u32".to_string(), trait_def_id)),
+            Type::U64 => self.primitive_trait_impls.contains(&("u64".to_string(), trait_def_id)),
+            Type::F32 => self.primitive_trait_impls.contains(&("f32".to_string(), trait_def_id)),
+            Type::F64 => self.primitive_trait_impls.contains(&("f64".to_string(), trait_def_id)),
+            Type::Bool => self.primitive_trait_impls.contains(&("bool".to_string(), trait_def_id)),
+            Type::Str => self.primitive_trait_impls.contains(&("str".to_string(), trait_def_id)),
+            Type::Ref { inner, .. } => self.type_implements_trait(inner, trait_def_id),
             _ => false,
         }
     }
@@ -1325,6 +1655,7 @@ pub struct TypedFunction {
     pub params: Vec<TypedParam>,
     pub return_type: Type,
     pub body: Option<TypedBlock>,
+    pub span: Span,
 }
 
 #[derive(Debug)]
@@ -1333,6 +1664,7 @@ pub struct TypedParam {
     pub name: String,
     pub is_mut: bool,
     pub ty: Type,
+    pub span: Span,
 }
 
 #[derive(Debug)]
@@ -1376,6 +1708,10 @@ pub enum TypedExprKind {
     MethodCall { receiver: Box<TypedExpr>, method: String, method_def_id: DefId, args: Vec<TypedExpr> },
     /// Method call on a type parameter via trait bounds
     TraitMethodCall { receiver: Box<TypedExpr>, method: String, trait_bounds: Vec<DefId>, args: Vec<TypedExpr> },
+    /// Associated function call: Type.function(args) where function has no self
+    AssociatedFunctionCall { type_id: DefId, function: String, function_def_id: DefId, args: Vec<TypedExpr> },
+    /// Method call on a primitive type (i32, bool, str, etc.)
+    PrimitiveMethodCall { receiver: Box<TypedExpr>, method: String, method_def_id: DefId, args: Vec<TypedExpr> },
     Field { expr: Box<TypedExpr>, field: String },
     StructLit { struct_def: DefId, fields: Vec<(String, TypedExpr)> },
     If { cond: Box<TypedExpr>, then_block: TypedBlock, else_block: Option<TypedElse> },

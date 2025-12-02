@@ -19,9 +19,7 @@ pub enum Type {
     Bool,
     /// Character
     Char,
-    /// String (owned)
-    String,
-    /// String slice
+    /// String slice (pointer to null-terminated C string)
     Str,
     /// Unit type ()
     Unit,
@@ -115,7 +113,6 @@ impl Type {
             Type::F64 => "f64".to_string(),
             Type::Bool => "bool".to_string(),
             Type::Char => "char".to_string(),
-            Type::String => "String".to_string(),
             Type::Str => "str".to_string(),
             Type::Unit => "()".to_string(),
             Type::Never => "!".to_string(),
@@ -367,7 +364,6 @@ pub fn parse_type_name(name: &str) -> Option<Type> {
         "f64" => Some(Type::F64),
         "bool" => Some(Type::Bool),
         "char" => Some(Type::Char),
-        "String" => Some(Type::String),
         "str" => Some(Type::Str),
         _ => None,
     }

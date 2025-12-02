@@ -36,13 +36,13 @@ fn vec2_length_squared(v: &Vec2) -> i32 {
     vec2_dot(v, v)
 }
 
-fn vec2_print(label: String, v: &Vec2) {
-    print(label);
-    print("(");
-    print_i32(v.x);
-    print(", ");
-    print_i32(v.y);
-    print(")");
+fn vec2_print(label: str, v: &Vec2) {
+    print(&label);
+    print(&"(");
+    print(&v.x);
+    print(&", ");
+    print(&v.y);
+    print(&")");
     println();
 }
 
@@ -131,9 +131,14 @@ fn isqrt(n: i32) -> i32 {
 }
 
 // Helper to print a labeled integer result
-fn print_result(label: String, value: i32) {
-    print(label);
-    print_i32(value);
+fn print_result(label: str, value: i32) {
+    print(&label);
+    print(&value);
+    println();
+}
+
+fn print_line(s: str) {
+    print(&s);
     println();
 }
 
@@ -175,8 +180,8 @@ fn main() -> i32 {
     print_result("  Position Y: ", p4.y);
     print_result("  Health: ", p4.health);
     print_result("  Score: ", p4.score);
-    print_result("  Alive (1=yes): ", if player_is_alive(&p4) { 1 } else { 0 });
-
+    print(&"  Alive: ");
+    print(&player_is_alive(&p4));
     println();
 
     // Math functions
@@ -187,6 +192,7 @@ fn main() -> i32 {
     print_result("gcd(48, 18) = ", gcd(48, 18));
     print_result("isqrt(144) = ", isqrt(144));
     print_result("isqrt(200) = ", isqrt(200));
+
 
     println();
     print_line("=== All tests passed! ===");

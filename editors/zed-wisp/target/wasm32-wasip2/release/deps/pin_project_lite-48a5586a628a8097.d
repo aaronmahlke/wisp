@@ -1,0 +1,7 @@
+/Users/aaronmahlke/Library/Application Support/Zed/extensions/installed/wisp/target/wasm32-wasip2/release/deps/pin_project_lite-48a5586a628a8097.d: /Users/aaronmahlke/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/pin-project-lite-0.2.16/src/lib.rs
+
+/Users/aaronmahlke/Library/Application Support/Zed/extensions/installed/wisp/target/wasm32-wasip2/release/deps/libpin_project_lite-48a5586a628a8097.rlib: /Users/aaronmahlke/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/pin-project-lite-0.2.16/src/lib.rs
+
+/Users/aaronmahlke/Library/Application Support/Zed/extensions/installed/wisp/target/wasm32-wasip2/release/deps/libpin_project_lite-48a5586a628a8097.rmeta: /Users/aaronmahlke/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/pin-project-lite-0.2.16/src/lib.rs
+
+/Users/aaronmahlke/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/pin-project-lite-0.2.16/src/lib.rs:
