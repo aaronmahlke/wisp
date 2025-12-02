@@ -9,7 +9,6 @@
   "loop"
   "return"
   "break"
-  "continue"
   "struct"
   "enum"
   "trait"
@@ -22,6 +21,10 @@
   "defer"
   "self"
 ] @keyword
+
+; Control flow expressions (for continue which is inlined)
+(continue_expression) @keyword
+(break_expression) @keyword
 
 ; Operators
 [
@@ -67,8 +70,6 @@
   "}"
   "["
   "]"
-  "<"
-  ">"
 ] @punctuation.bracket
 
 [
@@ -148,4 +149,3 @@
 
 ; Identifier (fallback)
 (identifier) @variable
-
