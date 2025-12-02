@@ -335,7 +335,7 @@ impl<'a> BorrowChecker<'a> {
             TypedExprKind::Var { def_id, .. } => {
                 Some(Place::var(*def_id))
             }
-            TypedExprKind::Field { expr: base, field } => {
+            TypedExprKind::Field { expr: base, field, .. } => {
                 self.expr_to_place(base).map(|p| p.field(field.clone()))
             }
             TypedExprKind::Deref(inner) => {

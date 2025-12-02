@@ -156,6 +156,12 @@ pub struct TypeContext {
     next_var: u32,
     /// Type variable substitutions
     substitutions: HashMap<u32, Type>,
+    
+    // === LSP Query Support ===
+    /// Span -> type string for hover (only for current file, filtered by source_len)
+    span_types: HashMap<(usize, usize), String>,
+    /// Span -> definition DefId for go-to-definition
+    span_definitions: HashMap<(usize, usize), DefId>,
 }
 
 impl TypeContext {
@@ -168,7 +174,69 @@ impl TypeContext {
             type_params: std::collections::HashSet::new(),
             next_var: 0,
             substitutions: HashMap::new(),
+            span_types: HashMap::new(),
+            span_definitions: HashMap::new(),
         }
+    }
+    
+    // === LSP Query Methods ===
+    
+    /// Record a span -> type mapping for hover support
+    pub fn record_span_type(&mut self, start: usize, end: usize, type_str: String) {
+        self.span_types.insert((start, end), type_str);
+    }
+    
+    /// Record a span -> definition mapping for go-to-definition
+    pub fn record_span_definition(&mut self, start: usize, end: usize, def_id: DefId) {
+        self.span_definitions.insert((start, end), def_id);
+    }
+    
+    /// Get the type string for a span (exact match)
+    pub fn get_span_type(&self, start: usize, end: usize) -> Option<&String> {
+        self.span_types.get(&(start, end))
+    }
+    
+    /// Get the definition for a span (exact match)
+    pub fn get_span_definition(&self, start: usize, end: usize) -> Option<DefId> {
+        self.span_definitions.get(&(start, end)).copied()
+    }
+    
+    /// Find the smallest span containing the given offset and return its type
+    pub fn type_at_offset(&self, offset: usize) -> Option<&String> {
+        let mut best: Option<((usize, usize), &String)> = None;
+        for ((start, end), type_str) in &self.span_types {
+            if offset >= *start && offset <= *end {
+                let span_size = end - start;
+                if best.is_none() || span_size < (best.as_ref().unwrap().0.1 - best.as_ref().unwrap().0.0) {
+                    best = Some(((*start, *end), type_str));
+                }
+            }
+        }
+        best.map(|(_, s)| s)
+    }
+    
+    /// Find the smallest span containing the given offset and return its definition
+    pub fn definition_at_offset(&self, offset: usize) -> Option<DefId> {
+        let mut best: Option<((usize, usize), DefId)> = None;
+        for ((start, end), def_id) in &self.span_definitions {
+            if offset >= *start && offset <= *end {
+                let span_size = end - start;
+                if best.is_none() || span_size < (best.as_ref().unwrap().0.1 - best.as_ref().unwrap().0.0) {
+                    best = Some(((*start, *end), *def_id));
+                }
+            }
+        }
+        best.map(|(_, d)| d)
+    }
+    
+    /// Get all span types (for debugging/iteration)
+    pub fn all_span_types(&self) -> &HashMap<(usize, usize), String> {
+        &self.span_types
+    }
+    
+    /// Get all span definitions (for debugging/iteration)
+    pub fn all_span_definitions(&self) -> &HashMap<(usize, usize), DefId> {
+        &self.span_definitions
     }
 
     /// Register a type parameter

@@ -64,6 +64,20 @@ pub struct ResolvedProgram {
     pub extern_statics: Vec<ResolvedExternStatic>,
 }
 
+impl ResolvedProgram {
+    /// Get the span of a definition by DefId (for go-to-definition)
+    pub fn definition_span(&self, def_id: DefId) -> Option<Span> {
+        self.defs.get(&def_id).map(|info| info.span)
+    }
+    
+    /// Get all references to a definition (for find-references)
+    /// Note: This is a placeholder - actual reference tracking would need to be added during resolution
+    pub fn references_to(&self, _def_id: DefId) -> Vec<Span> {
+        // TODO: Track references during name resolution
+        Vec::new()
+    }
+}
+
 /// External function declaration (C FFI)
 #[derive(Debug, Clone)]
 pub struct ResolvedExternFunction {
@@ -275,6 +289,8 @@ pub struct ResolvedFunction {
     /// Local variables defined in this function
     pub locals: Vec<DefId>,
     pub span: Span,
+    /// Span of just the function name (for hover)
+    pub name_span: Span,
 }
 
 /// Resolved parameter
@@ -367,12 +383,15 @@ pub enum ResolvedExprKind {
         expr: Box<ResolvedExpr>,
         field: String,
         field_def: Option<DefId>,
+        /// Span of the field name (for hover on method calls)
+        field_span: Span,
     },
     
     /// Struct literal
     StructLit {
         struct_def: DefId,
-        fields: Vec<(String, ResolvedExpr)>,
+        /// (field_name, field_name_span, value_expr)
+        fields: Vec<(String, Span, ResolvedExpr)>,
     },
     
     /// If expression

@@ -1,6 +1,6 @@
 //! Wisp Language Server Protocol implementation
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::RwLock;
@@ -11,7 +11,7 @@ use tower_lsp::{Client, LanguageServer, LspService, Server};
 
 use wisp_ast::{Item, SourceFile, StructField};
 use wisp_lexer::Span;
-use wisp_parser::Parser;
+use wisp_parser::parse_with_imports;
 use wisp_hir::{DefId, Resolver};
 use wisp_borrowck::BorrowChecker;
 
@@ -41,6 +41,10 @@ struct DocumentState {
     source: String,
     /// Type information: (start, end) -> type string
     type_info: HashMap<(usize, usize), String>,
+    /// Definition mappings: (start, end) -> DefId for go-to-definition
+    span_definitions: HashMap<(usize, usize), DefId>,
+    /// DefId -> definition span for resolving go-to-definition targets
+    def_spans: HashMap<DefId, Span>,
     /// Functions: name -> info
     functions: HashMap<String, FunctionInfo>,
     /// Structs: name -> info
@@ -63,72 +67,12 @@ impl WispLanguageServer {
         }
     }
 
-    /// Parse a file and recursively handle imports
-    fn parse_with_imports(&self, source: &str, file_path: &Path) -> std::result::Result<SourceFile, String> {
-        let base_dir = file_path.parent().unwrap_or(Path::new("."));
-        let mut visited = HashSet::new();
-        if let Ok(canonical) = file_path.canonicalize() {
-            visited.insert(canonical);
-        }
-        self.parse_with_imports_recursive(source, base_dir, &mut visited)
-    }
-
-    fn parse_with_imports_recursive(
-        &self,
-        source: &str,
-        base_dir: &Path,
-        visited: &mut HashSet<PathBuf>,
-    ) -> std::result::Result<SourceFile, String> {
-        let ast = Parser::parse(source).map_err(|e| e.to_string())?;
-        
-        let mut all_items = Vec::new();
-        
-        for item in ast.items {
-            match &item {
-                Item::Import(import) => {
-                    // Resolve import path relative to base_dir
-                    let import_path = base_dir.join(&import.path);
-                    let import_path = if import_path.extension().is_none() {
-                        import_path.with_extension("ws")
-                    } else {
-                        import_path
-                    };
-
-                    let canonical = match import_path.canonicalize() {
-                        Ok(c) => c,
-                        Err(_) => continue,
-                    };
-
-                    // Skip if already imported
-                    if visited.contains(&canonical) {
-                        continue;
-                    }
-                    visited.insert(canonical.clone());
-
-                    // Read and parse the imported file
-                    let import_source = match fs::read_to_string(&import_path) {
-                        Ok(s) => s,
-                        Err(_) => continue,
-                    };
-
-                    let import_dir = import_path.parent().unwrap_or(Path::new("."));
-                    if let Ok(imported_ast) = self.parse_with_imports_recursive(&import_source, import_dir, visited) {
-                        all_items.extend(imported_ast.items);
-                    }
-                }
-                _ => {
-                    all_items.push(item);
-                }
-            }
-        }
-
-        Ok(SourceFile { items: all_items })
-    }
-
     /// Analyze a document and update its state
     async fn analyze_document(&self, uri: &Url, text: &str) {
         let mut diagnostics = Vec::new();
         let mut type_info = HashMap::new();
+        let mut span_definitions = HashMap::new();
+        let mut def_spans = HashMap::new();
         let mut functions = HashMap::new();
         let mut structs = HashMap::new();
         let mut variable_defs = HashMap::new();
@@ -138,7 +82,7 @@ impl WispLanguageServer {
         let file_str = file_path.to_string_lossy().to_string();
 
         // Run parser with import resolution
-        let ast = match self.parse_with_imports(text, &file_path) {
+        let ast = match parse_with_imports(text, &file_path) {
             Ok(ast) => ast,
             Err(err) => {
                 diagnostics.push(Diagnostic {
@@ -155,6 +99,8 @@ impl WispLanguageServer {
                     docs.insert(uri.clone(), DocumentState {
                         source: text.to_string(),
                         type_info,
+                        span_definitions,
+                        def_spans,
                         functions,
                         structs,
                         variable_defs,
@@ -266,6 +212,8 @@ impl WispLanguageServer {
                     docs.insert(uri.clone(), DocumentState {
                         source: text.to_string(),
                         type_info,
+                        span_definitions,
+                        def_spans,
                         functions,
                         structs,
                         variable_defs,
@@ -287,6 +235,8 @@ impl WispLanguageServer {
                     docs.insert(uri.clone(), DocumentState {
                         source: text.to_string(),
                         type_info,
+                        span_definitions,
+                        def_spans,
                         functions,
                         structs,
                         variable_defs,
@@ -297,14 +247,40 @@ impl WispLanguageServer {
             }
         };
 
-        // Collect named argument info from AST (before type info loses it)
+        // Use compiler's type info directly (recorded during type checking)
+        // Filter to only include spans from the current file
         let source_len = text.len();
+        for ((start, end), type_str) in typed.all_span_types() {
+            if *end <= source_len {
+                type_info.insert((*start, *end), type_str.clone());
+            }
+        }
+        
+        // Collect span→definition mappings from compiler
+        for ((start, end), def_id) in typed.ctx.all_span_definitions() {
+            if *end <= source_len {
+                span_definitions.insert((*start, *end), *def_id);
+            }
+        }
+        
+        // Collect definition spans for resolving go-to-definition targets
+        for func in &typed.functions {
+            def_spans.insert(func.def_id, func.name_span);
+        }
+        for imp in &typed.impls {
+            for method in &imp.methods {
+                def_spans.insert(method.def_id, method.name_span);
+            }
+        }
+        for s in &typed.structs {
+            def_spans.insert(s.def_id, s.span);
+        }
+        
+        // Collect named argument info from AST (named arg labels are not in typed AST)
         collect_named_args_from_ast(&ast, &functions, &mut type_info, source_len);
         
-        // Collect type information from typed AST
-        // Only collect for spans within the current file (not imported files)
-        let mut method_sigs = HashMap::new();
-        collect_type_info(&typed, &mut type_info, &mut variable_defs, &mut method_sigs, source_len);
+        // Collect variable definitions for go-to-definition
+        collect_variable_defs(&typed, &mut variable_defs, source_len);
 
         // Run borrow checker
         let checker = BorrowChecker::new(&typed);
@@ -319,6 +295,8 @@ impl WispLanguageServer {
             docs.insert(uri.clone(), DocumentState {
                 source: text.to_string(),
                 type_info,
+                span_definitions,
+                def_spans,
                 functions,
                 structs,
                 variable_defs,
@@ -459,7 +437,29 @@ impl LanguageServer for WispLanguageServer {
                 let offset = position_to_offset(&doc.source, position);
                 let word = get_word_at_offset(&doc.source, offset);
                 
-                // Helper to create goto response
+                // First, try to use the compiler's span→definition mappings
+                // Find the smallest span containing the cursor
+                let mut best_span: Option<((usize, usize), DefId)> = None;
+                for ((start, end), def_id) in &doc.span_definitions {
+                    if offset >= *start && offset <= *end {
+                        let span_size = end - start;
+                        if best_span.is_none() || span_size < (best_span.as_ref().unwrap().0.1 - best_span.as_ref().unwrap().0.0) {
+                            best_span = Some(((*start, *end), *def_id));
+                        }
+                    }
+                }
+                
+                if let Some((_, def_id)) = best_span {
+                    // Look up the definition span
+                    if let Some(def_span) = doc.def_spans.get(&def_id) {
+                        return Ok(Some(GotoDefinitionResponse::Scalar(Location {
+                            uri: uri.clone(),
+                            range: offset_to_range(&doc.source, def_span.start, def_span.end),
+                        })));
+                    }
+                }
+                
+                // Helper to create goto response from FunctionInfo
                 let make_response = |info: &FunctionInfo| -> Option<GotoDefinitionResponse> {
                     let target_uri = if info.file.is_empty() || info.file == uri.to_file_path().unwrap_or_default().to_string_lossy() {
                         uri.clone()
@@ -479,7 +479,7 @@ impl LanguageServer for WispLanguageServer {
                     }))
                 };
                 
-                // Check for direct function definition
+                // Fallback: Check for direct function definition by name
                 if let Some(info) = doc.functions.get(&word) {
                     return Ok(make_response(info));
                 }
@@ -866,105 +866,6 @@ fn position_to_offset(source: &str, position: Position) -> usize {
     source.len()
 }
 
-/// Collect type information from the typed program
-fn collect_type_info(
-    program: &wisp_types::TypedProgram, 
-    type_info: &mut HashMap<(usize, usize), String>,
-    variable_defs: &mut HashMap<String, (usize, usize)>,
-    method_sigs: &mut HashMap<DefId, String>,
-    source_len: usize,
-) {
-    // First pass: collect all function/method signatures
-    // This must happen before processing bodies so that method calls can find signatures
-    for func in &program.functions {
-        let sig = format_function_signature(func, &program.ctx);
-        method_sigs.insert(func.def_id, sig);
-    }
-    for imp in &program.impls {
-        for method in &imp.methods {
-            let sig = format_function_signature(method, &program.ctx);
-            method_sigs.insert(method.def_id, sig);
-        }
-    }
-    
-    // Collect struct field types (only for current file)
-    for s in &program.structs {
-        if s.span.end > source_len { continue; } // Skip imported structs
-        for field in &s.fields {
-            let field_type = resolve_type_for_display(&field.ty, &program.ctx);
-            type_info.insert(
-                (field.span.start, field.span.end),
-                format!("{}: {}", field.name, field_type)
-            );
-        }
-    }
-    
-    // Second pass: collect type info from function bodies (only for current file)
-    for func in &program.functions {
-        if func.span.end > source_len { continue; } // Skip imported functions
-        // Collect parameter types
-        for param in &func.params {
-            type_info.insert(
-                (param.span.start, param.span.end), 
-                format!("{}: {}", param.name, param.ty.display(&program.ctx))
-            );
-            variable_defs.insert(param.name.clone(), (param.span.start, param.span.end));
-        }
-        if let Some(ref body) = func.body {
-            collect_block_types(body, &program.ctx, type_info, variable_defs, method_sigs, source_len);
-        }
-    }
-    
-    for imp in &program.impls {
-        for method in &imp.methods {
-            if method.span.end > source_len { continue; } // Skip imported methods
-            // Collect parameter types for methods
-            for param in &method.params {
-                type_info.insert(
-                    (param.span.start, param.span.end), 
-                    format!("{}: {}", param.name, param.ty.display(&program.ctx))
-                );
-                variable_defs.insert(param.name.clone(), (param.span.start, param.span.end));
-            }
-            if let Some(ref body) = method.body {
-                collect_block_types(body, &program.ctx, type_info, variable_defs, method_sigs, source_len);
-            }
-        }
-    }
-}
-
-fn format_function_signature(func: &wisp_types::TypedFunction, ctx: &wisp_types::TypeContext) -> String {
-    let params: Vec<String> = func.params.iter()
-        .map(|p| format!("{}: {}", p.name, p.ty.display(ctx)))
-        .collect();
-    let ret = func.return_type.display(ctx);
-    format!("fn {}({}) -> {}", func.name, params.join(", "), ret)
-}
-
-fn resolve_type_for_display(ty: &wisp_hir::ResolvedType, ctx: &wisp_types::TypeContext) -> String {
-    match ty {
-        wisp_hir::ResolvedType::Named { name, def_id, .. } => {
-            if let Some(id) = def_id {
-                ctx.get_type_name(*id).unwrap_or_else(|| name.clone())
-            } else {
-                name.clone()
-            }
-        }
-        wisp_hir::ResolvedType::Ref { is_mut, inner } => {
-            if *is_mut {
-                format!("&mut {}", resolve_type_for_display(inner, ctx))
-            } else {
-                format!("&{}", resolve_type_for_display(inner, ctx))
-            }
-        }
-        wisp_hir::ResolvedType::Slice { elem } => {
-            format!("[{}]", resolve_type_for_display(elem, ctx))
-        }
-        wisp_hir::ResolvedType::Unit => "()".to_string(),
-        wisp_hir::ResolvedType::SelfType => "Self".to_string(),
-        wisp_hir::ResolvedType::Error => "<error>".to_string(),
-    }
-}
 
 /// Collect named argument info from AST
 fn collect_named_args_from_ast(
@@ -1117,198 +1018,81 @@ fn collect_named_args_from_expr(
     }
 }
 
-fn collect_block_types(
-    block: &wisp_types::TypedBlock, 
-    ctx: &wisp_types::TypeContext, 
-    type_info: &mut HashMap<(usize, usize), String>,
+/// Collect variable definitions for go-to-definition (simplified version)
+fn collect_variable_defs(
+    program: &wisp_types::TypedProgram,
     variable_defs: &mut HashMap<String, (usize, usize)>,
-    method_sigs: &HashMap<DefId, String>,
     source_len: usize,
 ) {
-    for stmt in &block.stmts {
-        match stmt {
-            wisp_types::TypedStmt::Let { name, ty, init, span, .. } => {
-                if span.end <= source_len {
-                    // Store the variable definition location
-                    variable_defs.insert(name.clone(), (span.start, span.end));
-                    // Store type info for the variable name (approximate span)
-                    type_info.insert((span.start, span.end), format!("{}: {}", name, ty.display(ctx)));
-                }
-                if let Some(init) = init {
-                    collect_expr_types(init, ctx, type_info, variable_defs, method_sigs, source_len);
-                }
+    // Collect function parameters
+    for func in &program.functions {
+        if func.span.end > source_len { continue; }
+        for param in &func.params {
+            variable_defs.insert(param.name.clone(), (param.span.start, param.span.end));
+        }
+        if let Some(ref body) = func.body {
+            collect_block_variable_defs(body, variable_defs, source_len);
+        }
+    }
+    
+    // Collect impl method parameters
+    for imp in &program.impls {
+        for method in &imp.methods {
+            if method.span.end > source_len { continue; }
+            for param in &method.params {
+                variable_defs.insert(param.name.clone(), (param.span.start, param.span.end));
             }
-            wisp_types::TypedStmt::Expr(expr) => {
-                collect_expr_types(expr, ctx, type_info, variable_defs, method_sigs, source_len);
+            if let Some(ref body) = method.body {
+                collect_block_variable_defs(body, variable_defs, source_len);
             }
         }
     }
 }
 
-fn collect_expr_types(
-    expr: &wisp_types::TypedExpr, 
-    ctx: &wisp_types::TypeContext, 
-    type_info: &mut HashMap<(usize, usize), String>,
+fn collect_block_variable_defs(
+    block: &wisp_types::TypedBlock,
     variable_defs: &mut HashMap<String, (usize, usize)>,
-    method_sigs: &HashMap<DefId, String>,
     source_len: usize,
 ) {
-    // Skip expressions from imported files
-    if expr.span.end > source_len {
-        return;
-    }
-    
-    // Insert type info for expressions (skip calls/method calls to avoid () matching named args)
-    let should_insert = match &expr.kind {
-        // Skip call expressions - their () type isn't useful and interferes with named arg hover
-        wisp_types::TypedExprKind::Call { .. } => false,
-        wisp_types::TypedExprKind::MethodCall { .. } => false,
-        wisp_types::TypedExprKind::GenericCall { .. } => false,
-        wisp_types::TypedExprKind::TraitMethodCall { .. } => false,
-        wisp_types::TypedExprKind::AssociatedFunctionCall { .. } => false,
-        wisp_types::TypedExprKind::PrimitiveMethodCall { .. } => false,
-        // Skip blocks - their type is the last expression's type
-        wisp_types::TypedExprKind::Block(_) => false,
-        _ => true,
-    };
-    
-    if should_insert {
-        let type_str = match &expr.kind {
-            wisp_types::TypedExprKind::Var { name, .. } => {
-                format!("{}: {}", name, expr.ty.display(ctx))
+    for stmt in &block.stmts {
+        match stmt {
+            wisp_types::TypedStmt::Let { name, span, init, .. } => {
+                if span.end <= source_len {
+                    variable_defs.insert(name.clone(), (span.start, span.end));
+                }
+                if let Some(init) = init {
+                    collect_expr_variable_defs(init, variable_defs, source_len);
+                }
             }
-            _ => expr.ty.display(ctx),
-        };
-        type_info.insert((expr.span.start, expr.span.end), type_str);
+            wisp_types::TypedStmt::Expr(expr) => {
+                collect_expr_variable_defs(expr, variable_defs, source_len);
+            }
+        }
     }
+}
+
+fn collect_expr_variable_defs(
+    expr: &wisp_types::TypedExpr,
+    variable_defs: &mut HashMap<String, (usize, usize)>,
+    source_len: usize,
+) {
+    if expr.span.end > source_len { return; }
     
     match &expr.kind {
-        wisp_types::TypedExprKind::Binary { left, right, .. } => {
-            collect_expr_types(left, ctx, type_info, variable_defs, method_sigs, source_len);
-            collect_expr_types(right, ctx, type_info, variable_defs, method_sigs, source_len);
+        wisp_types::TypedExprKind::Block(block) => {
+            collect_block_variable_defs(block, variable_defs, source_len);
         }
-        wisp_types::TypedExprKind::Unary { expr: inner, .. } => {
-            collect_expr_types(inner, ctx, type_info, variable_defs, method_sigs, source_len);
-        }
-        wisp_types::TypedExprKind::Call { callee, args, .. } => {
-            collect_expr_types(callee, ctx, type_info, variable_defs, method_sigs, source_len);
-            for arg in args {
-                collect_expr_types(arg, ctx, type_info, variable_defs, method_sigs, source_len);
-            }
-        }
-        wisp_types::TypedExprKind::MethodCall { receiver, method, method_def_id, args } => {
-            collect_expr_types(receiver, ctx, type_info, variable_defs, method_sigs, source_len);
-            for arg in args {
-                collect_expr_types(arg, ctx, type_info, variable_defs, method_sigs, source_len);
-            }
-            // Store method signature - use the pre-computed signature with param names
-            let method_start = receiver.span.end + 1;
-            let method_end = method_start + method.len();
-            if let Some(sig) = method_sigs.get(method_def_id) {
-                type_info.insert((method_start, method_end), sig.clone());
-            } else if let Some(method_type) = ctx.get_def_type(*method_def_id) {
-                // Fallback: format from type (won't have param names)
-                let type_str = method_type.display(ctx);
-                let formatted = if type_str.starts_with("fn") {
-                    format!("fn {}{}", method, &type_str[2..])
-                } else {
-                    format!("fn {} -> {}", method, type_str)
-                };
-                type_info.insert((method_start, method_end), formatted);
-            }
-        }
-        wisp_types::TypedExprKind::Field { expr: inner, .. } => {
-            collect_expr_types(inner, ctx, type_info, variable_defs, method_sigs, source_len);
-        }
-        wisp_types::TypedExprKind::If { cond, then_block, else_block, .. } => {
-            collect_expr_types(cond, ctx, type_info, variable_defs, method_sigs, source_len);
-            collect_block_types(then_block, ctx, type_info, variable_defs, method_sigs, source_len);
+        wisp_types::TypedExprKind::If { then_block, else_block, .. } => {
+            collect_block_variable_defs(then_block, variable_defs, source_len);
             if let Some(else_branch) = else_block {
                 match else_branch {
-                    wisp_types::TypedElse::Block(block) => collect_block_types(block, ctx, type_info, variable_defs, method_sigs, source_len),
-                    wisp_types::TypedElse::If(if_expr) => collect_expr_types(if_expr, ctx, type_info, variable_defs, method_sigs, source_len),
+                    wisp_types::TypedElse::Block(block) => collect_block_variable_defs(block, variable_defs, source_len),
+                    wisp_types::TypedElse::If(if_expr) => collect_expr_variable_defs(if_expr, variable_defs, source_len),
                 }
             }
         }
-        wisp_types::TypedExprKind::While { cond, body, .. } => {
-            collect_expr_types(cond, ctx, type_info, variable_defs, method_sigs, source_len);
-            collect_block_types(body, ctx, type_info, variable_defs, method_sigs, source_len);
-        }
-        wisp_types::TypedExprKind::Block(block) => {
-            collect_block_types(block, ctx, type_info, variable_defs, method_sigs, source_len);
-        }
-        wisp_types::TypedExprKind::Assign { target, value, .. } => {
-            collect_expr_types(target, ctx, type_info, variable_defs, method_sigs, source_len);
-            collect_expr_types(value, ctx, type_info, variable_defs, method_sigs, source_len);
-        }
-        wisp_types::TypedExprKind::Ref { expr: inner, .. } => {
-            collect_expr_types(inner, ctx, type_info, variable_defs, method_sigs, source_len);
-        }
-        wisp_types::TypedExprKind::Deref(inner) => {
-            collect_expr_types(inner, ctx, type_info, variable_defs, method_sigs, source_len);
-        }
-        wisp_types::TypedExprKind::StructLit { fields, .. } => {
-            for (_, field_expr) in fields {
-                collect_expr_types(field_expr, ctx, type_info, variable_defs, method_sigs, source_len);
-            }
-        }
-        wisp_types::TypedExprKind::GenericCall { args, .. } => {
-            for arg in args {
-                collect_expr_types(arg, ctx, type_info, variable_defs, method_sigs, source_len);
-            }
-        }
-        wisp_types::TypedExprKind::TraitMethodCall { receiver, method, args, .. } => {
-            collect_expr_types(receiver, ctx, type_info, variable_defs, method_sigs, source_len);
-            for arg in args {
-                collect_expr_types(arg, ctx, type_info, variable_defs, method_sigs, source_len);
-            }
-            // Store method name info - we don't have method_def_id for trait methods
-            let method_start = receiver.span.end + 1;
-            let method_end = method_start + method.len();
-            type_info.insert((method_start, method_end), format!("fn {}(...) -> {}", method, expr.ty.display(ctx)));
-        }
-        wisp_types::TypedExprKind::AssociatedFunctionCall { type_id, function, function_def_id, args } => {
-            for arg in args {
-                collect_expr_types(arg, ctx, type_info, variable_defs, method_sigs, source_len);
-            }
-            // Store function signature
-            if let Some(type_name) = ctx.get_type_name(*type_id) {
-                let func_start = expr.span.start + type_name.len() + 1; // +1 for the dot
-                let func_end = func_start + function.len();
-                if let Some(sig) = method_sigs.get(function_def_id) {
-                    type_info.insert((func_start, func_end), sig.clone());
-                } else if let Some(func_type) = ctx.get_def_type(*function_def_id) {
-                    // Fallback: format from type (won't have param names)
-                    let type_str = func_type.display(ctx);
-                    let formatted = if type_str.starts_with("fn") {
-                        format!("fn {}{}", function, &type_str[2..])
-                    } else {
-                        format!("fn {} -> {}", function, type_str)
-                    };
-                    type_info.insert((func_start, func_end), formatted);
-                }
-            }
-        }
-        wisp_types::TypedExprKind::PrimitiveMethodCall { receiver, method, method_def_id, args } => {
-            collect_expr_types(receiver, ctx, type_info, variable_defs, method_sigs, source_len);
-            for arg in args {
-                collect_expr_types(arg, ctx, type_info, variable_defs, method_sigs, source_len);
-            }
-            // Store method signature
-            let method_start = receiver.span.end + 1;
-            let method_end = method_start + method.len();
-            if let Some(sig) = method_sigs.get(method_def_id) {
-                type_info.insert((method_start, method_end), sig.clone());
-            } else if let Some(method_type) = ctx.get_def_type(*method_def_id) {
-                // Fallback: format from type (won't have param names)
-                let type_str = method_type.display(ctx);
-                let formatted = if type_str.starts_with("fn") {
-                    format!("fn {}{}", method, &type_str[2..])
-                } else {
-                    format!("fn {} -> {}", method, type_str)
-                };
-                type_info.insert((method_start, method_end), formatted);
-            }
+        wisp_types::TypedExprKind::While { body, .. } => {
+            collect_block_variable_defs(body, variable_defs, source_len);
         }
         _ => {}
     }

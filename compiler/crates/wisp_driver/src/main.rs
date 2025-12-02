@@ -1,11 +1,9 @@
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::collections::HashSet;
 use std::process::Command;
 use wisp_lexer::{Lexer, Token};
-use wisp_parser::Parser;
-use wisp_ast::{SourceFile, Item};
+use wisp_parser::{Parser, parse_with_imports};
 use wisp_hir::Resolver;
 use wisp_types::TypeChecker;
 use wisp_borrowck::BorrowChecker;
@@ -240,61 +238,6 @@ fn compile_to_object(source: &str, file_path: &str, output_path: &Path) -> Resul
     Ok(())
 }
 
-/// Parse a file and recursively handle imports
-fn parse_with_imports(source: &str, file_path: &str) -> Result<SourceFile, String> {
-    let base_dir = Path::new(file_path).parent().unwrap_or(Path::new("."));
-    let mut visited = HashSet::new();
-    visited.insert(PathBuf::from(file_path).canonicalize().unwrap_or(PathBuf::from(file_path)));
-    
-    parse_with_imports_recursive(source, base_dir, &mut visited)
-}
-
-fn parse_with_imports_recursive(
-    source: &str,
-    base_dir: &Path,
-    visited: &mut HashSet<PathBuf>,
-) -> Result<SourceFile, String> {
-    let ast = Parser::parse(source).map_err(|e| format!("Parse error: {}", e))?;
-    
-    let mut all_items = Vec::new();
-    
-    for item in ast.items {
-        match item {
-            Item::Import(import) => {
-                // Resolve import path relative to base_dir
-                let import_path = base_dir.join(&import.path);
-                let import_path = if import_path.extension().is_none() {
-                    import_path.with_extension("ws")
-                } else {
-                    import_path
-                };
-                
-                let canonical = import_path.canonicalize()
-                    .map_err(|e| format!("Cannot find import '{}': {}", import.path, e))?;
-                
-                // Skip if already imported
-                if visited.contains(&canonical) {
-                    continue;
-                }
-                visited.insert(canonical.clone());
-                
-                // Read and parse the imported file
-                let import_source = fs::read_to_string(&import_path)
-                    .map_err(|e| format!("Cannot read import '{}': {}", import.path, e))?;
-                
-                let import_dir = import_path.parent().unwrap_or(Path::new("."));
-                let imported_ast = parse_with_imports_recursive(&import_source, import_dir, visited)?;
-                
-                // Add all items from the imported file
-                all_items.extend(imported_ast.items);
-            }
-            other => all_items.push(other),
-        }
-    }
-    
-    Ok(SourceFile { items: all_items })
-}
-
 fn run_lexer(source: &str, file_path: &str) {
     println!("=== Lexer Output for {} ===\n", file_path);
     
@@ -426,7 +369,7 @@ fn run_resolver(source: &str, file_path: &str) {
     println!("=== Name Resolution for {} ===\n", file_path);
     
     // First parse with imports
-    let ast = match parse_with_imports(source, file_path) {
+    let ast = match parse_with_imports(source, Path::new(file_path)) {
         Ok(ast) => ast,
         Err(e) => {
             eprintln!("{}", e);
@@ -454,7 +397,7 @@ fn run_type_check(source: &str, file_path: &str) {
     println!("=== Type Check for {} ===\n", file_path);
     
     // Parse with imports
-    let ast = match parse_with_imports(source, file_path) {
+    let ast = match parse_with_imports(source, Path::new(file_path)) {
         Ok(ast) => ast,
         Err(e) => {
             eprintln!("{}", e);
@@ -496,7 +439,7 @@ fn run_borrow_check(source: &str, file_path: &str) {
     println!("=== Borrow Check for {} ===\n", file_path);
     
     // Parse with imports
-    let ast = match parse_with_imports(source, file_path) {
+    let ast = match parse_with_imports(source, Path::new(file_path)) {
         Ok(ast) => ast,
         Err(e) => {
             eprintln!("{}", e);
@@ -611,7 +554,7 @@ fn run_codegen(source: &str, file_path: &str) {
 
 fn run_frontend(source: &str, file_path: &str) -> Result<wisp_types::TypedProgram, ()> {
     // Parse with imports
-    let ast = match parse_with_imports(source, file_path) {
+    let ast = match parse_with_imports(source, Path::new(file_path)) {
         Ok(ast) => ast,
         Err(e) => {
             eprintln!("{}", e);

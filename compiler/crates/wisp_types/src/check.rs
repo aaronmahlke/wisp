@@ -120,7 +120,14 @@ impl TypeChecker {
             let fields: Vec<_> = s.fields.iter()
                 .map(|f| (f.name.clone(), self.resolve_type(&f.ty)))
                 .collect();
-            self.ctx.register_struct_fields(s.def_id, fields);
+            self.ctx.register_struct_fields(s.def_id, fields.clone());
+            
+            // Record struct field spans for LSP
+            for (i, f) in s.fields.iter().enumerate() {
+                let field_type = &fields[i].1;
+                self.ctx.record_span_type(f.span.start, f.span.end, format!("{}: {}", f.name, field_type.display(&self.ctx)));
+                self.ctx.record_span_definition(f.span.start, f.span.end, f.def_id);
+            }
         }
 
         for e in &program.enums {
@@ -408,10 +415,16 @@ impl TypeChecker {
             self.ctx.register_type_param(tp.def_id, tp.name.clone());
         }
         
-        // Register parameter types
+        // Register parameter types and record span→type for LSP
+        let mut param_types = Vec::new();
         for p in &f.params {
             let ty = self.resolve_type(&p.ty);
-            self.ctx.register_def_type(p.def_id, ty);
+            self.ctx.register_def_type(p.def_id, ty.clone());
+            // Record parameter span for hover
+            self.ctx.record_span_type(p.span.start, p.span.end, format!("{}: {}", p.name, ty.display(&self.ctx)));
+            // Record definition for go-to-definition
+            self.ctx.record_span_definition(p.span.start, p.span.end, p.def_id);
+            param_types.push((p.name.clone(), ty));
         }
 
         // Set return type context
@@ -419,6 +432,14 @@ impl TypeChecker {
             .map(|t| self.resolve_type(t))
             .unwrap_or(Type::Unit);
         self.current_return_type = Some(return_type.clone());
+        
+        // Record function signature at name span for hover on function definitions
+        let params_str: Vec<String> = param_types.iter()
+            .map(|(name, ty)| format!("{}: {}", name, ty.display(&self.ctx)))
+            .collect();
+        let sig = format!("fn {}({}) -> {}", f.name, params_str.join(", "), return_type.display(&self.ctx));
+        self.ctx.record_span_type(f.name_span.start, f.name_span.end, sig);
+        self.ctx.record_span_definition(f.name_span.start, f.name_span.end, f.def_id);
 
         // Check body
         let body = f.body.as_ref().map(|b| self.check_block(b, Some(&return_type)));
@@ -440,6 +461,7 @@ impl TypeChecker {
             return_type,
             body,
             span: f.span,
+            name_span: f.name_span,
         }
     }
 
@@ -497,6 +519,11 @@ impl TypeChecker {
                 };
 
                 self.ctx.register_def_type(*def_id, var_type.clone());
+                
+                // Record span→type for LSP hover
+                self.ctx.record_span_type(span.start, span.end, format!("{}: {}", name, var_type.display(&self.ctx)));
+                // Record definition for go-to-definition
+                self.ctx.record_span_definition(span.start, span.end, *def_id);
 
                 let typed_init = init.as_ref().map(|e| self.check_expr(e));
 
@@ -717,7 +744,8 @@ impl TypeChecker {
             
             ResolvedExprKind::Call { callee, args } => {
                 // Check if this is a method call or associated function call: expr.method(args) or Type.function(args)
-                if let ResolvedExprKind::Field { expr: receiver, field: method_name, .. } = &callee.kind {
+                if let ResolvedExprKind::Field { expr: receiver, field: method_name, field_span, .. } = &callee.kind {
+                    let method_span = *field_span;
                     // Check if receiver is a type name (for associated function calls like Point.new())
                     if let ResolvedExprKind::Var { def_id, .. } = &receiver.kind {
                         // Check if this def_id refers to a struct type
@@ -751,11 +779,22 @@ impl TypeChecker {
                                     Type::Error
                                 };
                                 
+                                // Record function signature at function span for hover
+                                if let Type::Function { params, ret } = &fn_type {
+                                    let params_str: Vec<String> = params.iter()
+                                        .map(|p| p.display(&self.ctx))
+                                        .collect();
+                                    let sig = format!("fn {}({}) -> {}", method_name, params_str.join(", "), ret.display(&self.ctx));
+                                    self.ctx.record_span_type(method_span.start, method_span.end, sig);
+                                    self.ctx.record_span_definition(method_span.start, method_span.end, fn_def_id);
+                                }
+                                
                                 return TypedExpr {
                                     kind: TypedExprKind::AssociatedFunctionCall {
                                         type_id: struct_id,  // struct_id is already owned from the match
                                         function: method_name.clone(),
                                         function_def_id: fn_def_id,
+                                        function_span: method_span,
                                         args: args_typed,
                                     },
                                     ty: result_type,
@@ -830,11 +869,22 @@ impl TypeChecker {
                                 Type::Error
                             };
                             
+                            // Record method signature at method span for hover
+                            if let Type::Function { params, ret } = &method_type {
+                                let params_str: Vec<String> = params.iter()
+                                    .map(|p| p.display(&self.ctx))
+                                    .collect();
+                                let sig = format!("fn {}({}) -> {}", method_name, params_str.join(", "), ret.display(&self.ctx));
+                                self.ctx.record_span_type(method_span.start, method_span.end, sig);
+                                self.ctx.record_span_definition(method_span.start, method_span.end, method_def_id);
+                            }
+                            
                             return TypedExpr {
                                 kind: TypedExprKind::MethodCall {
                                     receiver: Box::new(receiver_typed),
                                     method: method_name.clone(),
                                     method_def_id,
+                                    method_span,
                                     args: args_typed,
                                 },
                                 ty: result_type,
@@ -870,6 +920,7 @@ impl TypeChecker {
                                 kind: TypedExprKind::TraitMethodCall {
                                     receiver: Box::new(receiver_typed),
                                     method: method_name.clone(),
+                                    method_span,
                                     trait_bounds: bounds,
                                     args: args_typed,
                                 },
@@ -923,11 +974,22 @@ impl TypeChecker {
                                 Type::Error
                             };
                             
+                            // Record method signature at method span for hover
+                            if let Type::Function { params, ret } = &method_type {
+                                let params_str: Vec<String> = params.iter()
+                                    .map(|p| p.display(&self.ctx))
+                                    .collect();
+                                let sig = format!("fn {}({}) -> {}", method_name, params_str.join(", "), ret.display(&self.ctx));
+                                self.ctx.record_span_type(method_span.start, method_span.end, sig);
+                                self.ctx.record_span_definition(method_span.start, method_span.end, method_def_id);
+                            }
+                            
                             return TypedExpr {
                                 kind: TypedExprKind::PrimitiveMethodCall {
                                     receiver: Box::new(receiver_typed),
                                     method: method_name.clone(),
                                     method_def_id,
+                                    method_span,
                                     args: args_typed,
                                 },
                                 ty: result_type,
@@ -1081,7 +1143,7 @@ impl TypeChecker {
                 (call_kind, result_type)
             }
             
-            ResolvedExprKind::Field { expr: base, field, .. } => {
+            ResolvedExprKind::Field { expr: base, field, field_span, .. } => {
                 let base_typed = self.check_expr(base);
                 
                 let field_type = match &base_typed.ty {
@@ -1117,6 +1179,7 @@ impl TypeChecker {
                 (TypedExprKind::Field {
                     expr: Box::new(base_typed),
                     field: field.clone(),
+                    field_span: *field_span,
                 }, field_type)
             }
             
@@ -1125,13 +1188,15 @@ impl TypeChecker {
                 
                 // Check field types
                 let mut typed_fields = Vec::new();
-                for (name, field_expr) in fields {
+                for (name, name_span, field_expr) in fields {
                     let typed = self.check_expr(field_expr);
                     
                     if let Some(expected) = self.ctx.get_struct_field(*struct_def, name).cloned() {
                         if let Err(e) = self.ctx.unify(&typed.ty, &expected) {
                             self.error(format!("field '{}' type mismatch: {}", name, e), field_expr.span);
                         }
+                        // Record the field type at the field name span for hover
+                        self.ctx.record_span_type(name_span.start, name_span.end, format!("{}: {}", name, expected.display(&self.ctx)));
                     }
                     
                     typed_fields.push((name.clone(), typed));
@@ -1305,6 +1370,14 @@ impl TypeChecker {
             
             ResolvedExprKind::Error => (TypedExprKind::Error, Type::Error),
         };
+
+        // Record span→type mapping for LSP hover support
+        // Format the type nicely for variables
+        let type_str = match &kind {
+            TypedExprKind::Var { name, .. } => format!("{}: {}", name, ty.display(&self.ctx)),
+            _ => ty.display(&self.ctx),
+        };
+        self.ctx.record_span_type(expr.span.start, expr.span.end, type_str);
 
         TypedExpr { kind, ty, span: expr.span }
     }
@@ -1578,6 +1651,114 @@ pub struct TypedExternStatic {
 }
 
 impl TypedProgram {
+    // === LSP Query Methods ===
+    
+    /// Get type string at a given offset (for hover)
+    pub fn type_at_offset(&self, offset: usize) -> Option<&String> {
+        self.ctx.type_at_offset(offset)
+    }
+    
+    /// Get definition DefId at a given offset (for go-to-definition)
+    pub fn definition_at_offset(&self, offset: usize) -> Option<DefId> {
+        self.ctx.definition_at_offset(offset)
+    }
+    
+    /// Get the span of a definition by DefId
+    pub fn definition_span(&self, def_id: DefId) -> Option<Span> {
+        // Check functions
+        for f in &self.functions {
+            if f.def_id == def_id {
+                return Some(f.span);
+            }
+            for p in &f.params {
+                if p.def_id == def_id {
+                    return Some(p.span);
+                }
+            }
+        }
+        // Check impl methods
+        for imp in &self.impls {
+            for m in &imp.methods {
+                if m.def_id == def_id {
+                    return Some(m.span);
+                }
+                for p in &m.params {
+                    if p.def_id == def_id {
+                        return Some(p.span);
+                    }
+                }
+            }
+        }
+        // Check structs
+        for s in &self.structs {
+            if s.def_id == def_id {
+                return Some(s.span);
+            }
+            for f in &s.fields {
+                if f.def_id == def_id {
+                    return Some(f.span);
+                }
+            }
+        }
+        // Check enums
+        for e in &self.enums {
+            if e.def_id == def_id {
+                return Some(e.span);
+            }
+        }
+        // Check extern functions
+        for f in &self.extern_functions {
+            if f.def_id == def_id {
+                // Extern functions don't have spans stored, return None
+                return None;
+            }
+        }
+        None
+    }
+    
+    /// Get function signature by name (for hover on function calls)
+    pub fn get_function_signature(&self, name: &str) -> Option<String> {
+        for f in &self.functions {
+            if f.name == name {
+                let params: Vec<_> = f.params.iter()
+                    .map(|p| format!("{}: {}", p.name, p.ty.display(&self.ctx)))
+                    .collect();
+                return Some(format!("fn {}({}) -> {}", f.name, params.join(", "), f.return_type.display(&self.ctx)));
+            }
+        }
+        for imp in &self.impls {
+            for m in &imp.methods {
+                if m.name == name {
+                    let params: Vec<_> = m.params.iter()
+                        .map(|p| format!("{}: {}", p.name, p.ty.display(&self.ctx)))
+                        .collect();
+                    return Some(format!("fn {}({}) -> {}", m.name, params.join(", "), m.return_type.display(&self.ctx)));
+                }
+            }
+        }
+        None
+    }
+    
+    /// Get struct definition string (for hover on struct names)
+    pub fn get_struct_definition(&self, name: &str) -> Option<String> {
+        for s in &self.structs {
+            if s.name == name {
+                if let Some(fields) = self.ctx.get_struct_fields(s.def_id) {
+                    let field_strs: Vec<_> = fields.iter()
+                        .map(|(n, t)| format!("    {}: {}", n, t.display(&self.ctx)))
+                        .collect();
+                    return Some(format!("struct {} {{\n{}\n}}", s.name, field_strs.join(",\n")));
+                }
+            }
+        }
+        None
+    }
+    
+    /// Get all span types (for iteration)
+    pub fn all_span_types(&self) -> &std::collections::HashMap<(usize, usize), String> {
+        self.ctx.all_span_types()
+    }
+    
     pub fn pretty_print(&self) -> String {
         let mut out = String::new();
         
@@ -1656,6 +1837,8 @@ pub struct TypedFunction {
     pub return_type: Type,
     pub body: Option<TypedBlock>,
     pub span: Span,
+    /// Span of just the function name (for hover)
+    pub name_span: Span,
 }
 
 #[derive(Debug)]
@@ -1705,14 +1888,14 @@ pub enum TypedExprKind {
     Call { callee: Box<TypedExpr>, args: Vec<TypedExpr> },
     /// Call to a generic function with inferred type arguments
     GenericCall { func_def_id: DefId, type_args: Vec<Type>, args: Vec<TypedExpr> },
-    MethodCall { receiver: Box<TypedExpr>, method: String, method_def_id: DefId, args: Vec<TypedExpr> },
+    MethodCall { receiver: Box<TypedExpr>, method: String, method_def_id: DefId, method_span: Span, args: Vec<TypedExpr> },
     /// Method call on a type parameter via trait bounds
-    TraitMethodCall { receiver: Box<TypedExpr>, method: String, trait_bounds: Vec<DefId>, args: Vec<TypedExpr> },
+    TraitMethodCall { receiver: Box<TypedExpr>, method: String, method_span: Span, trait_bounds: Vec<DefId>, args: Vec<TypedExpr> },
     /// Associated function call: Type.function(args) where function has no self
-    AssociatedFunctionCall { type_id: DefId, function: String, function_def_id: DefId, args: Vec<TypedExpr> },
+    AssociatedFunctionCall { type_id: DefId, function: String, function_def_id: DefId, function_span: Span, args: Vec<TypedExpr> },
     /// Method call on a primitive type (i32, bool, str, etc.)
-    PrimitiveMethodCall { receiver: Box<TypedExpr>, method: String, method_def_id: DefId, args: Vec<TypedExpr> },
-    Field { expr: Box<TypedExpr>, field: String },
+    PrimitiveMethodCall { receiver: Box<TypedExpr>, method: String, method_def_id: DefId, method_span: Span, args: Vec<TypedExpr> },
+    Field { expr: Box<TypedExpr>, field: String, field_span: Span },
     StructLit { struct_def: DefId, fields: Vec<(String, TypedExpr)> },
     If { cond: Box<TypedExpr>, then_block: TypedBlock, else_block: Option<TypedElse> },
     While { cond: Box<TypedExpr>, body: TypedBlock },

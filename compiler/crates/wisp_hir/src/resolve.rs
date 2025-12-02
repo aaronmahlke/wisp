@@ -507,6 +507,7 @@ impl Resolver {
             body,
             locals,
             span: f.span,
+            name_span: f.name.span,
         })
     }
 
@@ -597,6 +598,7 @@ impl Resolver {
             body,
             locals,
             span: f.span,
+            name_span: f.name.span,
         })
     }
 
@@ -805,6 +807,7 @@ impl Resolver {
                     expr: Box::new(self.resolve_expr(base)),
                     field: field.name.clone(),
                     field_def: None, // Resolved during type checking
+                    field_span: field.span,
                 }
             }
             
@@ -812,7 +815,7 @@ impl Resolver {
                 match self.lookup(&name.name) {
                     Some(struct_def) => {
                         let resolved_fields: Vec<_> = fields.iter()
-                            .map(|f| (f.name.name.clone(), self.resolve_expr(&f.value)))
+                            .map(|f| (f.name.name.clone(), f.name.span, self.resolve_expr(&f.value)))
                             .collect();
                         ResolvedExprKind::StructLit {
                             struct_def,

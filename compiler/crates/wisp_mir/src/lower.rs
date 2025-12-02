@@ -576,7 +576,7 @@ impl<'a> FunctionLowerer<'a> {
                 Operand::Copy(Place::local(temp))
             }
             
-            TypedExprKind::MethodCall { receiver, method: _, method_def_id, args } => {
+            TypedExprKind::MethodCall { receiver, method_def_id, args, .. } => {
                 // Lower the receiver
                 let receiver_op = self.lower_expr(receiver);
                 
@@ -637,7 +637,7 @@ impl<'a> FunctionLowerer<'a> {
                 Operand::Copy(Place::local(temp))
             }
             
-            TypedExprKind::AssociatedFunctionCall { type_id: _, function: _, function_def_id, args } => {
+            TypedExprKind::AssociatedFunctionCall { function_def_id, args, .. } => {
                 // Lower all arguments (no receiver/self for associated functions)
                 let arg_ops: Vec<_> = args.iter().map(|a| self.lower_expr(a)).collect();
                 
@@ -661,7 +661,7 @@ impl<'a> FunctionLowerer<'a> {
                 Operand::Copy(Place::local(temp))
             }
 
-            TypedExprKind::PrimitiveMethodCall { receiver, method: _, method_def_id, args } => {
+            TypedExprKind::PrimitiveMethodCall { receiver, method_def_id, args, .. } => {
                 // Lower the receiver
                 let receiver_op = self.lower_expr(receiver);
                 
@@ -726,7 +726,7 @@ impl<'a> FunctionLowerer<'a> {
                 Operand::Copy(Place::local(temp))
             }
 
-            TypedExprKind::TraitMethodCall { receiver, method, trait_bounds, args } => {
+            TypedExprKind::TraitMethodCall { receiver, method, trait_bounds, args, .. } => {
                 // For trait method calls on type parameters, we need to resolve the actual
                 // method based on the concrete type. During monomorphization, the receiver's
                 // type will be substituted with a concrete type.
@@ -800,7 +800,7 @@ impl<'a> FunctionLowerer<'a> {
                 Operand::Copy(Place::local(temp))
             }
 
-            TypedExprKind::Field { expr: base, field } => {
+            TypedExprKind::Field { expr: base, field, .. } => {
                 let base_op = self.lower_expr(base);
                 
                 // Get field index
@@ -1034,7 +1034,7 @@ impl<'a> FunctionLowerer<'a> {
             TypedExprKind::Var { def_id, .. } => {
                 self.def_to_local.get(def_id).map(|&local| Place::local(local))
             }
-            TypedExprKind::Field { expr: base, field } => {
+            TypedExprKind::Field { expr: base, field, .. } => {
                 let base_place = self.expr_to_place(base)?;
                 let field_idx = self.get_field_index(&base.ty, field)?;
                 Some(base_place.field(field_idx, field.clone()))
