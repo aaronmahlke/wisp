@@ -600,23 +600,23 @@ impl<'a> FunctionLowerer<'a> {
                 Operand::Copy(Place::local(temp))
             }
             
-            TypedExprKind::MethodCall { receiver, method_def_id, args, .. } => {
+            TypedExprKind::MethodCall { receiver, method_def_id, is_mut_self, args, .. } => {
                 // Lower the receiver
                 let receiver_op = self.lower_expr(receiver);
                 
-                // Create a reference to the receiver for &self parameter
+                // Create a reference to the receiver for &self or &mut self parameter
                 // The receiver needs to be a place to take a reference
                 let receiver_ref = match receiver_op {
                     Operand::Copy(place) | Operand::Move(place) => {
                         // Create a temp to hold the reference
                         let ref_ty = Type::Ref { 
-                            is_mut: false, 
+                            is_mut: *is_mut_self, 
                             inner: Box::new(receiver.ty.clone()) 
                         };
                         let ref_temp = self.new_temp(ref_ty);
                         self.assign(
                             Place::local(ref_temp),
-                            Rvalue::Ref { is_mut: false, place }
+                            Rvalue::Ref { is_mut: *is_mut_self, place }
                         );
                         Operand::Copy(Place::local(ref_temp))
                     }
@@ -625,13 +625,13 @@ impl<'a> FunctionLowerer<'a> {
                         let temp = self.new_temp(receiver.ty.clone());
                         self.assign(Place::local(temp), Rvalue::Use(receiver_op));
                         let ref_ty = Type::Ref { 
-                            is_mut: false, 
+                            is_mut: *is_mut_self, 
                             inner: Box::new(receiver.ty.clone()) 
                         };
                         let ref_temp = self.new_temp(ref_ty);
                         self.assign(
                             Place::local(ref_temp),
-                            Rvalue::Ref { is_mut: false, place: Place::local(temp) }
+                            Rvalue::Ref { is_mut: *is_mut_self, place: Place::local(temp) }
                         );
                         Operand::Copy(Place::local(ref_temp))
                     }
@@ -685,7 +685,7 @@ impl<'a> FunctionLowerer<'a> {
                 Operand::Copy(Place::local(temp))
             }
 
-            TypedExprKind::PrimitiveMethodCall { receiver, method_def_id, args, .. } => {
+            TypedExprKind::PrimitiveMethodCall { receiver, method_def_id, is_mut_self, args, .. } => {
                 // Lower the receiver
                 let receiver_op = self.lower_expr(receiver);
                 
@@ -694,17 +694,17 @@ impl<'a> FunctionLowerer<'a> {
                     // Already a reference, use it directly
                     receiver_op
                 } else {
-                    // Create a reference to the receiver for &self parameter
+                    // Create a reference to the receiver for &self or &mut self parameter
                     match receiver_op {
                         Operand::Copy(place) | Operand::Move(place) => {
                             let ref_ty = Type::Ref { 
-                                is_mut: false, 
+                                is_mut: *is_mut_self, 
                                 inner: Box::new(receiver.ty.clone()) 
                             };
                             let ref_temp = self.new_temp(ref_ty);
                             self.assign(
                                 Place::local(ref_temp),
-                                Rvalue::Ref { is_mut: false, place }
+                                Rvalue::Ref { is_mut: *is_mut_self, place }
                             );
                             Operand::Copy(Place::local(ref_temp))
                         }
@@ -713,13 +713,13 @@ impl<'a> FunctionLowerer<'a> {
                             let temp = self.new_temp(receiver.ty.clone());
                             self.assign(Place::local(temp), Rvalue::Use(receiver_op));
                             let ref_ty = Type::Ref { 
-                                is_mut: false, 
+                                is_mut: *is_mut_self, 
                                 inner: Box::new(receiver.ty.clone()) 
                             };
                             let ref_temp = self.new_temp(ref_ty);
                             self.assign(
                                 Place::local(ref_temp),
-                                Rvalue::Ref { is_mut: false, place: Place::local(temp) }
+                                Rvalue::Ref { is_mut: *is_mut_self, place: Place::local(temp) }
                             );
                             Operand::Copy(Place::local(ref_temp))
                         }
@@ -750,7 +750,7 @@ impl<'a> FunctionLowerer<'a> {
                 Operand::Copy(Place::local(temp))
             }
 
-            TypedExprKind::TraitMethodCall { receiver, method, trait_bounds, args, .. } => {
+            TypedExprKind::TraitMethodCall { receiver, method, is_mut_self, trait_bounds, args, .. } => {
                 // For trait method calls on type parameters, we need to resolve the actual
                 // method based on the concrete type. During monomorphization, the receiver's
                 // type will be substituted with a concrete type.
@@ -766,17 +766,17 @@ impl<'a> FunctionLowerer<'a> {
                     // Already a reference, use it directly
                     receiver_op
                 } else {
-                    // Create a reference to the receiver for &self parameter
+                    // Create a reference to the receiver for &self or &mut self parameter
                     match receiver_op {
                         Operand::Copy(place) | Operand::Move(place) => {
                             let ref_ty = Type::Ref { 
-                                is_mut: false, 
+                                is_mut: *is_mut_self, 
                                 inner: Box::new(receiver_ty.clone()) 
                             };
                             let ref_temp = self.new_temp(ref_ty);
                             self.assign(
                                 Place::local(ref_temp),
-                                Rvalue::Ref { is_mut: false, place }
+                                Rvalue::Ref { is_mut: *is_mut_self, place }
                             );
                             Operand::Copy(Place::local(ref_temp))
                         }
@@ -784,13 +784,13 @@ impl<'a> FunctionLowerer<'a> {
                             let temp = self.new_temp(receiver_ty.clone());
                             self.assign(Place::local(temp), Rvalue::Use(receiver_op));
                             let ref_ty = Type::Ref { 
-                                is_mut: false, 
+                                is_mut: *is_mut_self, 
                                 inner: Box::new(receiver_ty.clone()) 
                             };
                             let ref_temp = self.new_temp(ref_ty);
                             self.assign(
                                 Place::local(ref_temp),
-                                Rvalue::Ref { is_mut: false, place: Place::local(temp) }
+                                Rvalue::Ref { is_mut: *is_mut_self, place: Place::local(temp) }
                             );
                             Operand::Copy(Place::local(ref_temp))
                         }
@@ -1097,6 +1097,16 @@ impl<'a> FunctionLowerer<'a> {
                 Operand::Constant(Constant::FnPtr(lambda_def_id, lambda_name))
             }
 
+            TypedExprKind::Cast { expr: inner, target_type } => {
+                let operand = self.lower_expr(inner);
+                let result = self.new_temp(target_type.clone());
+                self.assign(Place::local(result), Rvalue::Cast {
+                    operand,
+                    ty: target_type.clone(),
+                });
+                Operand::Copy(Place::local(result))
+            }
+
             TypedExprKind::Match { scrutinee, arms } => {
                 let scrut_op = self.lower_expr(scrutinee);
                 let result = self.new_temp(expr.ty.clone());
@@ -1134,6 +1144,13 @@ impl<'a> FunctionLowerer<'a> {
 
             TypedExprKind::Error => {
                 Operand::Constant(Constant::Unit)
+            }
+            
+            TypedExprKind::StringInterp { .. } => {
+                // String interpolation should be desugared in the type checker
+                // into a chain of String.from() and + operations.
+                // If we get here, something went wrong.
+                panic!("StringInterp should be desugared in type checker")
             }
         }
     }

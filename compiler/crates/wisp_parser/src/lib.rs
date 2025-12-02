@@ -301,7 +301,7 @@ impl<'src> Parser<'src> {
         Ok(FnDef { name, type_params, params, return_type, body, span })
     }
     
-    /// Parse generic parameters: <T, U: Clone + Debug>
+    /// Parse generic parameters: <T, U: Clone + Debug, V = i32>
     fn parse_generic_params(&mut self) -> ParseResult<Vec<GenericParam>> {
         self.expect(Token::Lt)?;
         
@@ -319,8 +319,16 @@ impl<'src> Parser<'src> {
                 Vec::new()
             };
             
+            // Parse optional default: T = i32
+            let default = if self.check(&Token::Eq) {
+                self.advance();
+                Some(self.parse_type()?)
+            } else {
+                None
+            };
+            
             let span = Span::new(start.start, self.peek_span().end);
-            params.push(GenericParam { name, bounds, span });
+            params.push(GenericParam { name, bounds, default, span });
             
             if !self.check(&Token::Gt) {
                 self.expect(Token::Comma)?;
@@ -384,6 +392,18 @@ impl<'src> Parser<'src> {
                 };
                 return Ok(Param { name, is_mut: false, ty, span: Span::new(start.start, span.end) });
             }
+        }
+        
+        // Check for bare `self` (by value)
+        if self.check(&Token::SelfLower) {
+            let span = self.peek_span();
+            self.advance();
+            let name = Ident::new("self".to_string(), span);
+            let ty = TypeExpr {
+                kind: TypeKind::Named(Ident::new("Self".to_string(), span), Vec::new()),
+                span,
+            };
+            return Ok(Param { name, is_mut: false, ty, span });
         }
         
         let is_mut = if self.check(&Token::Mut) {
@@ -549,20 +569,20 @@ impl<'src> Parser<'src> {
         let first_type = self.parse_type()?;
         
         // Check for "for Type" (trait impl)
-        let (trait_name, target_type) = if self.check(&Token::For) {
+        let (trait_name, trait_type_args, target_type) = if self.check(&Token::For) {
             self.advance();
             let target = self.parse_type()?;
-            // first_type was the trait name
-            let trait_ident = match first_type.kind {
-                TypeKind::Named(id, _) => id,
+            // first_type was the trait name (possibly with type args)
+            let (trait_ident, type_args) = match first_type.kind {
+                TypeKind::Named(id, args) => (id, args),
                 _ => return Err(ParseError {
                     message: "expected trait name".to_string(),
                     span: first_type.span,
                 }),
             };
-            (Some(trait_ident), target)
+            (Some(trait_ident), type_args, target)
         } else {
-            (None, first_type)
+            (None, Vec::new(), first_type)
         };
         
         self.expect(Token::LBrace)?;
@@ -575,7 +595,7 @@ impl<'src> Parser<'src> {
         let end = self.expect(Token::RBrace)?;
         let span = Span::new(start.start, end.span.end);
         
-        Ok(ImplBlock { trait_name, target_type, methods, span })
+        Ok(ImplBlock { trait_name, trait_type_args, target_type, methods, span })
     }
 
     fn parse_type(&mut self) -> ParseResult<TypeExpr> {
@@ -911,6 +931,15 @@ impl<'src> Parser<'src> {
                     kind: ExprKind::Index(Box::new(expr), Box::new(index)),
                     span,
                 };
+            } else if self.check(&Token::As) {
+                // Type cast: expr as Type
+                self.advance();
+                let ty = self.parse_type()?;
+                let span = Span::new(expr.span.start, ty.span.end);
+                expr = Expr {
+                    kind: ExprKind::Cast(Box::new(expr), ty),
+                    span,
+                };
             } else {
                 break;
             }
@@ -1014,10 +1043,15 @@ impl<'src> Parser<'src> {
             }
             Token::StringLiteral(s) => {
                 self.advance();
-                Ok(Expr {
-                    kind: ExprKind::StringLiteral(s),
-                    span: start,
-                })
+                // Check if this is an interpolated string
+                if s.contains('{') {
+                    self.parse_interpolated_string(&s, start)
+                } else {
+                    Ok(Expr {
+                        kind: ExprKind::StringLiteral(s),
+                        span: start,
+                    })
+                }
             }
             Token::SelfLower => {
                 self.advance();
@@ -1363,6 +1397,104 @@ impl<'src> Parser<'src> {
                 span: start,
             }),
         }
+    }
+    
+    /// Parse an interpolated string like "hello {name}!"
+    /// The string content has already been extracted from quotes
+    fn parse_interpolated_string(&mut self, s: &str, span: Span) -> ParseResult<Expr> {
+        let mut parts = Vec::new();
+        let mut current_literal = String::new();
+        let mut chars = s.chars().peekable();
+        
+        while let Some(c) = chars.next() {
+            if c == '{' {
+                // Check for escaped brace {{
+                if chars.peek() == Some(&'{') {
+                    chars.next();
+                    current_literal.push('{');
+                    continue;
+                }
+                
+                // Save the current literal if non-empty
+                if !current_literal.is_empty() {
+                    parts.push(StringInterpPart::Literal(current_literal.clone()));
+                    current_literal.clear();
+                }
+                
+                // Extract the expression inside { }
+                let mut expr_str = String::new();
+                let mut brace_depth = 1;
+                
+                while let Some(c) = chars.next() {
+                    if c == '{' {
+                        brace_depth += 1;
+                        expr_str.push(c);
+                    } else if c == '}' {
+                        brace_depth -= 1;
+                        if brace_depth == 0 {
+                            break;
+                        }
+                        expr_str.push(c);
+                    } else {
+                        expr_str.push(c);
+                    }
+                }
+                
+                if brace_depth != 0 {
+                    return Err(ParseError {
+                        message: "unclosed '{' in string interpolation".to_string(),
+                        span,
+                    });
+                }
+                
+                // Parse the expression
+                let expr = Parser::parse_interpolation_expr(&expr_str).map_err(|e| ParseError {
+                    message: format!("error in interpolated expression: {}", e.message),
+                    span,
+                })?;
+                
+                parts.push(StringInterpPart::Expr(expr));
+            } else if c == '}' {
+                // Check for escaped brace }}
+                if chars.peek() == Some(&'}') {
+                    chars.next();
+                    current_literal.push('}');
+                } else {
+                    return Err(ParseError {
+                        message: "unmatched '}' in string".to_string(),
+                        span,
+                    });
+                }
+            } else {
+                current_literal.push(c);
+            }
+        }
+        
+        // Add any remaining literal
+        if !current_literal.is_empty() {
+            parts.push(StringInterpPart::Literal(current_literal));
+        }
+        
+        // If there's only one literal part, return a regular string
+        if parts.len() == 1 {
+            if let StringInterpPart::Literal(s) = &parts[0] {
+                return Ok(Expr {
+                    kind: ExprKind::StringLiteral(s.clone()),
+                    span,
+                });
+            }
+        }
+        
+        Ok(Expr {
+            kind: ExprKind::StringInterp(parts),
+            span,
+        })
+    }
+    
+    /// Parse a single expression from a string (for interpolation)
+    pub fn parse_interpolation_expr(source: &str) -> ParseResult<Expr> {
+        let mut parser = Parser::new(source)?;
+        parser.parse_expr()
     }
 }
 

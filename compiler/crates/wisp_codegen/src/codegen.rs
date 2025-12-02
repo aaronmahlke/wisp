@@ -921,9 +921,57 @@ impl<'a, 'b> FunctionCompiler<'a, 'b> {
                 }
             }
 
-            Rvalue::Discriminant(_) | Rvalue::Cast { .. } => {
+            Rvalue::Discriminant(_) => {
                 // Not fully implemented yet
                 Ok(Some(self.builder.ins().iconst(types::I32, 0)))
+            }
+            
+            Rvalue::Cast { operand, ty } => {
+                let val = self.compile_operand(operand)?.ok_or_else(|| CodegenError {
+                    message: "Cast operand has no value".to_string(),
+                })?;
+                
+                let from_ty = self.builder.func.dfg.value_type(val);
+                let to_ty = self.convert_type(ty);
+                
+                // If types are the same, no conversion needed
+                if from_ty == to_ty {
+                    return Ok(Some(val));
+                }
+                
+                // Handle various cast scenarios
+                let result = if from_ty.is_int() && to_ty.is_int() {
+                    // Integer to integer cast
+                    if from_ty.bits() < to_ty.bits() {
+                        // Widening - use sign extension for signed, zero extension otherwise
+                        // For simplicity, use uextend (zero extension)
+                        self.builder.ins().uextend(to_ty, val)
+                    } else if from_ty.bits() > to_ty.bits() {
+                        // Narrowing - use ireduce
+                        self.builder.ins().ireduce(to_ty, val)
+                    } else {
+                        // Same size, just use the value
+                        val
+                    }
+                } else if from_ty.is_float() && to_ty.is_float() {
+                    // Float to float cast
+                    if from_ty.bits() < to_ty.bits() {
+                        self.builder.ins().fpromote(to_ty, val)
+                    } else {
+                        self.builder.ins().fdemote(to_ty, val)
+                    }
+                } else if from_ty.is_int() && to_ty.is_float() {
+                    // Int to float
+                    self.builder.ins().fcvt_from_sint(to_ty, val)
+                } else if from_ty.is_float() && to_ty.is_int() {
+                    // Float to int
+                    self.builder.ins().fcvt_to_sint(to_ty, val)
+                } else {
+                    // For other cases (pointers, etc.), just bitcast or use the value directly
+                    val
+                };
+                
+                Ok(Some(result))
             }
         }
     }
@@ -1145,8 +1193,42 @@ impl<'a, 'b> FunctionCompiler<'a, 'b> {
         if let Some(&var) = self.locals.get(&place.local) {
             if place.projections.is_empty() {
                 self.builder.def_var(var, value);
+            } else {
+                // Handle storing through a reference (e.g., self.field = value where self is &mut T)
+                // The var holds a pointer, we need to store at the appropriate offset
+                let ptr = self.builder.use_var(var);
+                
+                // Calculate total offset from projections
+                let mut offset: i32 = 0;
+                for proj in &place.projections {
+                    if let PlaceProjection::Field(idx, _) = proj {
+                        // We need to find the struct type to get field offset
+                        // Look up the local's type from mir_func
+                        if let Some(local) = self.mir_func.locals.iter().find(|l| l.id == place.local) {
+                            if let Type::Ref { inner, .. } = &local.ty {
+                                if let Type::Struct(def_id) = inner.as_ref() {
+                                    if let Some(mir_struct) = self.structs.get(def_id) {
+                                        offset += self.field_offset(mir_struct, *idx) as i32;
+                                    }
+                                }
+                            }
+                        }
+                        // Also check params
+                        if let Some(param) = self.mir_func.params.iter().find(|p| p.id == place.local) {
+                            if let Type::Ref { inner, .. } = &param.ty {
+                                if let Type::Struct(def_id) = inner.as_ref() {
+                                    if let Some(mir_struct) = self.structs.get(def_id) {
+                                        offset += self.field_offset(mir_struct, *idx) as i32;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                
+                // Store through the pointer at the computed offset
+                self.builder.ins().store(cranelift_codegen::ir::MemFlags::new(), value, ptr, offset);
             }
-            // For projections, would need to compute address and store
         }
         Ok(())
     }
@@ -1268,10 +1350,20 @@ impl<'a, 'b> FunctionCompiler<'a, 'b> {
                     _ => (None, None),
                 };
                 
-                let callee_returns_struct = callee_def_id
+                // Check if the callee returns a struct
+                let mut callee_returns_struct = callee_def_id
                     .and_then(|id| self.func_return_types.get(&id))
                     .map(|ty| matches!(ty, Type::Struct(_)))
                     .unwrap_or(false);
+                
+                // For trait method calls, we don't have def_id, so check if destination is a struct
+                if !callee_returns_struct {
+                    if let Some(local) = self.mir_func.locals.iter().find(|l| l.id == destination.local) {
+                        if matches!(local.ty, Type::Struct(_)) {
+                            callee_returns_struct = true;
+                        }
+                    }
+                }
                 
                 // Compile arguments - handle struct args specially (pass as pointers)
                 let mut arg_vals = Vec::new();

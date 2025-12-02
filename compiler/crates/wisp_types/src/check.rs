@@ -65,6 +65,8 @@ pub struct TypeChecker {
     primitive_methods: HashMap<(String, String), (DefId, Type)>,
     /// Trait implementations for primitives: (primitive type name, trait DefId) -> true
     primitive_trait_impls: HashSet<(String, DefId)>,
+    /// Trait name to DefId lookup
+    trait_by_name: HashMap<String, DefId>,
 }
 
 impl TypeChecker {
@@ -84,6 +86,7 @@ impl TypeChecker {
             associated_functions: HashMap::new(),
             primitive_methods: HashMap::new(),
             primitive_trait_impls: HashSet::new(),
+            trait_by_name: HashMap::new(),
         }
     }
 
@@ -145,6 +148,7 @@ impl TypeChecker {
         // Register trait names and methods
         for t in &program.traits {
             self.ctx.register_type_name(t.def_id, t.name.clone());
+            self.trait_by_name.insert(t.name.clone(), t.def_id);
             
             // Collect trait method signatures
             let mut methods = Vec::new();
@@ -409,6 +413,51 @@ impl TypeChecker {
         }
     }
 
+    /// Check if a cast from one type to another is valid
+    fn is_valid_cast(&self, from: &Type, to: &Type) -> bool {
+        // Same type is always valid
+        if from == to {
+            return true;
+        }
+        
+        // Check for numeric casts
+        let is_numeric = |t: &Type| matches!(t,
+            Type::I8 | Type::I16 | Type::I32 | Type::I64 | Type::I128 |
+            Type::U8 | Type::U16 | Type::U32 | Type::U64 | Type::U128 |
+            Type::F32 | Type::F64
+        );
+        
+        // Numeric to numeric is valid
+        if is_numeric(from) && is_numeric(to) {
+            return true;
+        }
+        
+        // Char to/from integer is valid
+        if matches!(from, Type::Char) && is_numeric(to) {
+            return true;
+        }
+        if is_numeric(from) && matches!(to, Type::Char) {
+            return true;
+        }
+        
+        // Bool to integer is valid
+        if matches!(from, Type::Bool) && is_numeric(to) {
+            return true;
+        }
+        
+        // Pointer types (str, references) to i64 is valid (for FFI)
+        if matches!(from, Type::Str | Type::Ref { .. }) && matches!(to, Type::I64) {
+            return true;
+        }
+        
+        // i64 to pointer types is valid (for FFI)
+        if matches!(from, Type::I64) && matches!(to, Type::Str | Type::Ref { .. }) {
+            return true;
+        }
+        
+        false
+    }
+
     fn check_function(&mut self, f: &ResolvedFunction) -> TypedFunction {
         // Register type parameters
         for tp in &f.type_params {
@@ -497,21 +546,21 @@ impl TypeChecker {
             ResolvedStmt::Let { def_id, name, is_mut, ty, init, span } => {
                 let declared_type = ty.as_ref().map(|t| self.resolve_type(t));
                 
-                let init_type = init.as_ref().map(|e| {
-                    let typed = self.check_expr(e);
-                    typed.ty.clone()
+                // Type check the initializer with the expected type (if declared)
+                let typed_init = init.as_ref().map(|e| {
+                    self.check_expr_with_expected(e, declared_type.as_ref())
                 });
 
                 // Determine the type
-                let var_type = match (&declared_type, &init_type) {
-                    (Some(d), Some(i)) => {
-                        if let Err(e) = self.ctx.unify(d, i) {
+                let var_type = match (&declared_type, &typed_init) {
+                    (Some(d), Some(init_expr)) => {
+                        if let Err(e) = self.ctx.unify(d, &init_expr.ty) {
                             self.error(format!("type mismatch in let: {}", e), *span);
                         }
                         self.ctx.apply(d)
                     }
                     (Some(d), None) => d.clone(),
-                    (None, Some(i)) => i.clone(),
+                    (None, Some(init_expr)) => init_expr.ty.clone(),
                     (None, None) => {
                         self.error("cannot infer type without initializer".to_string(), *span);
                         Type::Error
@@ -524,8 +573,6 @@ impl TypeChecker {
                 self.ctx.record_span_type(span.start, span.end, format!("{}: {}", name, var_type.display(&self.ctx)));
                 // Record definition for go-to-definition
                 self.ctx.record_span_definition(span.start, span.end, *def_id);
-
-                let typed_init = init.as_ref().map(|e| self.check_expr(e));
 
                 (TypedStmt::Let {
                     def_id: *def_id,
@@ -695,12 +742,36 @@ impl TypeChecker {
     }
 
     fn check_expr(&mut self, expr: &ResolvedExpr) -> TypedExpr {
+        self.check_expr_with_expected(expr, None)
+    }
+    
+    fn check_expr_with_expected(&mut self, expr: &ResolvedExpr, expected: Option<&Type>) -> TypedExpr {
         let (kind, ty) = match &expr.kind {
             ResolvedExprKind::IntLiteral(n) => {
-                (TypedExprKind::IntLiteral(*n), Type::I32) // Default to i32
+                // Use expected type if it's a numeric type, otherwise default to i32
+                let ty = match expected {
+                    Some(Type::I8) => Type::I8,
+                    Some(Type::I16) => Type::I16,
+                    Some(Type::I32) => Type::I32,
+                    Some(Type::I64) => Type::I64,
+                    Some(Type::I128) => Type::I128,
+                    Some(Type::U8) => Type::U8,
+                    Some(Type::U16) => Type::U16,
+                    Some(Type::U32) => Type::U32,
+                    Some(Type::U64) => Type::U64,
+                    Some(Type::U128) => Type::U128,
+                    _ => Type::I32, // Default to i32
+                };
+                (TypedExprKind::IntLiteral(*n), ty)
             }
             ResolvedExprKind::FloatLiteral(n) => {
-                (TypedExprKind::FloatLiteral(*n), Type::F64) // Default to f64
+                // Use expected type if it's a float type, otherwise default to f64
+                let ty = match expected {
+                    Some(Type::F32) => Type::F32,
+                    Some(Type::F64) => Type::F64,
+                    _ => Type::F64, // Default to f64
+                };
+                (TypedExprKind::FloatLiteral(*n), ty)
             }
             ResolvedExprKind::BoolLiteral(b) => {
                 (TypedExprKind::BoolLiteral(*b), Type::Bool)
@@ -723,6 +794,45 @@ impl TypeChecker {
                 let left_typed = self.check_expr(left);
                 let right_typed = self.check_expr(right);
                 
+                // Check if this is an overloadable operator on a non-primitive type
+                if let Some((trait_name, method_name)) = Self::op_to_trait(*op) {
+                    if !left_typed.ty.is_primitive() {
+                        // Try to find an operator trait implementation
+                        if let Some((method_def_id, method_type)) = self.find_op_trait_method(&left_typed.ty, trait_name, method_name) {
+                            // Desugar to a method call: left.add(right)
+                            let (result_type, is_mut_self) = if let Type::Function { ret, params, .. } = &method_type {
+                                // Check that right matches the expected parameter type
+                                if params.len() >= 2 {
+                                    // params[0] is self, params[1] is rhs
+                                    if let Err(e) = self.ctx.unify(&right_typed.ty, &params[1]) {
+                                        self.error(format!("operator {} rhs type mismatch: {}", method_name, e), expr.span);
+                                    }
+                                }
+                                // Check if self param is &mut
+                                let is_mut = params.first().map(|p| matches!(p, Type::Ref { is_mut: true, .. })).unwrap_or(false);
+                                ((**ret).clone(), is_mut)
+                            } else {
+                                self.error(format!("operator {} method has wrong type", method_name), expr.span);
+                                (Type::Error, false)
+                            };
+                            
+                            return TypedExpr {
+                                kind: TypedExprKind::MethodCall {
+                                    receiver: Box::new(left_typed),
+                                    method: method_name.to_string(),
+                                    method_def_id,
+                                    method_span: expr.span,
+                                    is_mut_self,
+                                    args: vec![right_typed],
+                                },
+                                ty: result_type,
+                                span: expr.span,
+                            };
+                        }
+                    }
+                }
+                
+                // Fall back to built-in operator handling
                 let result_type = self.check_binary_op(*op, &left_typed.ty, &right_typed.ty, expr.span);
                 
                 (TypedExprKind::Binary {
@@ -843,7 +953,7 @@ impl TypeChecker {
                             // TODO: Handle named arguments for methods
                             let args_typed: Vec<_> = args.iter().map(|a| self.check_expr(&a.value)).collect();
                             
-                            let result_type = if let Type::Function { params, ret } = &method_type {
+                            let (result_type, is_mut_self) = if let Type::Function { params, ret } = &method_type {
                                 // Method's first param is &self or &mut self
                                 // Check remaining args against remaining params
                                 let method_params = &params[1..]; // Skip self param
@@ -864,9 +974,11 @@ impl TypeChecker {
                                         }
                                     }
                                 }
-                                (**ret).clone()
+                                // Check if self param is &mut
+                                let is_mut = params.first().map(|p| matches!(p, Type::Ref { is_mut: true, .. })).unwrap_or(false);
+                                ((**ret).clone(), is_mut)
                             } else {
-                                Type::Error
+                                (Type::Error, false)
                             };
                             
                             // Record method signature at method span for hover
@@ -885,6 +997,7 @@ impl TypeChecker {
                                     method: method_name.clone(),
                                     method_def_id,
                                     method_span,
+                                    is_mut_self,
                                     args: args_typed,
                                 },
                                 ty: result_type,
@@ -899,7 +1012,7 @@ impl TypeChecker {
                             // TODO: Handle named arguments for trait methods
                             let args_typed: Vec<_> = args.iter().map(|a| self.check_expr(&a.value)).collect();
                             
-                            let result_type = if let Type::Function { params, ret } = &method_type {
+                            let (result_type, is_mut_self) = if let Type::Function { params, ret } = &method_type {
                                 let method_params = &params[1..]; // Skip self param
                                 
                                 if args_typed.len() != method_params.len() {
@@ -909,10 +1022,12 @@ impl TypeChecker {
                                         expr.span
                                     );
                                 }
+                                // Check if self param is &mut
+                                let is_mut = params.first().map(|p| matches!(p, Type::Ref { is_mut: true, .. })).unwrap_or(false);
                                 // Note: we don't check arg types here since they're generic
-                                (**ret).clone()
+                                ((**ret).clone(), is_mut)
                             } else {
-                                Type::Error
+                                (Type::Error, false)
                             };
                             
                             // For trait method calls on type params, we use TraitMethodCall
@@ -921,6 +1036,7 @@ impl TypeChecker {
                                     receiver: Box::new(receiver_typed),
                                     method: method_name.clone(),
                                     method_span,
+                                    is_mut_self,
                                     trait_bounds: bounds,
                                     args: args_typed,
                                 },
@@ -959,7 +1075,7 @@ impl TypeChecker {
                             // Method call on primitive type
                             let args_typed: Vec<_> = args.iter().map(|a| self.check_expr(&a.value)).collect();
                             
-                            let result_type = if let Type::Function { params, ret } = &method_type {
+                            let (result_type, is_mut_self) = if let Type::Function { params, ret } = &method_type {
                                 let method_params = &params[1..]; // Skip self param
                                 
                                 if args_typed.len() != method_params.len() {
@@ -969,9 +1085,11 @@ impl TypeChecker {
                                         expr.span
                                     );
                                 }
-                                (**ret).clone()
+                                // Check if self param is &mut
+                                let is_mut = params.first().map(|p| matches!(p, Type::Ref { is_mut: true, .. })).unwrap_or(false);
+                                ((**ret).clone(), is_mut)
                             } else {
-                                Type::Error
+                                (Type::Error, false)
                             };
                             
                             // Record method signature at method span for hover
@@ -990,6 +1108,7 @@ impl TypeChecker {
                                     method: method_name.clone(),
                                     method_def_id,
                                     method_span,
+                                    is_mut_self,
                                     args: args_typed,
                                 },
                                 ty: result_type,
@@ -1465,7 +1584,186 @@ impl TypeChecker {
                 }, fn_type)
             }
             
+            ResolvedExprKind::Cast { expr, target_type } => {
+                let typed_expr = self.check_expr(expr);
+                let target = self.resolve_type(target_type);
+                
+                // Check if the cast is valid
+                // For now, allow casts between numeric types and pointer types
+                let from_ty = self.ctx.apply(&typed_expr.ty);
+                let to_ty = self.ctx.apply(&target);
+                
+                let valid = self.is_valid_cast(&from_ty, &to_ty);
+                if !valid {
+                    self.error(format!("cannot cast {} to {}", from_ty.display(&self.ctx), to_ty.display(&self.ctx)), expr.span);
+                }
+                
+                (TypedExprKind::Cast {
+                    expr: Box::new(typed_expr),
+                    target_type: target.clone(),
+                }, target)
+            }
+            
             ResolvedExprKind::Error => (TypedExprKind::Error, Type::Error),
+            
+            ResolvedExprKind::StringInterp { parts } => {
+                // Desugar string interpolation into a chain of + operations
+                // "hello {name}!" becomes:
+                //   String.from("hello ") + name.to_string() + String.from("!")
+                
+                // Get the String type
+                let string_type = self.ctx.lookup_type_by_name("String")
+                    .unwrap_or(Type::Str);
+                
+                // Convert each part to a TypedExpr that produces a String
+                let mut string_exprs: Vec<TypedExpr> = Vec::new();
+                
+                for part in parts {
+                    match part {
+                        wisp_hir::ResolvedStringInterpPart::Literal(s) => {
+                            // Create String.from("literal")
+                            // For now, we'll create a StringLiteral and let it be converted
+                            // Actually, we need to call String.from() - but that requires
+                            // looking up the method. For simplicity, store as StringLiteral
+                            // and handle in MIR lowering
+                            string_exprs.push(TypedExpr {
+                                kind: TypedExprKind::StringLiteral(s.clone()),
+                                ty: Type::Str,
+                                span: expr.span,
+                            });
+                        }
+                        wisp_hir::ResolvedStringInterpPart::Expr(e) => {
+                            let typed_expr = self.check_expr(e);
+                            
+                            // If the expression is already a String, use it directly
+                            // Otherwise, we need to call .to_string() on it
+                            if typed_expr.ty == string_type {
+                                string_exprs.push(typed_expr);
+                            } else {
+                                // Need to call .to_string() - create a method call
+                                // Check if the type implements Display
+                                let display_trait = self.trait_by_name.get("Display").copied();
+                                
+                                if let Some(trait_id) = display_trait {
+                                    // Create a reference to the expression for &self
+                                    let ref_expr = TypedExpr {
+                                        kind: TypedExprKind::Ref {
+                                            is_mut: false,
+                                            expr: Box::new(typed_expr.clone()),
+                                        },
+                                        ty: Type::Ref {
+                                            is_mut: false,
+                                            inner: Box::new(typed_expr.ty.clone()),
+                                        },
+                                        span: expr.span,
+                                    };
+                                    
+                                    // Create the to_string() method call
+                                    let to_string_call = TypedExpr {
+                                        kind: TypedExprKind::TraitMethodCall {
+                                            receiver: Box::new(ref_expr),
+                                            method: "to_string".to_string(),
+                                            method_span: expr.span,
+                                            is_mut_self: false, // to_string takes &self, not &mut self
+                                            trait_bounds: vec![trait_id],
+                                            args: vec![],
+                                        },
+                                        ty: string_type.clone(),
+                                        span: expr.span,
+                                    };
+                                    
+                                    string_exprs.push(to_string_call);
+                                } else {
+                                    // No Display trait found, just use the expression
+                                    // This will likely fail at runtime
+                                    self.error(
+                                        format!("type {} does not implement Display for string interpolation", 
+                                            typed_expr.ty.display(&self.ctx)),
+                                        expr.span
+                                    );
+                                    string_exprs.push(typed_expr);
+                                }
+                            }
+                        }
+                    }
+                }
+                
+                // Now chain all parts with + operator
+                if string_exprs.is_empty() {
+                    // Empty interpolation - return empty string
+                    (TypedExprKind::StringLiteral(String::new()), Type::Str)
+                } else if string_exprs.len() == 1 {
+                    // Single part - just return it
+                    let single = string_exprs.pop().unwrap();
+                    (single.kind, single.ty)
+                } else {
+                    // Multiple parts - chain with +
+                    // We need to wrap str literals in String.from() for the + operator
+                    // Build: part1 + part2 + part3 + ...
+                    
+                    let mut result = string_exprs.remove(0);
+                    
+                    // If first part is str, wrap in String.from()
+                    if result.ty == Type::Str {
+                        result = self.wrap_str_in_string_from(result, expr.span);
+                    }
+                    
+                    for part in string_exprs {
+                        let mut rhs = part;
+                        
+                        // If rhs is str, wrap in String.from()
+                        if rhs.ty == Type::Str {
+                            rhs = self.wrap_str_in_string_from(rhs, expr.span);
+                        }
+                        
+                        // Look up the Add trait implementation for String
+                        let add_trait = self.trait_by_name.get("Add").copied();
+                        
+                        if let Some(_trait_id) = add_trait {
+                            if let Some((method_def_id, _)) = self.find_op_trait_method(&string_type, "Add", "add") {
+                                // Create the + operation as a method call
+                                // Note: Add::add takes self by value, not &mut self
+                                result = TypedExpr {
+                                    kind: TypedExprKind::MethodCall {
+                                        receiver: Box::new(result),
+                                        method: "add".to_string(),
+                                        method_def_id,
+                                        method_span: expr.span,
+                                        is_mut_self: false,
+                                        args: vec![rhs],
+                                    },
+                                    ty: string_type.clone(),
+                                    span: expr.span,
+                                };
+                            } else {
+                                // Fallback: use binary op (won't work for String)
+                                result = TypedExpr {
+                                    kind: TypedExprKind::Binary {
+                                        left: Box::new(result),
+                                        op: wisp_ast::BinOp::Add,
+                                        right: Box::new(rhs),
+                                    },
+                                    ty: string_type.clone(),
+                                    span: expr.span,
+                                };
+                            }
+                        } else {
+                            // No Add trait, use binary op
+                            result = TypedExpr {
+                                kind: TypedExprKind::Binary {
+                                    left: Box::new(result),
+                                    op: wisp_ast::BinOp::Add,
+                                    right: Box::new(rhs),
+                                },
+                                ty: string_type.clone(),
+                                span: expr.span,
+                            };
+                        }
+                    }
+                    
+                    (result.kind, result.ty)
+                }
+            }
         };
 
         // Record span→type mapping for LSP hover support
@@ -1477,6 +1775,78 @@ impl TypeChecker {
         self.ctx.record_span_type(expr.span.start, expr.span.end, type_str);
 
         TypedExpr { kind, ty, span: expr.span }
+    }
+    
+    /// Map binary operators to (trait name, method name) for operator overloading
+    fn op_to_trait(op: wisp_ast::BinOp) -> Option<(&'static str, &'static str)> {
+        use wisp_ast::BinOp;
+        match op {
+            BinOp::Add => Some(("Add", "add")),
+            BinOp::Sub => Some(("Sub", "sub")),
+            BinOp::Mul => Some(("Mul", "mul")),
+            BinOp::Div => Some(("Div", "div")),
+            BinOp::Mod => Some(("Rem", "rem")),
+            // Comparison and logical ops don't use trait overloading (for now)
+            _ => None,
+        }
+    }
+    
+    /// Try to find an operator trait implementation for the given type
+    fn find_op_trait_method(&self, ty: &Type, trait_name: &str, method_name: &str) -> Option<(DefId, Type)> {
+        // Get the trait DefId
+        let trait_def_id = self.trait_by_name.get(trait_name)?;
+        
+        // Get the type's DefId
+        let type_def_id = match ty {
+            Type::Struct(id) => Some(*id),
+            Type::Enum(id) => Some(*id),
+            _ => None,
+        }?;
+        
+        // Check if this type implements the trait
+        let impl_methods = self.trait_impls.get(&(type_def_id, *trait_def_id))?;
+        
+        // Find the method
+        for (name, def_id, method_type) in impl_methods {
+            if name == method_name {
+                return Some((*def_id, method_type.clone()));
+            }
+        }
+        
+        None
+    }
+    
+    /// Wrap a str expression in String.from() call
+    fn wrap_str_in_string_from(&self, str_expr: TypedExpr, span: Span) -> TypedExpr {
+        // Look up String type and String.from associated function
+        let string_type = self.ctx.lookup_type_by_name("String")
+            .unwrap_or(Type::Str);
+        
+        let string_def_id = match &string_type {
+            Type::Struct(id) => Some(*id),
+            _ => None,
+        };
+        
+        if let Some(struct_id) = string_def_id {
+            // Look up String.from
+            if let Some((fn_def_id, _fn_type)) = self.associated_functions.get(&(struct_id, "from".to_string())) {
+                // Create String.from(str_expr) call
+                return TypedExpr {
+                    kind: TypedExprKind::AssociatedFunctionCall {
+                        type_id: struct_id,
+                        function: "from".to_string(),
+                        function_def_id: *fn_def_id,
+                        function_span: span,
+                        args: vec![str_expr],
+                    },
+                    ty: string_type,
+                    span,
+                };
+            }
+        }
+        
+        // Fallback: just return the str expr (will fail at runtime)
+        str_expr
     }
 
     fn check_binary_op(&mut self, op: wisp_ast::BinOp, left: &Type, right: &Type, span: Span) -> Type {
@@ -1954,13 +2324,13 @@ pub struct TypedParam {
     pub span: Span,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct TypedBlock {
     pub stmts: Vec<TypedStmt>,
     pub ty: Type,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum TypedStmt {
     Let {
         def_id: DefId,
@@ -1973,14 +2343,14 @@ pub enum TypedStmt {
     Expr(TypedExpr),
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct TypedExpr {
     pub kind: TypedExprKind,
     pub ty: Type,
     pub span: Span,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum TypedExprKind {
     IntLiteral(i64),
     FloatLiteral(f64),
@@ -1992,13 +2362,13 @@ pub enum TypedExprKind {
     Call { callee: Box<TypedExpr>, args: Vec<TypedExpr> },
     /// Call to a generic function with inferred type arguments
     GenericCall { func_def_id: DefId, type_args: Vec<Type>, args: Vec<TypedExpr> },
-    MethodCall { receiver: Box<TypedExpr>, method: String, method_def_id: DefId, method_span: Span, args: Vec<TypedExpr> },
+    MethodCall { receiver: Box<TypedExpr>, method: String, method_def_id: DefId, method_span: Span, is_mut_self: bool, args: Vec<TypedExpr> },
     /// Method call on a type parameter via trait bounds
-    TraitMethodCall { receiver: Box<TypedExpr>, method: String, method_span: Span, trait_bounds: Vec<DefId>, args: Vec<TypedExpr> },
+    TraitMethodCall { receiver: Box<TypedExpr>, method: String, method_span: Span, is_mut_self: bool, trait_bounds: Vec<DefId>, args: Vec<TypedExpr> },
     /// Associated function call: Type.function(args) where function has no self
     AssociatedFunctionCall { type_id: DefId, function: String, function_def_id: DefId, function_span: Span, args: Vec<TypedExpr> },
     /// Method call on a primitive type (i32, bool, str, etc.)
-    PrimitiveMethodCall { receiver: Box<TypedExpr>, method: String, method_def_id: DefId, method_span: Span, args: Vec<TypedExpr> },
+    PrimitiveMethodCall { receiver: Box<TypedExpr>, method: String, method_def_id: DefId, method_span: Span, is_mut_self: bool, args: Vec<TypedExpr> },
     Field { expr: Box<TypedExpr>, field: String, field_span: Span },
     StructLit { struct_def: DefId, fields: Vec<(String, TypedExpr)> },
     If { cond: Box<TypedExpr>, then_block: TypedBlock, else_block: Option<TypedElse> },
@@ -2012,10 +2382,19 @@ pub enum TypedExprKind {
     Index { expr: Box<TypedExpr>, index: Box<TypedExpr> },
     ArrayLit(Vec<TypedExpr>),
     Lambda { params: Vec<TypedLambdaParam>, body: Box<TypedExpr> },
+    Cast { expr: Box<TypedExpr>, target_type: Type },
+    StringInterp { parts: Vec<TypedStringInterpPart> },
     Error,
 }
 
-#[derive(Debug)]
+/// Part of an interpolated string (typed)
+#[derive(Debug, Clone)]
+pub enum TypedStringInterpPart {
+    Literal(String),
+    Expr(TypedExpr),
+}
+
+#[derive(Debug, Clone)]
 pub struct TypedLambdaParam {
     pub def_id: DefId,
     pub name: String,
@@ -2023,19 +2402,19 @@ pub struct TypedLambdaParam {
     pub span: Span,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum TypedElse {
     Block(TypedBlock),
     If(Box<TypedExpr>),
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct TypedMatchArm {
     pub pattern: TypedPattern,
     pub body: TypedExpr,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum TypedPattern {
     Wildcard,
     Binding { def_id: DefId, name: String, ty: Type },

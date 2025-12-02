@@ -51,6 +51,7 @@ pub struct ExternStaticDef {
 pub struct GenericParam {
     pub name: Ident,
     pub bounds: Vec<TypeExpr>,  // Trait bounds like T: Clone + Debug
+    pub default: Option<TypeExpr>,  // Default type like T = i32
     pub span: Span,
 }
 
@@ -121,6 +122,7 @@ pub struct TraitDef {
 #[derive(Debug, Clone)]
 pub struct ImplBlock {
     pub trait_name: Option<Ident>,  // None for inherent impl
+    pub trait_type_args: Vec<TypeExpr>,  // Type arguments for trait (e.g., Add<i32>)
     pub target_type: TypeExpr,
     pub methods: Vec<FnDef>,
     pub span: Span,
@@ -208,6 +210,20 @@ pub enum ExprKind {
     ArrayLit(Vec<Expr>),
     /// Lambda/closure: (x, y) -> x + y
     Lambda(Vec<LambdaParam>, Box<Expr>),
+    /// Type cast: expr as Type
+    Cast(Box<Expr>, TypeExpr),
+    /// String interpolation: "hello {name}!"
+    /// Parts alternate between string literals and expressions
+    StringInterp(Vec<StringInterpPart>),
+}
+
+/// Part of an interpolated string
+#[derive(Debug, Clone)]
+pub enum StringInterpPart {
+    /// Literal string part
+    Literal(String),
+    /// Interpolated expression: {expr}
+    Expr(Expr),
 }
 
 /// Lambda parameter (may have type annotation)
@@ -749,6 +765,24 @@ impl Expr {
                 out.push_str(&body.pretty_print_indented(indent + 1));
                 out
             }
+            ExprKind::Cast(expr, ty) => {
+                format!("{}Cast({} as {})\n", ind, expr.pretty_print(), ty.pretty_print())
+            }
+            ExprKind::StringInterp(parts) => {
+                let mut out = format!("{}StringInterp\n", ind);
+                for part in parts {
+                    match part {
+                        StringInterpPart::Literal(s) => {
+                            out.push_str(&format!("{}  Literal: \"{}\"\n", ind, s));
+                        }
+                        StringInterpPart::Expr(e) => {
+                            out.push_str(&format!("{}  Expr:\n", ind));
+                            out.push_str(&e.pretty_print_indented(indent + 2));
+                        }
+                    }
+                }
+                out
+            }
         }
     }
     
@@ -830,6 +864,24 @@ impl Expr {
                     .collect::<Vec<_>>()
                     .join(", ");
                 format!("({}) -> {}", params_str, body.pretty_print())
+            }
+            ExprKind::Cast(expr, ty) => {
+                format!("{} as {}", expr.pretty_print(), ty.pretty_print())
+            }
+            ExprKind::StringInterp(parts) => {
+                let mut out = String::from("\"");
+                for part in parts {
+                    match part {
+                        StringInterpPart::Literal(s) => out.push_str(s),
+                        StringInterpPart::Expr(e) => {
+                            out.push('{');
+                            out.push_str(&e.pretty_print());
+                            out.push('}');
+                        }
+                    }
+                }
+                out.push('"');
+                out
             }
         }
     }

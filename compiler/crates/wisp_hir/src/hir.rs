@@ -263,6 +263,7 @@ pub struct ResolvedTrait {
 #[derive(Debug, Clone)]
 pub struct ResolvedImpl {
     pub trait_def: Option<DefId>,
+    pub trait_type_args: Vec<ResolvedType>,  // Type arguments for trait
     pub target_type: ResolvedType,
     pub methods: Vec<ResolvedFunction>,
     pub span: Span,
@@ -274,6 +275,7 @@ pub struct ResolvedTypeParam {
     pub def_id: DefId,
     pub name: String,
     pub bounds: Vec<ResolvedType>,
+    pub default: Option<ResolvedType>,
     pub span: Span,
 }
 
@@ -454,8 +456,26 @@ pub enum ResolvedExprKind {
         body: Box<ResolvedExpr>,
     },
     
+    /// Type cast: expr as Type
+    Cast {
+        expr: Box<ResolvedExpr>,
+        target_type: ResolvedType,
+    },
+    
+    /// String interpolation: "hello {name}!"
+    StringInterp {
+        parts: Vec<ResolvedStringInterpPart>,
+    },
+    
     /// Error (for recovery)
     Error,
+}
+
+/// Part of an interpolated string (resolved)
+#[derive(Debug, Clone)]
+pub enum ResolvedStringInterpPart {
+    Literal(String),
+    Expr(ResolvedExpr),
 }
 
 /// Resolved lambda parameter

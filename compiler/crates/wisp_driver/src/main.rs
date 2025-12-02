@@ -1,107 +1,153 @@
-use std::env;
 use std::fs;
+use std::io;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use clap::{Parser, Subcommand, CommandFactory};
+use clap_complete::{generate, Shell};
 use wisp_lexer::{Lexer, Token};
-use wisp_parser::{Parser, parse_with_imports};
+use wisp_parser::{Parser as WispParser, parse_with_imports};
 use wisp_hir::Resolver;
 use wisp_types::TypeChecker;
 use wisp_borrowck::BorrowChecker;
 use wisp_mir::lower_program;
 use wisp_codegen::Codegen;
 
-fn print_usage() {
-    eprintln!("Wisp Compiler");
-    eprintln!();
-    eprintln!("Usage: wisp <command> <file.ws>");
-    eprintln!();
-    eprintln!("Commands:");
-    eprintln!("  run <file>      Compile and run the program");
-    eprintln!("  build <file>    Compile to executable");
-    eprintln!("  lsp             Start the language server");
-    eprintln!("  lex <file>      Show lexer output (tokens)");
-    eprintln!("  parse <file>    Show parser output (AST)");
-    eprintln!("  resolve <file>  Show name resolution (HIR)");
-    eprintln!("  check <file>    Show type checking output");
-    eprintln!("  borrow <file>   Show borrow checking output");
-    eprintln!("  mir <file>      Show MIR output");
-    eprintln!("  emit-obj <file> Emit object file only");
-    eprintln!("  help            Show this help message");
-    eprintln!();
-    eprintln!("Examples:");
-    eprintln!("  wisp run examples/hello.ws");
-    eprintln!("  wisp build examples/hello.ws");
-    eprintln!("  wisp parse examples/hello.ws");
+#[derive(Parser)]
+#[command(name = "wisp")]
+#[command(author, version, about = "The Wisp programming language compiler", long_about = None)]
+struct Cli {
+    #[command(subcommand)]
+    command: Commands,
+}
+
+#[derive(Subcommand)]
+enum Commands {
+    /// Compile and run the program
+    Run {
+        /// The .ws file to compile and run
+        #[arg(value_hint = clap::ValueHint::FilePath)]
+        file: PathBuf,
+    },
+    /// Compile to executable
+    Build {
+        /// The .ws file to compile
+        #[arg(value_hint = clap::ValueHint::FilePath)]
+        file: PathBuf,
+    },
+    /// Start the language server
+    Lsp,
+    /// Show lexer output (tokens)
+    Lex {
+        /// The .ws file to lex
+        #[arg(value_hint = clap::ValueHint::FilePath)]
+        file: PathBuf,
+    },
+    /// Show parser output (AST)
+    Parse {
+        /// The .ws file to parse
+        #[arg(value_hint = clap::ValueHint::FilePath)]
+        file: PathBuf,
+    },
+    /// Show name resolution (HIR)
+    Resolve {
+        /// The .ws file to resolve
+        #[arg(value_hint = clap::ValueHint::FilePath)]
+        file: PathBuf,
+    },
+    /// Show type checking output
+    Check {
+        /// The .ws file to type check
+        #[arg(value_hint = clap::ValueHint::FilePath)]
+        file: PathBuf,
+    },
+    /// Show borrow checking output
+    Borrow {
+        /// The .ws file to borrow check
+        #[arg(value_hint = clap::ValueHint::FilePath)]
+        file: PathBuf,
+    },
+    /// Show MIR output
+    Mir {
+        /// The .ws file to lower to MIR
+        #[arg(value_hint = clap::ValueHint::FilePath)]
+        file: PathBuf,
+    },
+    /// Emit object file only
+    EmitObj {
+        /// The .ws file to compile
+        #[arg(value_hint = clap::ValueHint::FilePath)]
+        file: PathBuf,
+    },
+    /// Generate shell completions
+    Completions {
+        /// The shell to generate completions for
+        #[arg(value_enum)]
+        shell: Shell,
+    },
 }
 
 fn main() {
-    let args: Vec<String> = env::args().collect();
-    
-    if args.len() < 2 {
-        print_usage();
-        std::process::exit(1);
-    }
+    let cli = Cli::parse();
 
-    // Handle help
-    if args[1] == "help" || args[1] == "--help" || args[1] == "-h" {
-        print_usage();
-        std::process::exit(0);
-    }
-    
-    // Handle LSP (no file argument needed)
-    if args[1] == "lsp" {
-        run_lsp();
-        return;
-    }
-
-    // All other commands require a file argument
-    let commands = ["run", "build", "lex", "parse", "resolve", "check", "borrow", "mir", "emit-obj"];
-    
-    let (mode, file_path) = if commands.contains(&args[1].as_str()) {
-        if args.len() < 3 {
-            eprintln!("Usage: wisp {} <file.ws>", args[1]);
-            std::process::exit(1);
+    match cli.command {
+        Commands::Run { file } => {
+            let source = read_file(&file);
+            run_and_execute(&source, file.to_str().unwrap());
         }
-        (args[1].as_str(), &args[2])
-    } else if args[1].starts_with("--") {
-        // Support legacy --command syntax
-        let cmd = args[1].trim_start_matches("--");
-        if commands.contains(&cmd) {
-            if args.len() < 3 {
-                eprintln!("Usage: wisp {} <file.ws>", cmd);
-                std::process::exit(1);
-            }
-            (cmd, &args[2])
-        } else {
-            eprintln!("Unknown command: {}", args[1]);
-            print_usage();
-            std::process::exit(1);
+        Commands::Build { file } => {
+            let source = read_file(&file);
+            run_build(&source, file.to_str().unwrap());
         }
-    } else {
-        // Default: treat argument as file and run it
-        ("run", &args[1])
-    };
+        Commands::Lsp => {
+            run_lsp();
+        }
+        Commands::Lex { file } => {
+            let source = read_file(&file);
+            run_lexer(&source, file.to_str().unwrap());
+        }
+        Commands::Parse { file } => {
+            let source = read_file(&file);
+            run_parser(&source, file.to_str().unwrap());
+        }
+        Commands::Resolve { file } => {
+            let source = read_file(&file);
+            run_resolver(&source, file.to_str().unwrap());
+        }
+        Commands::Check { file } => {
+            let source = read_file(&file);
+            run_type_check(&source, file.to_str().unwrap());
+        }
+        Commands::Borrow { file } => {
+            let source = read_file(&file);
+            run_borrow_check(&source, file.to_str().unwrap());
+        }
+        Commands::Mir { file } => {
+            let source = read_file(&file);
+            run_mir(&source, file.to_str().unwrap());
+        }
+        Commands::EmitObj { file } => {
+            let source = read_file(&file);
+            run_codegen(&source, file.to_str().unwrap());
+        }
+        Commands::Completions { shell } => {
+            generate_completions(shell);
+        }
+    }
+}
 
-    let source = match fs::read_to_string(file_path) {
+fn read_file(path: &Path) -> String {
+    match fs::read_to_string(path) {
         Ok(s) => s,
         Err(e) => {
-            eprintln!("Error reading file '{}': {}", file_path, e);
+            eprintln!("Error reading file '{}': {}", path.display(), e);
             std::process::exit(1);
         }
-    };
-
-    match mode {
-        "run" => run_and_execute(&source, file_path),
-        "build" => run_build(&source, file_path),
-        "lex" => run_lexer(&source, file_path),
-        "parse" => run_parser(&source, file_path),
-        "resolve" => run_resolver(&source, file_path),
-        "check" => run_type_check(&source, file_path),
-        "borrow" => run_borrow_check(&source, file_path),
-        "mir" => run_mir(&source, file_path),
-        "emit-obj" => run_codegen(&source, file_path),
-        _ => unreachable!(),
     }
+}
+
+fn generate_completions(shell: Shell) {
+    let mut cmd = Cli::command();
+    generate(shell, &mut cmd, "wisp", &mut io::stdout());
 }
 
 /// Get the build directory (creates .build in current working directory)
@@ -281,7 +327,7 @@ fn run_lexer(source: &str, file_path: &str) {
 fn run_parser(source: &str, file_path: &str) {
     println!("=== Parser Output for {} ===\n", file_path);
     
-    match Parser::parse(source) {
+    match WispParser::parse(source) {
         Ok(ast) => {
             println!("{}", ast.pretty_print());
             

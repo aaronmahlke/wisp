@@ -77,6 +77,16 @@ impl Type {
     pub fn is_float(&self) -> bool {
         matches!(self, Type::F32 | Type::F64)
     }
+    
+    /// Check if this is a primitive type (not a user-defined struct/enum)
+    pub fn is_primitive(&self) -> bool {
+        matches!(self,
+            Type::I8 | Type::I16 | Type::I32 | Type::I64 | Type::I128 |
+            Type::U8 | Type::U16 | Type::U32 | Type::U64 | Type::U128 |
+            Type::F32 | Type::F64 | Type::Bool | Type::Char | Type::Str |
+            Type::Unit | Type::Never
+        )
+    }
 
     /// Check if this is a reference type
     pub fn is_ref(&self) -> bool {
@@ -258,6 +268,19 @@ impl TypeContext {
     /// Get type name for a DefId
     pub fn get_type_name(&self, def_id: DefId) -> Option<String> {
         self.type_names.get(&def_id).cloned()
+    }
+    
+    /// Look up a type by name (returns Struct type if found)
+    pub fn lookup_type_by_name(&self, name: &str) -> Option<Type> {
+        for (def_id, type_name) in &self.type_names {
+            if type_name == name {
+                // Check if this is a struct
+                if self.struct_fields.contains_key(def_id) {
+                    return Some(Type::Struct(*def_id));
+                }
+            }
+        }
+        None
     }
 
     /// Register a definition's type

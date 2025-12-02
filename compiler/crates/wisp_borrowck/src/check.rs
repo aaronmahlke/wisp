@@ -69,7 +69,11 @@ impl<'a> BorrowChecker<'a> {
 
         // Declare parameters
         for param in &func.params {
-            self.state.declare_var(param.def_id, param.name.clone(), param.is_mut, true);
+            // A parameter is mutable if:
+            // 1. It's explicitly declared as `mut`
+            // 2. Its type is `&mut T` (mutable reference)
+            let is_mut = param.is_mut || matches!(&param.ty, wisp_types::Type::Ref { is_mut: true, .. });
+            self.state.declare_var(param.def_id, param.name.clone(), is_mut, true);
         }
 
         // Check body
@@ -148,19 +152,28 @@ impl<'a> BorrowChecker<'a> {
             TypedExprKind::MethodCall { receiver, args, .. } => {
                 // Check receiver - it's borrowed, not moved
                 self.check_expr(receiver);
-                // Create a borrow for the receiver (immutable for &self)
-                if let Some(place) = self.expr_to_place(receiver) {
+                // Create a temporary borrow for the receiver
+                // This borrow only lasts for the duration of the call
+                let loan_id = if let Some(place) = self.expr_to_place(receiver) {
                     if let Err(conflict) = self.state.can_borrow(&place) {
                         self.report_conflict(conflict, expr.span);
+                        None
                     } else {
-                        self.state.create_loan(place, false, expr.span);
+                        Some(self.state.create_loan(place, false, expr.span))
                     }
-                }
+                } else {
+                    None
+                };
                 
                 for arg in args {
                     self.check_expr(arg);
                     // Arguments may be moved
                     self.check_move_or_copy(arg);
+                }
+                
+                // End the temporary borrow after the call
+                if let Some(id) = loan_id {
+                    self.state.end_loan(id);
                 }
             }
 
@@ -184,6 +197,18 @@ impl<'a> BorrowChecker<'a> {
                 // For now, just check the lambda body
                 // TODO: proper capture analysis
                 self.check_expr(body);
+            }
+
+            TypedExprKind::Cast { expr, .. } => {
+                self.check_expr(expr);
+            }
+            
+            TypedExprKind::StringInterp { parts } => {
+                for part in parts {
+                    if let wisp_types::TypedStringInterpPart::Expr(expr) = part {
+                        self.check_expr(expr);
+                    }
+                }
             }
 
             TypedExprKind::StructLit { fields, .. } => {

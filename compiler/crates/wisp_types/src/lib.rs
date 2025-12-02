@@ -9,7 +9,7 @@ pub use types::*;
 pub use check::{
     TypeChecker, TypeError,
     TypedProgram, TypedImpl, TypedFunction, TypedExternFunction, TypedExternStatic, TypedParam, TypedBlock, TypedStmt,
-    TypedExpr, TypedExprKind, TypedElse, TypedMatchArm, TypedPattern, TypedLambdaParam,
+    TypedExpr, TypedExprKind, TypedElse, TypedMatchArm, TypedPattern, TypedLambdaParam, TypedStringInterpPart,
     GenericInstantiation,
 };
 

@@ -79,6 +79,8 @@ pub struct Resolver {
     current_locals: Vec<DefId>,
     /// Self type in current impl block
     self_type: Option<DefId>,
+    /// Trait type parameters with defaults: trait DefId -> [(param name, default type if any)]
+    trait_type_params: HashMap<DefId, Vec<(String, Option<TypeExpr>)>>,
 }
 
 impl Resolver {
@@ -91,6 +93,7 @@ impl Resolver {
             errors: Vec::new(),
             current_locals: Vec::new(),
             self_type: None,
+            trait_type_params: HashMap::new(),
         }
     }
 
@@ -351,7 +354,27 @@ impl Resolver {
     fn resolve_trait(&mut self, t: &TraitDef) -> Option<ResolvedTrait> {
         let def_id = self.globals.get(&t.name.name).copied()?;
         
+        // Store trait type parameters with defaults for later use in impl blocks
+        let type_params_with_defaults: Vec<(String, Option<TypeExpr>)> = t.type_params.iter()
+            .map(|tp| (tp.name.name.clone(), tp.default.clone()))
+            .collect();
+        self.trait_type_params.insert(def_id, type_params_with_defaults);
+        
         self.push_scope();
+        
+        // Define trait type parameters in scope
+        for type_param in &t.type_params {
+            let param_id = self.fresh_id();
+            let param_info = DefInfo {
+                id: param_id,
+                name: type_param.name.name.clone(),
+                kind: DefKind::TypeParam,
+                span: type_param.span,
+                parent: Some(def_id),
+            };
+            self.defs.insert(param_id, param_info);
+            self.scope.define(type_param.name.name.clone(), param_id);
+        }
         
         let mut methods = Vec::new();
         for method in &t.methods {
@@ -391,6 +414,38 @@ impl Resolver {
             None
         };
         
+        // Resolve trait type arguments, applying defaults where needed
+        let trait_type_args = if let Some(trait_id) = trait_def {
+            // Get the trait's type parameters with defaults
+            let trait_params = self.trait_type_params.get(&trait_id).cloned().unwrap_or_default();
+            
+            // Start with explicitly provided type args
+            let mut resolved_args: Vec<ResolvedType> = i.trait_type_args.iter()
+                .map(|t| self.resolve_type(t))
+                .collect();
+            
+            // Fill in defaults for missing type args
+            for idx in resolved_args.len()..trait_params.len() {
+                if let Some(default_type) = &trait_params[idx].1 {
+                    // Resolve the default type in the current context
+                    // "Self" in defaults should resolve to the target type
+                    let resolved_default = self.resolve_type(default_type);
+                    resolved_args.push(resolved_default);
+                } else {
+                    // No default provided, this is an error
+                    self.error(
+                        format!("missing type argument for trait parameter '{}'", trait_params[idx].0),
+                        i.span,
+                    );
+                    resolved_args.push(ResolvedType::Error);
+                }
+            }
+            
+            resolved_args
+        } else {
+            Vec::new()
+        };
+        
         // For primitive types, we still need methods to get their own DefIds
         // We pass true to indicate this is an impl block context
         let is_impl_context = true;
@@ -411,6 +466,7 @@ impl Resolver {
 
         Some(ResolvedImpl {
             trait_def,
+            trait_type_args,
             target_type: target_type.clone(),
             methods,
             span: i.span,
@@ -457,10 +513,13 @@ impl Resolver {
                 bounds.push(bound_type);
             }
             
+            let default = type_param.default.as_ref().map(|t| self.resolve_type(t));
+            
             type_params.push(ResolvedTypeParam {
                 def_id: param_id,
                 name: type_param.name.name.clone(),
                 bounds,
+                default,
                 span: type_param.span,
             });
         }
@@ -551,10 +610,13 @@ impl Resolver {
                 .map(|b| self.resolve_type(b))
                 .collect();
             
+            let default = type_param.default.as_ref().map(|t| self.resolve_type(t));
+            
             type_params.push(ResolvedTypeParam {
                 def_id: param_id,
                 name: type_param.name.name.clone(),
                 bounds,
+                default,
                 span: type_param.span,
             });
         }
@@ -932,6 +994,29 @@ impl Resolver {
                     params: resolved_params,
                     body: Box::new(resolved_body),
                 }
+            }
+            
+            ExprKind::Cast(inner, target_type) => {
+                let resolved_expr = self.resolve_expr(inner);
+                let resolved_type = self.resolve_type(target_type);
+                ResolvedExprKind::Cast {
+                    expr: Box::new(resolved_expr),
+                    target_type: resolved_type,
+                }
+            }
+            
+            ExprKind::StringInterp(parts) => {
+                let resolved_parts = parts.iter().map(|part| {
+                    match part {
+                        wisp_ast::StringInterpPart::Literal(s) => {
+                            ResolvedStringInterpPart::Literal(s.clone())
+                        }
+                        wisp_ast::StringInterpPart::Expr(e) => {
+                            ResolvedStringInterpPart::Expr(self.resolve_expr(e))
+                        }
+                    }
+                }).collect();
+                ResolvedExprKind::StringInterp { parts: resolved_parts }
             }
         };
         
