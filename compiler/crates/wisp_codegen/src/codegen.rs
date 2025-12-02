@@ -438,6 +438,8 @@ struct FunctionCompiler<'a, 'b> {
     locals: HashMap<u32, Variable>,
     /// Map from MIR local to (stack slot, struct DefId) for aggregate types
     struct_slots: HashMap<u32, (cranelift_codegen::ir::StackSlot, DefId)>,
+    /// Map from MIR local to (stack slot, elem type, length) for arrays
+    array_slots: HashMap<u32, (cranelift_codegen::ir::StackSlot, Type, usize)>,
     /// Map from MIR block to Cranelift Block
     blocks: HashMap<u32, Block>,
     /// Next variable index
@@ -485,6 +487,7 @@ impl<'a, 'b> FunctionCompiler<'a, 'b> {
             mir_func,
             locals: HashMap::new(),
             struct_slots: HashMap::new(),
+            array_slots: HashMap::new(),
             blocks: HashMap::new(),
             sret_ptr: None,
             sret_def_id,
@@ -536,6 +539,18 @@ impl<'a, 'b> FunctionCompiler<'a, 'b> {
                     );
                     self.struct_slots.insert(local.id, (slot, *def_id));
                 }
+            } else if let Type::Array(elem_ty, len) = &local.ty {
+                // Arrays get stack slots
+                let elem_size = self.type_size(elem_ty);
+                let size = elem_size * (*len as u32);
+                let slot = self.builder.create_sized_stack_slot(
+                    cranelift_codegen::ir::StackSlotData::new(
+                        cranelift_codegen::ir::StackSlotKind::ExplicitSlot,
+                        size,
+                        3, // align to 8 bytes
+                    )
+                );
+                self.array_slots.insert(local.id, (slot, elem_ty.as_ref().clone(), *len));
             } else {
                 // Scalars get variables
                 let var = Variable::from_u32(self.next_var as u32);
@@ -707,6 +722,21 @@ impl<'a, 'b> FunctionCompiler<'a, 'b> {
                                     let val = self.builder.ins().stack_load(cl_ty, src_slot, offset as i32);
                                     self.builder.ins().stack_store(val, dst_slot, offset as i32);
                                 }
+                            }
+                            return Ok(());
+                        }
+                    }
+                    // Check if this is an array copy
+                    if let Some(&(src_slot, ref src_elem_ty, src_len)) = self.array_slots.get(&src_place.local) {
+                        let src_elem_ty = src_elem_ty.clone();
+                        if let Some(&(dst_slot, _, _)) = self.array_slots.get(&place.local) {
+                            // Copy array by copying each element
+                            let elem_size = self.type_size(&src_elem_ty);
+                            let cl_ty = self.convert_type(&src_elem_ty);
+                            for i in 0..src_len {
+                                let offset = (i as u32 * elem_size) as i32;
+                                let val = self.builder.ins().stack_load(cl_ty, src_slot, offset);
+                                self.builder.ins().stack_store(val, dst_slot, offset);
                             }
                             return Ok(());
                         }
@@ -927,9 +957,17 @@ impl<'a, 'b> FunctionCompiler<'a, 'b> {
                         }
                     }
                     Constant::Unit => Ok(None),
-                    Constant::FnPtr(_, _) => {
-                        // Function pointers not fully implemented
-                        Ok(Some(self.builder.ins().iconst(types::I64, 0)))
+                    Constant::FnPtr(def_id, name) => {
+                        // Get the function reference and its address
+                        let func_ref = self.func_refs.get(def_id).copied()
+                            .or_else(|| self.func_refs_by_name.get(name).copied());
+                        if let Some(func_ref) = func_ref {
+                            let addr = self.builder.ins().func_addr(types::I64, func_ref);
+                            Ok(Some(addr))
+                        } else {
+                            // Function not found - return null pointer
+                            Ok(Some(self.builder.ins().iconst(types::I64, 0)))
+                        }
                     }
                     Constant::ExternStatic(def_id, name, ty) => {
                         // Get the global value for this extern static and load from it
@@ -975,6 +1013,37 @@ impl<'a, 'b> FunctionCompiler<'a, 'b> {
                 }
             }
             // Loading whole struct - return address
+            let addr = self.builder.ins().stack_addr(types::I64, slot, 0);
+            return Ok(Some(addr));
+        }
+        
+        // Check if this is an array access
+        if let Some(&(slot, ref elem_ty, _len)) = self.array_slots.get(&place.local) {
+            let elem_ty = elem_ty.clone();  // Clone to avoid borrow issues
+            for proj in &place.projections {
+                if let PlaceProjection::Index(idx_operand) = proj {
+                    // Compile the index operand
+                    let idx_val = self.compile_operand(idx_operand)?
+                        .ok_or_else(|| CodegenError { message: "Invalid array index".to_string() })?;
+                    
+                    // Compute element offset: index * element_size
+                    let elem_size = self.type_size(&elem_ty);
+                    let elem_size_val = self.builder.ins().iconst(types::I64, elem_size as i64);
+                    // Extend index to i64 for address calculation
+                    let idx_i64 = self.builder.ins().sextend(types::I64, idx_val);
+                    let offset = self.builder.ins().imul(idx_i64, elem_size_val);
+                    
+                    // Get base address of array
+                    let base_addr = self.builder.ins().stack_addr(types::I64, slot, 0);
+                    let elem_addr = self.builder.ins().iadd(base_addr, offset);
+                    
+                    // Load the element
+                    let cl_ty = self.convert_type(&elem_ty);
+                    let val = self.builder.ins().load(cl_ty, cranelift_codegen::ir::MemFlags::new(), elem_addr, 0);
+                    return Ok(Some(val));
+                }
+            }
+            // Loading whole array - return address
             let addr = self.builder.ins().stack_addr(types::I64, slot, 0);
             return Ok(Some(addr));
         }
@@ -1044,6 +1113,35 @@ impl<'a, 'b> FunctionCompiler<'a, 'b> {
             return Ok(());
         }
         
+        // Check if this is an array element store
+        if let Some(&(slot, ref elem_ty, _len)) = self.array_slots.get(&place.local) {
+            let elem_ty = elem_ty.clone();  // Clone to avoid borrow issues
+            for proj in &place.projections {
+                if let PlaceProjection::Index(idx_operand) = proj {
+                    // Compile the index operand
+                    let idx_val = self.compile_operand(idx_operand)?
+                        .ok_or_else(|| CodegenError { message: "Invalid array index".to_string() })?;
+                    
+                    // Compute element offset: index * element_size
+                    let elem_size = self.type_size(&elem_ty);
+                    let elem_size_val = self.builder.ins().iconst(types::I64, elem_size as i64);
+                    // Extend index to i64 for address calculation
+                    let idx_i64 = self.builder.ins().sextend(types::I64, idx_val);
+                    let offset = self.builder.ins().imul(idx_i64, elem_size_val);
+                    
+                    // Get base address of array
+                    let base_addr = self.builder.ins().stack_addr(types::I64, slot, 0);
+                    let elem_addr = self.builder.ins().iadd(base_addr, offset);
+                    
+                    // Store the element
+                    self.builder.ins().store(cranelift_codegen::ir::MemFlags::new(), value, elem_addr, 0);
+                    return Ok(());
+                }
+            }
+            // Storing to whole array not supported
+            return Ok(());
+        }
+        
         if let Some(&var) = self.locals.get(&place.local) {
             if place.projections.is_empty() {
                 self.builder.def_var(var, value);
@@ -1064,15 +1162,18 @@ impl<'a, 'b> FunctionCompiler<'a, 'b> {
                 let discr_val = self.compile_operand(discr)?.ok_or_else(|| CodegenError {
                     message: "Switch discriminant has no value".to_string(),
                 })?;
+                
+                // Get the type of the discriminant value
+                let discr_ty = self.builder.func.dfg.value_type(discr_val);
 
                 let otherwise_block = *self.blocks.get(otherwise).unwrap();
 
                 if targets.len() == 1 {
-                    // Simple if-else - for bool, compare with 0
+                    // Simple if-else
                     let (val, target) = &targets[0];
                     let target_block = *self.blocks.get(target).unwrap();
-                    // Use iconst with I8 for bool comparisons
-                    let cmp_val = self.builder.ins().iconst(types::I8, *val);
+                    // Use the discriminant's type for the comparison value
+                    let cmp_val = self.builder.ins().iconst(discr_ty, *val);
                     let cmp = self.builder.ins().icmp(
                         cranelift_codegen::ir::condcodes::IntCC::Equal,
                         discr_val, cmp_val
@@ -1084,7 +1185,7 @@ impl<'a, 'b> FunctionCompiler<'a, 'b> {
                     // Multiple targets - use a series of branches
                     for (val, target) in targets {
                         let target_block = *self.blocks.get(target).unwrap();
-                        let cmp_val = self.builder.ins().iconst(types::I8, *val);
+                        let cmp_val = self.builder.ins().iconst(discr_ty, *val);
                         let cmp = self.builder.ins().icmp(
                             cranelift_codegen::ir::condcodes::IntCC::Equal,
                             discr_val, cmp_val
@@ -1210,10 +1311,12 @@ impl<'a, 'b> FunctionCompiler<'a, 'b> {
                     }
                 }
 
-                // Get the function reference
+                // Get the function reference for direct calls, or function pointer for indirect calls
                 let func_ref = match func {
-                    Operand::Constant(Constant::FnPtr(def_id, _name)) => {
+                    Operand::Constant(Constant::FnPtr(def_id, name)) => {
+                        // First try by def_id, then by name (for lambdas)
                         self.func_refs.get(def_id).copied()
+                            .or_else(|| self.func_refs_by_name.get(name).copied())
                     }
                     Operand::Constant(Constant::MonomorphizedFn(_, name, _)) => {
                         // Look up by mangled name for monomorphized functions
@@ -1227,7 +1330,7 @@ impl<'a, 'b> FunctionCompiler<'a, 'b> {
                 };
 
                 if let Some(func_ref) = func_ref {
-                    // Make the call
+                    // Direct call
                     let call = self.builder.ins().call(func_ref, &arg_vals);
                     
                     // Get the return value (if any) - skip for struct returns (handled via sret)
@@ -1237,6 +1340,34 @@ impl<'a, 'b> FunctionCompiler<'a, 'b> {
                             if let Some(&var) = self.locals.get(&destination.local) {
                                 self.builder.def_var(var, results[0]);
                             }
+                        }
+                    }
+                } else if let Some(func_ptr) = self.compile_operand(func).ok().flatten() {
+                    // Indirect call through function pointer
+                    // Build the signature for the indirect call
+                    let mut sig = Signature::new(CallConv::SystemV);
+                    
+                    // Add parameter types based on the arguments
+                    for arg in &arg_vals {
+                        sig.params.push(AbiParam::new(self.builder.func.dfg.value_type(*arg)));
+                    }
+                    
+                    // Get return type from destination local
+                    if let Some(local) = self.mir_func.locals.iter().find(|l| l.id == destination.local) {
+                        let ret_ty = self.convert_type(&local.ty);
+                        if ret_ty != types::INVALID {
+                            sig.returns.push(AbiParam::new(ret_ty));
+                        }
+                    }
+                    
+                    let sig_ref = self.builder.import_signature(sig);
+                    let call = self.builder.ins().call_indirect(sig_ref, func_ptr, &arg_vals);
+                    
+                    // Get the return value
+                    let results = self.builder.inst_results(call);
+                    if !results.is_empty() {
+                        if let Some(&var) = self.locals.get(&destination.local) {
+                            self.builder.def_var(var, results[0]);
                         }
                     }
                 } else {

@@ -190,6 +190,8 @@ pub enum ExprKind {
     If(Box<Expr>, Block, Option<ElseBranch>),
     /// While loop: while cond { ... }
     While(Box<Expr>, Block),
+    /// For loop: for x in iter { ... }
+    For(Ident, Box<Expr>, Block),
     /// Block expression: { ... }
     Block(Block),
     /// Assignment: x = expr
@@ -202,6 +204,18 @@ pub enum ExprKind {
     Match(Box<Expr>, Vec<MatchArm>),
     /// Index expression: arr[idx]
     Index(Box<Expr>, Box<Expr>),
+    /// Array literal: [1, 2, 3]
+    ArrayLit(Vec<Expr>),
+    /// Lambda/closure: (x, y) -> x + y
+    Lambda(Vec<LambdaParam>, Box<Expr>),
+}
+
+/// Lambda parameter (may have type annotation)
+#[derive(Debug, Clone)]
+pub struct LambdaParam {
+    pub name: Ident,
+    pub ty: Option<TypeExpr>,
+    pub span: Span,
 }
 
 /// Else branch - can be a block or another if
@@ -297,11 +311,14 @@ pub enum BinOp {
     // Logical
     And,
     Or,
+    // Range
+    Range,  // ..
 }
 
 impl BinOp {
     pub fn precedence(self) -> u8 {
         match self {
+            BinOp::Range => 0,  // Lowest precedence
             BinOp::Or => 1,
             BinOp::And => 2,
             BinOp::Eq | BinOp::NotEq => 3,
@@ -328,6 +345,7 @@ impl std::fmt::Display for BinOp {
             BinOp::GtEq => write!(f, ">="),
             BinOp::And => write!(f, "&&"),
             BinOp::Or => write!(f, "||"),
+            BinOp::Range => write!(f, ".."),
         }
     }
 }
@@ -654,6 +672,15 @@ impl Expr {
                 out.push_str(&body.pretty_print(indent + 2));
                 out
             }
+            ExprKind::For(binding, iter, body) => {
+                let mut out = format!("{}For\n", ind);
+                out.push_str(&format!("{}binding: {}\n", "  ".repeat(indent + 1), binding.name));
+                out.push_str(&format!("{}iter:\n", "  ".repeat(indent + 1)));
+                out.push_str(&iter.pretty_print_indented(indent + 2));
+                out.push_str(&format!("{}body:\n", "  ".repeat(indent + 1)));
+                out.push_str(&body.pretty_print(indent + 2));
+                out
+            }
             ExprKind::Block(block) => {
                 let mut out = format!("{}Block\n", ind);
                 for stmt in &block.stmts {
@@ -698,6 +725,28 @@ impl Expr {
                 out.push_str(&e.pretty_print_indented(indent + 2));
                 out.push_str(&format!("{}index:\n", "  ".repeat(indent + 1)));
                 out.push_str(&idx.pretty_print_indented(indent + 2));
+                out
+            }
+            ExprKind::ArrayLit(elements) => {
+                let mut out = format!("{}ArrayLit\n", ind);
+                for elem in elements {
+                    out.push_str(&elem.pretty_print_indented(indent + 1));
+                }
+                out
+            }
+            ExprKind::Lambda(params, body) => {
+                let params_str = params.iter()
+                    .map(|p| {
+                        if let Some(ty) = &p.ty {
+                            format!("{}: {}", p.name.name, ty.pretty_print())
+                        } else {
+                            p.name.name.clone()
+                        }
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let mut out = format!("{}Lambda(({}))\n", ind, params_str);
+                out.push_str(&body.pretty_print_indented(indent + 1));
                 out
             }
         }
@@ -753,6 +802,7 @@ impl Expr {
                 format!("if {} {{ {} }}{}", cond.pretty_print(), then_str, else_str)
             }
             ExprKind::While(cond, _) => format!("while {} {{ ... }}", cond.pretty_print()),
+            ExprKind::For(binding, iter, _) => format!("for {} in {} {{ ... }}", binding.name, iter.pretty_print()),
             ExprKind::Block(_) => "{ ... }".to_string(),
             ExprKind::Assign(lhs, rhs) => format!("({} = {})", lhs.pretty_print(), rhs.pretty_print()),
             ExprKind::Ref(is_mut, e) => {
@@ -764,6 +814,23 @@ impl Expr {
                 format!("match {} {{ {} arms }}", expr.pretty_print(), arms.len())
             }
             ExprKind::Index(e, idx) => format!("{}[{}]", e.pretty_print(), idx.pretty_print()),
+            ExprKind::ArrayLit(elements) => {
+                let elems_str = elements.iter().map(|e| e.pretty_print()).collect::<Vec<_>>().join(", ");
+                format!("[{}]", elems_str)
+            }
+            ExprKind::Lambda(params, body) => {
+                let params_str = params.iter()
+                    .map(|p| {
+                        if let Some(ty) = &p.ty {
+                            format!("{}: {}", p.name.name, ty.pretty_print())
+                        } else {
+                            p.name.name.clone()
+                        }
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                format!("({}) -> {}", params_str, body.pretty_print())
+            }
         }
     }
 }

@@ -407,6 +407,14 @@ pub enum ResolvedExprKind {
         body: ResolvedBlock,
     },
     
+    /// For loop
+    For {
+        binding: DefId,
+        binding_name: String,
+        iter: Box<ResolvedExpr>,
+        body: ResolvedBlock,
+    },
+    
     /// Block expression
     Block(ResolvedBlock),
     
@@ -437,8 +445,26 @@ pub enum ResolvedExprKind {
         index: Box<ResolvedExpr>,
     },
     
+    /// Array literal
+    ArrayLit(Vec<ResolvedExpr>),
+    
+    /// Lambda/closure
+    Lambda {
+        params: Vec<ResolvedLambdaParam>,
+        body: Box<ResolvedExpr>,
+    },
+    
     /// Error (for recovery)
     Error,
+}
+
+/// Resolved lambda parameter
+#[derive(Debug, Clone)]
+pub struct ResolvedLambdaParam {
+    pub def_id: DefId,
+    pub name: String,
+    pub ty: Option<ResolvedType>,
+    pub span: Span,
 }
 
 /// Resolved function call argument

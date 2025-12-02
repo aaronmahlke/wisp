@@ -2,7 +2,7 @@
 
 use crate::mir::*;
 use wisp_hir::DefId;
-use wisp_types::*;
+use wisp_types::{Type, TypeContext, TypedBlock, TypedElse, TypedExpr, TypedExprKind, TypedFunction, TypedLambdaParam, TypedProgram, TypedStmt};
 use std::collections::HashMap;
 
 /// Generate a mangled name for a monomorphized generic function
@@ -134,8 +134,9 @@ pub fn lower_program(program: &TypedProgram) -> MirProgram {
         if is_generic {
             generic_funcs.insert(func.def_id, func);
         } else {
-            if let Some(mir_func) = lower_function(func, &program.ctx, &extern_statics, None) {
-                mir.functions.push(mir_func);
+            if let Some(result) = lower_function(func, &program.ctx, &extern_statics, None) {
+                mir.functions.push(result.main_function);
+                mir.functions.extend(result.lambda_functions);
             }
         }
     }
@@ -144,13 +145,14 @@ pub fn lower_program(program: &TypedProgram) -> MirProgram {
     for inst in &program.generic_instantiations {
         if let Some(func) = generic_funcs.get(&inst.func_def_id) {
             // Create a specialized version of the function
-            if let Some(mir_func) = lower_monomorphized_function(
+            if let Some(result) = lower_monomorphized_function(
                 func, 
                 &inst.type_args,
                 &program.ctx, 
                 &extern_statics
             ) {
-                mir.functions.push(mir_func);
+                mir.functions.push(result.main_function);
+                mir.functions.extend(result.lambda_functions);
             }
         }
     }
@@ -161,8 +163,9 @@ pub fn lower_program(program: &TypedProgram) -> MirProgram {
         let impl_type_name = get_type_name(&imp.target_type, &program.ctx);
         
         for method in &imp.methods {
-            if let Some(mir_func) = lower_function(method, &program.ctx, &extern_statics, Some(&impl_type_name)) {
-                mir.functions.push(mir_func);
+            if let Some(result) = lower_function(method, &program.ctx, &extern_statics, Some(&impl_type_name)) {
+                mir.functions.push(result.main_function);
+                mir.functions.extend(result.lambda_functions);
             }
         }
     }
@@ -215,15 +218,25 @@ fn get_type_name(ty: &Type, ctx: &TypeContext) -> String {
     }
 }
 
+/// Result of lowering a function - includes the main function and any lambdas
+struct LowerResult {
+    main_function: MirFunction,
+    lambda_functions: Vec<MirFunction>,
+}
+
 /// Lower a single function to MIR
 /// If `impl_type_name` is provided, the function name will be mangled as `TypeName::method_name`
-fn lower_function(func: &TypedFunction, ctx: &TypeContext, extern_statics: &HashMap<DefId, (String, Type)>, impl_type_name: Option<&str>) -> Option<MirFunction> {
+fn lower_function(func: &TypedFunction, ctx: &TypeContext, extern_statics: &HashMap<DefId, (String, Type)>, impl_type_name: Option<&str>) -> Option<LowerResult> {
     let body = func.body.as_ref()?;
 
     let mut lowerer = FunctionLowerer::new(func, ctx, extern_statics, impl_type_name, None);
     lowerer.lower_body(body);
 
-    Some(lowerer.finish())
+    let lambda_functions = std::mem::take(&mut lowerer.lambda_functions);
+    Some(LowerResult {
+        main_function: lowerer.finish(),
+        lambda_functions,
+    })
 }
 
 /// Lower a monomorphized version of a generic function
@@ -232,7 +245,7 @@ fn lower_monomorphized_function(
     type_args: &[Type],
     ctx: &TypeContext, 
     extern_statics: &HashMap<DefId, (String, Type)>
-) -> Option<MirFunction> {
+) -> Option<LowerResult> {
     let body = func.body.as_ref()?;
 
     // Create substitution info
@@ -246,7 +259,11 @@ fn lower_monomorphized_function(
     let mut lowerer = FunctionLowerer::new(func, ctx, extern_statics, None, Some(subst));
     lowerer.lower_body(body);
 
-    Some(lowerer.finish())
+    let lambda_functions = std::mem::take(&mut lowerer.lambda_functions);
+    Some(LowerResult {
+        main_function: lowerer.finish(),
+        lambda_functions,
+    })
 }
 
 /// Extract type parameter DefIds from a function's signature
@@ -318,6 +335,11 @@ struct FunctionLowerer<'a> {
     
     /// Return place (local 0)
     return_place: u32,
+    
+    /// Lambda functions generated during lowering
+    lambda_functions: Vec<MirFunction>,
+    /// Counter for generating unique lambda names
+    lambda_counter: u32,
 }
 
 impl<'a> FunctionLowerer<'a> {
@@ -348,6 +370,8 @@ impl<'a> FunctionLowerer<'a> {
             current_block: 0,
             current_stmts: Vec::new(),
             return_place: 0,
+            lambda_functions: Vec::new(),
+            lambda_counter: 0,
         };
 
         // Local 0 is the return place
@@ -908,6 +932,64 @@ impl<'a> FunctionLowerer<'a> {
                 Operand::Constant(Constant::Unit)
             }
 
+            TypedExprKind::For { binding, start, end, body, .. } => {
+                // Lower: for i in start..end { body }
+                // To:    let i = start; while i < end { body; i = i + 1; }
+                
+                let cond_bb = self.new_block();
+                let body_bb = self.new_block();
+                let exit_bb = self.new_block();
+                
+                // Initialize loop variable
+                let loop_var = self.new_temp(Type::I32);
+                self.def_to_local.insert(*binding, loop_var);
+                let start_op = self.lower_expr(start);
+                self.assign(Place::local(loop_var), Rvalue::Use(start_op));
+                
+                // Jump to condition check
+                self.terminate(Terminator::Goto { target: cond_bb });
+                
+                // Condition block: i < end
+                self.switch_to_block(cond_bb);
+                let end_op = self.lower_expr(end);
+                let cond_temp = self.new_temp(Type::Bool);
+                self.assign(
+                    Place::local(cond_temp),
+                    Rvalue::BinaryOp {
+                        op: BinOp::Lt,
+                        left: Operand::Copy(Place::local(loop_var)),
+                        right: end_op,
+                    },
+                );
+                self.terminate(Terminator::SwitchInt {
+                    discr: Operand::Copy(Place::local(cond_temp)),
+                    targets: vec![(1, body_bb)],
+                    otherwise: exit_bb,
+                });
+                
+                // Body block
+                self.switch_to_block(body_bb);
+                self.lower_block(body);
+                
+                // Increment: i = i + 1
+                let inc_temp = self.new_temp(Type::I32);
+                self.assign(
+                    Place::local(inc_temp),
+                    Rvalue::BinaryOp {
+                        op: BinOp::Add,
+                        left: Operand::Copy(Place::local(loop_var)),
+                        right: Operand::Constant(Constant::Int(1, Type::I32)),
+                    },
+                );
+                self.assign(Place::local(loop_var), Rvalue::Use(Operand::Copy(Place::local(inc_temp))));
+                
+                self.terminate(Terminator::Goto { target: cond_bb });
+                
+                // Exit block
+                self.switch_to_block(exit_bb);
+                Operand::Constant(Constant::Unit)
+            }
+
             TypedExprKind::Block(block) => {
                 self.lower_block(block).unwrap_or(Operand::Constant(Constant::Unit))
             }
@@ -979,6 +1061,40 @@ impl<'a> FunctionLowerer<'a> {
                     self.assign(Place::local(temp), Rvalue::Use(base_op));
                     Operand::Copy(Place::local(temp).index(index_op))
                 }
+            }
+
+            TypedExprKind::ArrayLit(elements) => {
+                // Create a temporary for the array
+                let array_temp = self.new_temp(expr.ty.clone());
+                
+                // Initialize each element
+                for (i, elem) in elements.iter().enumerate() {
+                    let elem_op = self.lower_expr(elem);
+                    let index_op = Operand::Constant(Constant::Int(i as i64, Type::I32));
+                    let place = Place::local(array_temp).index(index_op);
+                    self.assign(place, Rvalue::Use(elem_op));
+                }
+                
+                Operand::Copy(Place::local(array_temp))
+            }
+
+            TypedExprKind::Lambda { params, body } => {
+                // Generate a unique name for this lambda
+                let lambda_name = format!("{}$lambda{}", self.func.name, self.lambda_counter);
+                self.lambda_counter += 1;
+                
+                // Create a synthetic DefId for the lambda (use a hash of the name)
+                let lambda_def_id = DefId::new(
+                    (std::collections::hash_map::DefaultHasher::new(), &lambda_name)
+                        .1.len() as u32 + self.lambda_counter * 1000000
+                );
+                
+                // Build the lambda function's MIR
+                let lambda_mir = self.lower_lambda(&lambda_name, lambda_def_id, params, body);
+                self.lambda_functions.push(lambda_mir);
+                
+                // Return a function pointer to the lambda
+                Operand::Constant(Constant::FnPtr(lambda_def_id, lambda_name))
             }
 
             TypedExprKind::Match { scrutinee, arms } => {
@@ -1090,6 +1206,95 @@ impl<'a> FunctionLowerer<'a> {
         )
     }
 
+    /// Lower a lambda expression into a separate MIR function
+    fn lower_lambda(
+        &mut self,
+        name: &str,
+        def_id: DefId,
+        params: &[TypedLambdaParam],
+        body: &TypedExpr,
+    ) -> MirFunction {
+        // Create a new lowerer state for the lambda
+        let mut locals = Vec::new();
+        let mut def_to_local = HashMap::new();
+        let mut next_local = 0u32;
+        
+        // Local 0 is the return place
+        let return_type = body.ty.clone();
+        locals.push(MirLocal {
+            id: 0,
+            name: "_return".to_string(),
+            ty: return_type.clone(),
+            is_arg: false,
+        });
+        next_local = 1;
+        
+        // Add parameters as locals
+        let mut mir_params = Vec::new();
+        for param in params {
+            let local_id = next_local;
+            next_local += 1;
+            locals.push(MirLocal {
+                id: local_id,
+                name: param.name.clone(),
+                ty: param.ty.clone(),
+                is_arg: true,
+            });
+            mir_params.push(MirLocal {
+                id: local_id,
+                name: param.name.clone(),
+                ty: param.ty.clone(),
+                is_arg: true,
+            });
+            def_to_local.insert(param.def_id, local_id);
+        }
+        
+        // Save current lowerer state
+        let saved_locals = std::mem::replace(&mut self.locals, locals);
+        let saved_def_to_local = std::mem::replace(&mut self.def_to_local, def_to_local);
+        let saved_next_local = std::mem::replace(&mut self.next_local, next_local);
+        let saved_blocks = std::mem::take(&mut self.blocks);
+        let saved_current_block = self.current_block;
+        let saved_current_stmts = std::mem::take(&mut self.current_stmts);
+        let saved_return_place = self.return_place;
+        
+        // Reset for lambda
+        self.current_block = 0;
+        self.return_place = 0;
+        
+        // Lower the lambda body
+        let result = self.lower_expr(body);
+        
+        // Store result in return place and terminate
+        self.assign(Place::local(0), Rvalue::Use(result));
+        self.terminate(Terminator::Return);
+        
+        // Collect the lambda's blocks and locals
+        let lambda_blocks = std::mem::take(&mut self.blocks);
+        let lambda_locals: Vec<_> = self.locals.iter()
+            .filter(|l| !l.is_arg)
+            .cloned()
+            .collect();
+        
+        // Restore parent lowerer state
+        self.locals = saved_locals;
+        self.def_to_local = saved_def_to_local;
+        self.next_local = saved_next_local;
+        self.blocks = saved_blocks;
+        self.current_block = saved_current_block;
+        self.current_stmts = saved_current_stmts;
+        self.return_place = saved_return_place;
+        
+        MirFunction {
+            def_id,
+            name: name.to_string(),
+            params: mir_params,
+            locals: lambda_locals,
+            blocks: lambda_blocks,
+            return_type,
+        }
+    }
+
     fn finish(mut self) -> MirFunction {
         // Separate params from other locals
         let params: Vec<_> = self.locals.iter()
@@ -1142,6 +1347,7 @@ fn convert_binop(op: wisp_ast::BinOp) -> BinOp {
         AstOp::GtEq => BinOp::Ge,
         AstOp::And => BinOp::And,
         AstOp::Or => BinOp::Or,
+        AstOp::Range => unreachable!("Range operator should be handled specially in for loops"),
     }
 }
 

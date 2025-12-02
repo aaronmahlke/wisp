@@ -1264,6 +1264,42 @@ impl TypeChecker {
                 }, Type::Unit)
             }
             
+            ResolvedExprKind::For { binding, binding_name, iter, body } => {
+                // Check that iter is a range expression (Binary with Range operator)
+                // For now, we only support `for x in start..end` syntax
+                match &iter.kind {
+                    ResolvedExprKind::Binary { left, op: wisp_ast::BinOp::Range, right } => {
+                        let start_typed = self.check_expr(left);
+                        let end_typed = self.check_expr(right);
+                        
+                        // Both start and end must be i32 (for now)
+                        if let Err(e) = self.ctx.unify(&start_typed.ty, &Type::I32) {
+                            self.error(format!("for loop range start must be i32: {}", e), left.span);
+                        }
+                        if let Err(e) = self.ctx.unify(&end_typed.ty, &Type::I32) {
+                            self.error(format!("for loop range end must be i32: {}", e), right.span);
+                        }
+                        
+                        // The binding has type i32
+                        self.ctx.register_def_type(*binding, Type::I32);
+                        
+                        let body_typed = self.check_block(body, None);
+                        
+                        (TypedExprKind::For {
+                            binding: *binding,
+                            binding_name: binding_name.clone(),
+                            start: Box::new(start_typed),
+                            end: Box::new(end_typed),
+                            body: body_typed,
+                        }, Type::Unit)
+                    }
+                    _ => {
+                        self.error("for loop currently only supports range expressions (start..end)".to_string(), iter.span);
+                        (TypedExprKind::Error, Type::Error)
+                    }
+                }
+            }
+            
             ResolvedExprKind::Block(block) => {
                 let typed = self.check_block(block, None);
                 let ty = typed.ty.clone();
@@ -1368,6 +1404,67 @@ impl TypeChecker {
                 }, elem_type)
             }
             
+            ResolvedExprKind::ArrayLit(elements) => {
+                if elements.is_empty() {
+                    self.error("cannot infer type of empty array literal".to_string(), expr.span);
+                    (TypedExprKind::ArrayLit(vec![]), Type::Error)
+                } else {
+                    // Type check all elements
+                    let typed_elements: Vec<_> = elements.iter().map(|e| self.check_expr(e)).collect();
+                    
+                    // All elements must have the same type
+                    let elem_type = typed_elements[0].ty.clone();
+                    for (i, elem) in typed_elements.iter().enumerate().skip(1) {
+                        if let Err(e) = self.ctx.unify(&elem_type, &elem.ty) {
+                            self.error(format!("array element {} has wrong type: {}", i, e), elem.span);
+                        }
+                    }
+                    
+                    let len = typed_elements.len();
+                    let array_type = Type::Array(Box::new(self.ctx.apply(&elem_type)), len);
+                    
+                    (TypedExprKind::ArrayLit(typed_elements), array_type)
+                }
+            }
+            
+            ResolvedExprKind::Lambda { params, body } => {
+                // Type check the lambda
+                // For now, we require type annotations on parameters (no inference)
+                let mut param_types = Vec::new();
+                let mut typed_params = Vec::new();
+                
+                for p in params {
+                    let param_ty = if let Some(ty) = &p.ty {
+                        self.resolve_type(ty)
+                    } else {
+                        // No type annotation - use a fresh type variable for inference
+                        self.ctx.fresh_var()
+                    };
+                    
+                    self.ctx.register_def_type(p.def_id, param_ty.clone());
+                    param_types.push(param_ty.clone());
+                    typed_params.push(TypedLambdaParam {
+                        def_id: p.def_id,
+                        name: p.name.clone(),
+                        ty: param_ty,
+                        span: p.span,
+                    });
+                }
+                
+                let body_typed = self.check_expr(body);
+                let ret_type = body_typed.ty.clone();
+                
+                let fn_type = Type::Function {
+                    params: param_types,
+                    ret: Box::new(ret_type),
+                };
+                
+                (TypedExprKind::Lambda {
+                    params: typed_params,
+                    body: Box::new(body_typed),
+                }, fn_type)
+            }
+            
             ResolvedExprKind::Error => (TypedExprKind::Error, Type::Error),
         };
 
@@ -1414,6 +1511,13 @@ impl TypeChecker {
                     self.error(format!("logical operator requires bool: {}", e), span);
                 }
                 Type::Bool
+            }
+            // Range (used in for loops)
+            BinOp::Range => {
+                // Range is only valid in for loop context, which is handled specially
+                // If we get here, it's an error
+                self.error("range operator (..) can only be used in for loops".to_string(), span);
+                Type::Error
             }
         }
     }
@@ -1899,13 +2003,24 @@ pub enum TypedExprKind {
     StructLit { struct_def: DefId, fields: Vec<(String, TypedExpr)> },
     If { cond: Box<TypedExpr>, then_block: TypedBlock, else_block: Option<TypedElse> },
     While { cond: Box<TypedExpr>, body: TypedBlock },
+    For { binding: DefId, binding_name: String, start: Box<TypedExpr>, end: Box<TypedExpr>, body: TypedBlock },
     Block(TypedBlock),
     Assign { target: Box<TypedExpr>, value: Box<TypedExpr> },
     Ref { is_mut: bool, expr: Box<TypedExpr> },
     Deref(Box<TypedExpr>),
     Match { scrutinee: Box<TypedExpr>, arms: Vec<TypedMatchArm> },
     Index { expr: Box<TypedExpr>, index: Box<TypedExpr> },
+    ArrayLit(Vec<TypedExpr>),
+    Lambda { params: Vec<TypedLambdaParam>, body: Box<TypedExpr> },
     Error,
+}
+
+#[derive(Debug)]
+pub struct TypedLambdaParam {
+    pub def_id: DefId,
+    pub name: String,
+    pub ty: Type,
+    pub span: Span,
 }
 
 #[derive(Debug)]

@@ -821,6 +821,7 @@ impl<'src> Parser<'src> {
             Token::GtEq => Some(BinOp::GtEq),
             Token::AndAnd => Some(BinOp::And),
             Token::OrOr => Some(BinOp::Or),
+            Token::DotDot => Some(BinOp::Range),
             _ => None,
         }
     }
@@ -1042,6 +1043,7 @@ impl<'src> Parser<'src> {
             }
             Token::If => self.parse_if_expr(),
             Token::While => self.parse_while_expr(),
+            Token::For => self.parse_for_expr(),
             Token::Match => self.parse_match_expr(),
             Token::LBrace => {
                 let block = self.parse_block()?;
@@ -1052,16 +1054,110 @@ impl<'src> Parser<'src> {
                 })
             }
             Token::LParen => {
+                // Could be grouped expression or lambda
+                // Try to parse as lambda first by looking ahead
+                if let Some(lambda) = self.try_parse_lambda(start)? {
+                    Ok(lambda)
+                } else {
+                    self.advance();
+                    let expr = self.parse_expr()?;
+                    self.expect(Token::RParen)?;
+                    Ok(expr)
+                }
+            }
+            Token::LBracket => {
+                // Array literal: [1, 2, 3]
                 self.advance();
-                let expr = self.parse_expr()?;
-                self.expect(Token::RParen)?;
-                Ok(expr)
+                let mut elements = Vec::new();
+                
+                while !self.check(&Token::RBracket) && !self.is_at_end() {
+                    elements.push(self.parse_expr()?);
+                    
+                    if !self.check(&Token::RBracket) {
+                        self.expect(Token::Comma)?;
+                    }
+                }
+                
+                let end = self.expect(Token::RBracket)?;
+                let span = Span::new(start.start, end.span.end);
+                
+                Ok(Expr {
+                    kind: ExprKind::ArrayLit(elements),
+                    span,
+                })
             }
             _ => Err(ParseError {
                 message: format!("expected expression, found '{}'", self.peek()),
                 span: start,
             }),
         }
+    }
+
+    /// Try to parse a lambda expression. Returns None if not a lambda.
+    /// Lambda syntax: (params) -> body
+    fn try_parse_lambda(&mut self, start: Span) -> ParseResult<Option<Expr>> {
+        // Save position for backtracking
+        let saved_pos = self.pos;
+        
+        self.advance(); // consume '('
+        
+        // Try to parse parameters
+        let mut params = Vec::new();
+        
+        while !self.check(&Token::RParen) && !self.is_at_end() {
+            let param_start = self.peek_span();
+            
+            // Lambda params can be: ident or ident: type
+            if let Token::Ident(name) = self.peek().clone() {
+                self.advance();
+                let name_ident = Ident { name, span: param_start };
+                
+                let ty = if self.check(&Token::Colon) {
+                    self.advance();
+                    Some(self.parse_type()?)
+                } else {
+                    None
+                };
+                
+                let span = Span::new(param_start.start, self.peek_span().start);
+                params.push(LambdaParam { name: name_ident, ty, span });
+                
+                if !self.check(&Token::RParen) {
+                    if !self.check(&Token::Comma) {
+                        // Not a valid lambda param list
+                        self.pos = saved_pos;
+                        return Ok(None);
+                    }
+                    self.advance();
+                }
+            } else {
+                // Not an identifier, not a lambda
+                self.pos = saved_pos;
+                return Ok(None);
+            }
+        }
+        
+        if !self.check(&Token::RParen) {
+            self.pos = saved_pos;
+            return Ok(None);
+        }
+        self.advance(); // consume ')'
+        
+        // Check for '->'
+        if !self.check(&Token::Arrow) {
+            self.pos = saved_pos;
+            return Ok(None);
+        }
+        self.advance(); // consume '->'
+        
+        // Parse body
+        let body = self.parse_expr()?;
+        let span = Span::new(start.start, body.span.end);
+        
+        Ok(Some(Expr {
+            kind: ExprKind::Lambda(params, Box::new(body)),
+            span,
+        }))
     }
 
     fn parse_struct_literal(&mut self, name: Ident) -> ParseResult<Expr> {
@@ -1137,6 +1233,23 @@ impl<'src> Parser<'src> {
         
         Ok(Expr {
             kind: ExprKind::While(Box::new(cond), body),
+            span,
+        })
+    }
+
+    fn parse_for_expr(&mut self) -> ParseResult<Expr> {
+        let start = self.peek_span();
+        self.expect(Token::For)?;
+        
+        let binding = self.expect_ident()?;
+        self.expect(Token::In)?;
+        let iter = self.parse_expr_no_struct()?;
+        let body = self.parse_block()?;
+        
+        let span = Span::new(start.start, body.span.end);
+        
+        Ok(Expr {
+            kind: ExprKind::For(binding, Box::new(iter), body),
             span,
         })
     }

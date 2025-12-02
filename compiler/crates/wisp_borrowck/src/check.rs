@@ -173,6 +173,19 @@ impl<'a> BorrowChecker<'a> {
                 self.check_expr(index);
             }
 
+            TypedExprKind::ArrayLit(elements) => {
+                for elem in elements {
+                    self.check_expr(elem);
+                    self.check_move_or_copy(elem);
+                }
+            }
+
+            TypedExprKind::Lambda { body, .. } => {
+                // For now, just check the lambda body
+                // TODO: proper capture analysis
+                self.check_expr(body);
+            }
+
             TypedExprKind::StructLit { fields, .. } => {
                 for (_, field_expr) in fields {
                     self.check_expr(field_expr);
@@ -190,6 +203,12 @@ impl<'a> BorrowChecker<'a> {
 
             TypedExprKind::While { cond, body } => {
                 self.check_expr(cond);
+                self.check_block(body);
+            }
+
+            TypedExprKind::For { start, end, body, .. } => {
+                self.check_expr(start);
+                self.check_expr(end);
                 self.check_block(body);
             }
 

@@ -849,6 +849,24 @@ impl Resolver {
                 }
             }
             
+            ExprKind::For(binding, iter, body) => {
+                // Resolve the iterator expression first (before entering the loop scope)
+                let resolved_iter = self.resolve_expr(iter);
+                
+                // Create a new scope for the loop body with the binding
+                self.push_scope();
+                let binding_def = self.define(binding.name.clone(), DefKind::Local, binding.span, None);
+                let resolved_body = self.resolve_block(body);
+                self.pop_scope();
+                
+                ResolvedExprKind::For {
+                    binding: binding_def,
+                    binding_name: binding.name.clone(),
+                    iter: Box::new(resolved_iter),
+                    body: resolved_body,
+                }
+            }
+            
             ExprKind::Block(block) => {
                 ResolvedExprKind::Block(self.resolve_block(block))
             }
@@ -882,6 +900,37 @@ impl Resolver {
                 ResolvedExprKind::Index {
                     expr: Box::new(self.resolve_expr(base)),
                     index: Box::new(self.resolve_expr(index)),
+                }
+            }
+            
+            ExprKind::ArrayLit(elements) => {
+                ResolvedExprKind::ArrayLit(
+                    elements.iter().map(|e| self.resolve_expr(e)).collect()
+                )
+            }
+            
+            ExprKind::Lambda(params, body) => {
+                // Create a new scope for lambda body
+                self.push_scope();
+                
+                // Define parameters in scope
+                let resolved_params: Vec<_> = params.iter().map(|p| {
+                    let def_id = self.define(p.name.name.clone(), DefKind::Parameter, p.span, None);
+                    let ty = p.ty.as_ref().map(|t| self.resolve_type(t));
+                    ResolvedLambdaParam {
+                        def_id,
+                        name: p.name.name.clone(),
+                        ty,
+                        span: p.span,
+                    }
+                }).collect();
+                
+                let resolved_body = self.resolve_expr(body);
+                self.pop_scope();
+                
+                ResolvedExprKind::Lambda {
+                    params: resolved_params,
+                    body: Box::new(resolved_body),
                 }
             }
         };
