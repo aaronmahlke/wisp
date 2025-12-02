@@ -20,6 +20,7 @@ fn print_usage() {
     eprintln!("Commands:");
     eprintln!("  run <file>      Compile and run the program");
     eprintln!("  build <file>    Compile to executable");
+    eprintln!("  lsp             Start the language server");
     eprintln!("  lex <file>      Show lexer output (tokens)");
     eprintln!("  parse <file>    Show parser output (AST)");
     eprintln!("  resolve <file>  Show name resolution (HIR)");
@@ -48,8 +49,14 @@ fn main() {
         print_usage();
         std::process::exit(0);
     }
+    
+    // Handle LSP (no file argument needed)
+    if args[1] == "lsp" {
+        run_lsp();
+        return;
+    }
 
-    // All commands require a file argument
+    // All other commands require a file argument
     let commands = ["run", "build", "lex", "parse", "resolve", "check", "borrow", "mir", "emit-obj"];
     
     let (mode, file_path) = if commands.contains(&args[1].as_str()) {
@@ -672,4 +679,10 @@ fn show_error_context(source: &str, span: wisp_lexer::Span) {
         
         char_count = line_end + 1; // +1 for newline
     }
+}
+
+/// Run the Language Server Protocol server
+#[tokio::main]
+async fn run_lsp() {
+    wisp_lsp::run_server().await;
 }

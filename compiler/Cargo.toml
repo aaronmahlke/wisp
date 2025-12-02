@@ -9,6 +9,7 @@ members = [
     "crates/wisp_borrowck",
     "crates/wisp_mir",
     "crates/wisp_codegen",
+    "crates/wisp_lsp",
     "crates/wisp_driver",
 ]
 

@@ -1,0 +1,14 @@
+id = "wisp"
+name = "Wisp"
+version = "0.1.0"
+schema_version = 1
+authors = ["Aaron Mahlke"]
+description = "Wisp language support"
+repository = "https://github.com/aaronmahlke/wisp"
+languages = ["languages/wisp"]
+
+[grammars.wisp]
+repository = "https://github.com/aaronmahlke/wisp"
+path = "tree-sitter-wisp"
+
+[language_servers]

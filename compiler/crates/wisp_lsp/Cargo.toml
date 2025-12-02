@@ -1,18 +1,19 @@
 [package]
-name = "wisp_driver"
+name = "wisp_lsp"
 version.workspace = true
-edition.workspace = true
+edition = "2021"
 
 [dependencies]
+tower-lsp = "0.20"
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Wisp compiler crates
 wisp_lexer = { path = "../wisp_lexer" }
 wisp_ast = { path = "../wisp_ast" }
 wisp_parser = { path = "../wisp_parser" }
 wisp_hir = { path = "../wisp_hir" }
 wisp_types = { path = "../wisp_types" }
 wisp_borrowck = { path = "../wisp_borrowck" }
-wisp_mir = { path = "../wisp_mir" }
-wisp_codegen = { path = "../wisp_codegen" }
-wisp_lsp = { path = "../wisp_lsp" }
-ariadne.workspace = true
-tokio = { version = "1", features = ["full"] }
 
