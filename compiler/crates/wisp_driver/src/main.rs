@@ -5,7 +5,7 @@ use std::process::Command;
 use clap::{Parser, Subcommand, CommandFactory};
 use clap_complete::{generate, Shell};
 use wisp_lexer::{Lexer, Token};
-use wisp_parser::{Parser as WispParser, parse_with_imports};
+use wisp_parser::{Parser as WispParser, parse_with_imports, parse_with_imports_structured};
 use wisp_hir::Resolver;
 use wisp_types::TypeChecker;
 use wisp_borrowck::BorrowChecker;
@@ -599,8 +599,17 @@ fn run_codegen(source: &str, file_path: &str) {
 }
 
 fn run_frontend(source: &str, file_path: &str) -> Result<wisp_types::TypedProgram, ()> {
-    // Parse with imports
-    let ast = match parse_with_imports(source, Path::new(file_path)) {
+    // Parse with imports, preserving namespace structure
+    let mut visited = std::collections::HashSet::new();
+    let file_path = Path::new(file_path);
+    if let Ok(canonical) = file_path.canonicalize() {
+        visited.insert(canonical);
+    } else {
+        visited.insert(file_path.to_path_buf());
+    }
+    let base_dir = file_path.parent().unwrap_or(Path::new("."));
+    
+    let ast_with_imports = match parse_with_imports_structured(source, base_dir, &mut visited) {
         Ok(ast) => ast,
         Err(e) => {
             eprintln!("{}", e);
@@ -608,8 +617,8 @@ fn run_frontend(source: &str, file_path: &str) -> Result<wisp_types::TypedProgra
         }
     };
     
-    // Resolve
-    let hir = match Resolver::resolve(&ast) {
+    // Resolve with namespace support
+    let hir = match Resolver::resolve_with_imports(&ast_with_imports) {
         Ok(hir) => hir,
         Err(errors) => {
             eprintln!("Resolution errors:");

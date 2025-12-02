@@ -1,6 +1,6 @@
 //! Name resolution - resolves all identifiers to DefIds
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use wisp_ast::*;
 use wisp_lexer::Span;
 use crate::hir::*;
@@ -63,16 +63,46 @@ impl Scope {
     }
 }
 
+/// Namespace - a collection of names from an import
+#[derive(Debug, Clone, Default)]
+pub struct Namespace {
+    /// Names in this namespace
+    pub names: HashMap<String, DefId>,
+    /// Nested namespaces (for `import std` -> `std.io.print`)
+    pub children: HashMap<String, Namespace>,
+}
+
+impl Namespace {
+    fn new() -> Self {
+        Self { 
+            names: HashMap::new(),
+            children: HashMap::new(),
+        }
+    }
+    
+    fn define(&mut self, name: String, def_id: DefId) {
+        self.names.insert(name, def_id);
+    }
+    
+    fn lookup(&self, name: &str) -> Option<DefId> {
+        self.names.get(name).copied()
+    }
+}
+
 /// Name resolver
 pub struct Resolver {
     /// Next DefId to assign
     next_id: u32,
-    /// Current scope
+    /// Current scope (for local variables within functions)
     scope: Scope,
     /// All definitions
     defs: HashMap<DefId, DefInfo>,
-    /// Global names (types, functions)
+    /// Global names (types, functions) - shared across all modules
     globals: HashMap<String, DefId>,
+    /// Namespaces from imports: namespace_name -> Namespace (only public items)
+    namespaces: HashMap<String, Namespace>,
+    /// Per-module scopes: ModuleId -> Scope (all items in that module, public or private)
+    module_scopes: HashMap<ModuleId, Scope>,
     /// Errors encountered
     errors: Vec<ResolveError>,
     /// Current function's locals
@@ -81,6 +111,14 @@ pub struct Resolver {
     self_type: Option<DefId>,
     /// Trait type parameters with defaults: trait DefId -> [(param name, default type if any)]
     trait_type_params: HashMap<DefId, Vec<(String, Option<TypeExpr>)>>,
+    /// Current namespace being populated (when processing an import's items)
+    current_namespace: Option<String>,
+    /// Items that have already been resolved (by span start..end)
+    resolved_items: HashSet<(usize, usize)>,
+    /// Module registry
+    modules: ModuleRegistry,
+    /// Current module being resolved
+    current_module: ModuleId,
 }
 
 impl Resolver {
@@ -90,10 +128,16 @@ impl Resolver {
             scope: Scope::new(),
             defs: HashMap::new(),
             globals: HashMap::new(),
+            namespaces: HashMap::new(),
+            module_scopes: HashMap::new(),
             errors: Vec::new(),
             current_locals: Vec::new(),
             self_type: None,
             trait_type_params: HashMap::new(),
+            current_namespace: None,
+            resolved_items: HashSet::new(),
+            modules: ModuleRegistry::new(),
+            current_module: ModuleId::root(),
         }
     }
 
@@ -108,6 +152,18 @@ impl Resolver {
             Err(resolver.errors)
         }
     }
+    
+    /// Resolve a source file with imports to HIR, preserving namespace information
+    pub fn resolve_with_imports(source: &SourceFileWithImports) -> Result<ResolvedProgram, Vec<ResolveError>> {
+        let mut resolver = Resolver::new();
+        let program = resolver.resolve_source_file_with_imports(source);
+        
+        if resolver.errors.is_empty() {
+            Ok(program)
+        } else {
+            Err(resolver.errors)
+        }
+    }
 
     fn fresh_id(&mut self) -> DefId {
         let id = DefId::new(self.next_id);
@@ -115,7 +171,7 @@ impl Resolver {
         id
     }
 
-    fn define(&mut self, name: String, kind: DefKind, span: Span, parent: Option<DefId>) -> DefId {
+    fn define(&mut self, name: String, kind: DefKind, span: Span, parent: Option<DefId>, is_pub: bool) -> DefId {
         let id = self.fresh_id();
         let info = DefInfo {
             id,
@@ -123,13 +179,15 @@ impl Resolver {
             kind,
             span,
             parent,
+            module_id: self.current_module,
+            is_pub,
         };
         self.defs.insert(id, info);
         self.scope.define(name, id);
         id
     }
 
-    fn define_global(&mut self, name: String, kind: DefKind, span: Span) -> DefId {
+    fn define_global(&mut self, name: String, kind: DefKind, span: Span, is_pub: bool) -> DefId {
         let id = self.fresh_id();
         let info = DefInfo {
             id,
@@ -137,15 +195,245 @@ impl Resolver {
             kind,
             span,
             parent: None,
+            module_id: self.current_module,
+            is_pub,
         };
         self.defs.insert(id, info);
         self.globals.insert(name.clone(), id);
-        self.scope.define(name, id);
+        
+        // Track in module registry
+        self.modules.add_def(self.current_module, id);
+        
+        // Add to the current module's scope (all items in a module can see each other)
+        self.module_scopes
+            .entry(self.current_module)
+            .or_insert_with(Scope::new)
+            .define(name.clone(), id);
+        
+        // Also add to namespace if we're processing an import (only public items)
+        if let Some(ref ns_name) = self.current_namespace {
+            if is_pub {
+                if let Some(ns) = self.namespaces.get_mut(ns_name) {
+                    ns.define(name, id);
+                }
+            }
+        }
+        
         id
+    }
+    
+    /// Lookup a name in a namespace (only returns public items)
+    fn lookup_in_namespace(&self, namespace: &str, name: &str) -> Option<DefId> {
+        self.namespaces.get(namespace).and_then(|ns| ns.lookup(name))
+    }
+    
+    /// Lookup a name in a namespace, with visibility checking
+    /// Returns (DefId, is_public) or None if not found
+    fn lookup_in_namespace_with_visibility(&self, namespace: &str, name: &str) -> Option<(DefId, bool)> {
+        self.namespaces.get(namespace).and_then(|ns| {
+            ns.lookup(name).map(|def_id| {
+                let is_pub = self.defs.get(&def_id)
+                    .map(|info| info.is_pub)
+                    .unwrap_or(false);
+                (def_id, is_pub)
+            })
+        })
+    }
+    
+    /// Check if accessing a def from another module is allowed
+    fn check_visibility(&mut self, def_id: DefId, access_span: Span) -> bool {
+        if let Some(def_info) = self.defs.get(&def_id) {
+            // Same module - always allowed
+            if def_info.module_id == self.current_module {
+                return true;
+            }
+            // Different module - check if public
+            if !def_info.is_pub {
+                self.error(
+                    format!("'{}' is private", def_info.name),
+                    access_span,
+                );
+                return false;
+            }
+        }
+        true
+    }
+    
+    /// Check if a name is a namespace
+    fn is_namespace(&self, name: &str) -> bool {
+        self.namespaces.contains_key(name)
+    }
+    
+    /// Collect namespace path from a field access chain (e.g., std.io -> ["std", "io"])
+    fn collect_namespace_path(&self, expr: &Expr) -> Option<Vec<String>> {
+        match &expr.kind {
+            ExprKind::Ident(ident) => {
+                if self.is_namespace(&ident.name) {
+                    Some(vec![ident.name.clone()])
+                } else {
+                    None
+                }
+            }
+            ExprKind::Field(base, field) => {
+                // Recursively collect path from base
+                if let Some(mut path) = self.collect_namespace_path(base) {
+                    // Check if this field is a child namespace
+                    if let Some(ns) = self.lookup_child_namespace(&path, &field.name) {
+                        if ns.children.contains_key(&field.name) || !ns.names.is_empty() {
+                            path.push(field.name.clone());
+                            return Some(path);
+                        }
+                    }
+                }
+                None
+            }
+            _ => None,
+        }
+    }
+    
+    /// Look up a child namespace by path
+    fn lookup_child_namespace(&self, path: &[String], _child: &str) -> Option<&Namespace> {
+        if path.is_empty() {
+            return None;
+        }
+        
+        let mut current = self.namespaces.get(&path[0])?;
+        for segment in &path[1..] {
+            current = current.children.get(segment)?;
+        }
+        Some(current)
+    }
+    
+    /// Resolve a namespace access like std.io.print
+    fn resolve_namespace_access(&mut self, ns_path: &[String], item_name: &str, field_span: Span, expr_span: Span) -> Option<ResolvedExpr> {
+        if ns_path.is_empty() {
+            return None;
+        }
+        
+        // Start from the root namespace
+        let mut current = self.namespaces.get(&ns_path[0])?;
+        
+        // Navigate through child namespaces
+        for segment in &ns_path[1..] {
+            current = current.children.get(segment)?;
+        }
+        
+        // Check if the item exists in this namespace
+        if let Some(&def_id) = current.names.get(item_name) {
+            // Check visibility
+            let is_pub = self.defs.get(&def_id).map(|d| d.is_pub).unwrap_or(false);
+            if !is_pub {
+                self.error(
+                    format!("'{}' is private", item_name),
+                    field_span,
+                );
+            }
+            return Some(ResolvedExpr {
+                kind: ResolvedExprKind::Var {
+                    name: item_name.to_string(),
+                    def_id,
+                },
+                span: expr_span,
+            });
+        }
+        
+        // Check if it's a child namespace (for further chaining)
+        if current.children.contains_key(item_name) {
+            let mut new_path = ns_path.to_vec();
+            new_path.push(item_name.to_string());
+            return Some(ResolvedExpr {
+                kind: ResolvedExprKind::NamespacePath(new_path),
+                span: expr_span,
+            });
+        }
+        
+        // Item not found in namespace
+        let ns_display = ns_path.join(".");
+        self.error(
+            format!("cannot find '{}' in namespace '{}'", item_name, ns_display),
+            field_span,
+        );
+        Some(ResolvedExpr {
+            kind: ResolvedExprKind::Error,
+            span: expr_span,
+        })
+    }
+    
+    /// Process an import to create its namespace (first pass)
+    fn process_import_namespace(&mut self, import: &ImportDecl) {
+        // Determine the namespace name
+        let ns_name = if let Some(ref alias) = import.alias {
+            alias.name.clone()
+        } else {
+            // Use the last segment of the path
+            import.path.last_segment()
+                .map(|s| s.to_string())
+                .unwrap_or_default()
+        };
+        
+        // Create the namespace if it doesn't exist
+        if !ns_name.is_empty() && !import.destructure_only {
+            self.namespaces.entry(ns_name.clone()).or_insert_with(Namespace::new);
+            // Set current namespace so define_global adds items to it
+            self.current_namespace = Some(ns_name);
+        }
+    }
+    
+    /// Process import items into scope (second pass)
+    fn process_import_items(&mut self, import: &ImportDecl) {
+        // Clear current namespace
+        self.current_namespace = None;
+        
+        // If destructure items are specified, import them directly into scope
+        if let Some(ref items) = import.items {
+            for item in items {
+                let name = if let Some(ref alias) = item.alias {
+                    &alias.name
+                } else {
+                    &item.name.name
+                };
+                
+                // Look up the original item in the namespace
+                let ns_name = import.path.last_segment().unwrap_or("");
+                if let Some((def_id, is_pub)) = self.lookup_in_namespace_with_visibility(ns_name, &item.name.name) {
+                    // Check visibility - only public items can be imported
+                    if !is_pub {
+                        self.error(
+                            format!("'{}' is private and cannot be imported", item.name.name),
+                            item.span,
+                        );
+                    }
+                    // Import it into the current scope
+                    self.scope.define(name.clone(), def_id);
+                } else {
+                    // Also check globals (for backwards compatibility)
+                    if let Some(&def_id) = self.globals.get(&item.name.name) {
+                        self.scope.define(name.clone(), def_id);
+                    } else {
+                        self.error(
+                            format!("cannot find '{}' in module", item.name.name),
+                            item.span,
+                        );
+                    }
+                }
+            }
+        }
     }
 
     fn lookup(&self, name: &str) -> Option<DefId> {
-        self.scope.lookup(name)
+        // First check the local scope (function locals, parameters)
+        if let Some(id) = self.scope.lookup(name) {
+            return Some(id);
+        }
+        
+        // Then check the current module's scope (all items in this module)
+        if let Some(module_scope) = self.module_scopes.get(&self.current_module) {
+            if let Some(id) = module_scope.lookup(name) {
+                return Some(id);
+            }
+        }
+        
+        None
     }
 
     fn error(&mut self, message: String, span: Span) {
@@ -169,26 +457,27 @@ impl Resolver {
         // First pass: collect all type and function names
         for item in &source.items {
             match item {
-                Item::Import(_) => {
-                    // Imports are handled by the driver before resolution
+                Item::Import(import) => {
+                    // Create namespace for this import
+                    self.process_import_namespace(import);
                 }
                 Item::Struct(s) => {
-                    self.define_global(s.name.name.clone(), DefKind::Struct, s.span);
+                    self.define_global(s.name.name.clone(), DefKind::Struct, s.span, s.is_pub);
                 }
                 Item::Enum(e) => {
-                    self.define_global(e.name.name.clone(), DefKind::Enum, e.span);
+                    self.define_global(e.name.name.clone(), DefKind::Enum, e.span, e.is_pub);
                 }
                 Item::Trait(t) => {
-                    self.define_global(t.name.name.clone(), DefKind::Trait, t.span);
+                    self.define_global(t.name.name.clone(), DefKind::Trait, t.span, t.is_pub);
                 }
                 Item::Function(f) => {
-                    self.define_global(f.name.name.clone(), DefKind::Function, f.span);
+                    self.define_global(f.name.name.clone(), DefKind::Function, f.span, f.is_pub);
                 }
                 Item::ExternFunction(f) => {
-                    self.define_global(f.name.name.clone(), DefKind::ExternFunction, f.span);
+                    self.define_global(f.name.name.clone(), DefKind::ExternFunction, f.span, f.is_pub);
                 }
                 Item::ExternStatic(s) => {
-                    self.define_global(s.name.name.clone(), DefKind::ExternStatic, s.span);
+                    self.define_global(s.name.name.clone(), DefKind::ExternStatic, s.span, s.is_pub);
                 }
                 Item::Impl(_) => {
                     // Impl blocks don't define a global name
@@ -199,8 +488,9 @@ impl Resolver {
         // Second pass: resolve all items
         for item in &source.items {
             match item {
-                Item::Import(_) => {
-                    // Imports are handled by the driver before resolution
+                Item::Import(import) => {
+                    // Import items into scope based on import style
+                    self.process_import_items(import);
                 }
                 Item::Struct(s) => {
                     if let Some(resolved) = self.resolve_struct(s) {
@@ -242,7 +532,330 @@ impl Resolver {
 
         program.defs = self.defs.clone();
         program.globals = self.globals.clone();
+        program.modules = std::mem::take(&mut self.modules);
         program
+    }
+    
+    /// Resolve a source file with imports, properly setting up namespaces
+    fn resolve_source_file_with_imports(&mut self, source: &SourceFileWithImports) -> ResolvedProgram {
+        let mut program = ResolvedProgram::new();
+        
+        // Register the root module (the main file being compiled)
+        let root_module = ModuleId::root();
+        self.module_scopes.insert(root_module, Scope::new());
+        
+        // First pass: process imported modules and their items
+        // Each imported module gets its own ModuleId
+        // We need to process modules in order so that when a module imports another,
+        // the imported module's items are already defined.
+        let mut next_module_id = 1u32;
+        
+        // Map from namespace name to module ID (for looking up imports within modules)
+        let mut ns_to_module: HashMap<String, ModuleId> = HashMap::new();
+        
+        for module in &source.imported_modules {
+            // Assign a ModuleId to this imported module
+            let module_id = ModuleId::new(next_module_id);
+            next_module_id += 1;
+            self.current_module = module_id;
+            self.module_scopes.insert(module_id, Scope::new());
+            
+            // Determine namespace name
+            let ns_name = if let Some(ref alias) = module.import.alias {
+                alias.name.clone()
+            } else {
+                module.import.path.last_segment()
+                    .map(|s| s.to_string())
+                    .unwrap_or_default()
+            };
+            
+            // Track namespace -> module mapping
+            if !ns_name.is_empty() {
+                ns_to_module.insert(ns_name.clone(), module_id);
+            }
+            
+            // Create namespace if not destructure-only
+            if !ns_name.is_empty() && !module.import.destructure_only {
+                self.namespaces.entry(ns_name.clone()).or_insert_with(Namespace::new);
+                self.current_namespace = Some(ns_name.clone());
+            }
+            
+            // First, process this module's imports to bring imported items into this module's scope
+            for import in &module.module_imports {
+                // This module imports another module - add its public items to this module's scope
+                let imported_ns = import.path.last_segment().unwrap_or("");
+                if let Some(ns) = self.namespaces.get(imported_ns) {
+                    // Add all items from the imported namespace to this module's scope
+                    for (name, &def_id) in &ns.names {
+                        // Check if item is public
+                        let is_pub = self.defs.get(&def_id).map(|d| d.is_pub).unwrap_or(false);
+                        if is_pub {
+                            self.module_scopes
+                                .get_mut(&module_id)
+                                .unwrap()
+                                .define(name.clone(), def_id);
+                        }
+                    }
+                    
+                    // If this is a `pub import ... as child`, add as child namespace of current namespace
+                    // This enables `import std` -> `std.io.print()` when std/mod.ws has `pub import std/io as io`
+                    if let Some(ref parent_ns) = self.current_namespace {
+                        let child_name = if let Some(ref alias) = import.alias {
+                            alias.name.clone()
+                        } else {
+                            imported_ns.to_string()
+                        };
+                        
+                        // Clone the namespace to add as a child
+                        let child_ns = Namespace {
+                            names: ns.names.clone(),
+                            children: ns.children.clone(),
+                        };
+                        
+                        if let Some(parent) = self.namespaces.get_mut(parent_ns) {
+                            parent.children.insert(child_name, child_ns);
+                        }
+                    }
+                }
+            }
+            
+            // Now process this module's own items
+            for item in &module.items {
+                match item {
+                    Item::Import(_) => {
+                        // Already handled above
+                    }
+                    Item::Struct(s) => {
+                        // Skip if already defined (from another import of the same module)
+                        if !self.globals.contains_key(&s.name.name) {
+                            self.define_global(s.name.name.clone(), DefKind::Struct, s.span, s.is_pub);
+                        } else if let Some(ref ns_name) = self.current_namespace {
+                            // Still add to namespace even if globally defined
+                            if let Some(&def_id) = self.globals.get(&s.name.name) {
+                                if let Some(ns) = self.namespaces.get_mut(ns_name) {
+                                    ns.define(s.name.name.clone(), def_id);
+                                }
+                            }
+                        }
+                    }
+                    Item::Enum(e) => {
+                        if !self.globals.contains_key(&e.name.name) {
+                            self.define_global(e.name.name.clone(), DefKind::Enum, e.span, e.is_pub);
+                        } else if let Some(ref ns_name) = self.current_namespace {
+                            if let Some(&def_id) = self.globals.get(&e.name.name) {
+                                if let Some(ns) = self.namespaces.get_mut(ns_name) {
+                                    ns.define(e.name.name.clone(), def_id);
+                                }
+                            }
+                        }
+                    }
+                    Item::Trait(t) => {
+                        if !self.globals.contains_key(&t.name.name) {
+                            self.define_global(t.name.name.clone(), DefKind::Trait, t.span, t.is_pub);
+                        } else if let Some(ref ns_name) = self.current_namespace {
+                            if let Some(&def_id) = self.globals.get(&t.name.name) {
+                                if let Some(ns) = self.namespaces.get_mut(ns_name) {
+                                    ns.define(t.name.name.clone(), def_id);
+                                }
+                            }
+                        }
+                    }
+                    Item::Function(f) => {
+                        if !self.globals.contains_key(&f.name.name) {
+                            self.define_global(f.name.name.clone(), DefKind::Function, f.span, f.is_pub);
+                        } else if let Some(ref ns_name) = self.current_namespace {
+                            if let Some(&def_id) = self.globals.get(&f.name.name) {
+                                if let Some(ns) = self.namespaces.get_mut(ns_name) {
+                                    ns.define(f.name.name.clone(), def_id);
+                                }
+                            }
+                        }
+                    }
+                    Item::ExternFunction(f) => {
+                        if !self.globals.contains_key(&f.name.name) {
+                            self.define_global(f.name.name.clone(), DefKind::ExternFunction, f.span, f.is_pub);
+                        } else if let Some(ref ns_name) = self.current_namespace {
+                            if let Some(&def_id) = self.globals.get(&f.name.name) {
+                                if let Some(ns) = self.namespaces.get_mut(ns_name) {
+                                    ns.define(f.name.name.clone(), def_id);
+                                }
+                            }
+                        }
+                    }
+                    Item::ExternStatic(s) => {
+                        if !self.globals.contains_key(&s.name.name) {
+                            self.define_global(s.name.name.clone(), DefKind::ExternStatic, s.span, s.is_pub);
+                        } else if let Some(ref ns_name) = self.current_namespace {
+                            if let Some(&def_id) = self.globals.get(&s.name.name) {
+                                if let Some(ns) = self.namespaces.get_mut(ns_name) {
+                                    ns.define(s.name.name.clone(), def_id);
+                                }
+                            }
+                        }
+                    }
+                    Item::Impl(_) => {}
+                }
+            }
+            
+            // Clear namespace after processing this module's items
+            self.current_namespace = None;
+            
+            // Handle destructured imports
+            if let Some(ref items) = module.import.items {
+                for item in items {
+                    let name = if let Some(ref alias) = item.alias {
+                        &alias.name
+                    } else {
+                        &item.name.name
+                    };
+                    
+                    // Look up the item in the namespace or globals with visibility check
+                    if let Some((def_id, is_pub)) = self.lookup_in_namespace_with_visibility(&ns_name, &item.name.name) {
+                        // Check visibility - only public items can be imported
+                        if !is_pub {
+                            self.error(
+                                format!("'{}' is private and cannot be imported", item.name.name),
+                                item.span,
+                            );
+                        }
+                        // Add to root module's scope so it's accessible from main file
+                        self.module_scopes
+                            .entry(ModuleId::root())
+                            .or_insert_with(Scope::new)
+                            .define(name.clone(), def_id);
+                    } else if let Some(&def_id) = self.globals.get(&item.name.name) {
+                        self.module_scopes
+                            .entry(ModuleId::root())
+                            .or_insert_with(Scope::new)
+                            .define(name.clone(), def_id);
+                    } else {
+                        self.error(
+                            format!("cannot find '{}' in module", item.name.name),
+                            item.span,
+                        );
+                    }
+                }
+            }
+        }
+        
+        // Process local items (first pass) - switch back to root module
+        self.current_module = ModuleId::root();
+        self.current_namespace = None;
+        
+        for item in &source.local_items {
+            match item {
+                Item::Import(_) => {}
+                Item::Struct(s) => {
+                    self.define_global(s.name.name.clone(), DefKind::Struct, s.span, s.is_pub);
+                }
+                Item::Enum(e) => {
+                    self.define_global(e.name.name.clone(), DefKind::Enum, e.span, e.is_pub);
+                }
+                Item::Trait(t) => {
+                    self.define_global(t.name.name.clone(), DefKind::Trait, t.span, t.is_pub);
+                }
+                Item::Function(f) => {
+                    self.define_global(f.name.name.clone(), DefKind::Function, f.span, f.is_pub);
+                }
+                Item::ExternFunction(f) => {
+                    self.define_global(f.name.name.clone(), DefKind::ExternFunction, f.span, f.is_pub);
+                }
+                Item::ExternStatic(s) => {
+                    self.define_global(s.name.name.clone(), DefKind::ExternStatic, s.span, s.is_pub);
+                }
+                Item::Impl(_) => {}
+            }
+        }
+        
+        // Second pass: resolve all items
+        // Reset module ID counter to match first pass
+        let mut next_module_id = 1u32;
+        
+        for module in &source.imported_modules {
+            // Set current module to match the first pass
+            let module_id = ModuleId::new(next_module_id);
+            next_module_id += 1;
+            self.current_module = module_id;
+            
+            for item in &module.items {
+                self.resolve_item(item, &mut program);
+            }
+        }
+        
+        // Switch back to root module for local items
+        self.current_module = ModuleId::root();
+        
+        for item in &source.local_items {
+            self.resolve_item(item, &mut program);
+        }
+        
+        program.defs = self.defs.clone();
+        program.globals = self.globals.clone();
+        program.modules = std::mem::take(&mut self.modules);
+        program
+    }
+    
+    /// Helper to resolve a single item
+    /// Get the span key for an item (for deduplication)
+    fn item_span_key(item: &Item) -> (usize, usize) {
+        match item {
+            Item::Import(i) => (i.span.start, i.span.end),
+            Item::Function(f) => (f.span.start, f.span.end),
+            Item::ExternFunction(f) => (f.span.start, f.span.end),
+            Item::ExternStatic(s) => (s.span.start, s.span.end),
+            Item::Struct(s) => (s.span.start, s.span.end),
+            Item::Enum(e) => (e.span.start, e.span.end),
+            Item::Trait(t) => (t.span.start, t.span.end),
+            Item::Impl(i) => (i.span.start, i.span.end),
+        }
+    }
+    
+    fn resolve_item(&mut self, item: &Item, program: &mut ResolvedProgram) {
+        // Skip if already resolved
+        let span_key = Self::item_span_key(item);
+        if self.resolved_items.contains(&span_key) {
+            return;
+        }
+        self.resolved_items.insert(span_key);
+        
+        match item {
+            Item::Import(_) => {}
+            Item::Struct(s) => {
+                if let Some(resolved) = self.resolve_struct(s) {
+                    program.structs.push(resolved);
+                }
+            }
+            Item::Enum(e) => {
+                if let Some(resolved) = self.resolve_enum(e) {
+                    program.enums.push(resolved);
+                }
+            }
+            Item::Trait(t) => {
+                if let Some(resolved) = self.resolve_trait(t) {
+                    program.traits.push(resolved);
+                }
+            }
+            Item::Function(f) => {
+                if let Some(resolved) = self.resolve_function(f, None) {
+                    program.functions.push(resolved);
+                }
+            }
+            Item::ExternFunction(f) => {
+                if let Some(resolved) = self.resolve_extern_function(f) {
+                    program.extern_functions.push(resolved);
+                }
+            }
+            Item::ExternStatic(s) => {
+                if let Some(resolved) = self.resolve_extern_static(s) {
+                    program.extern_statics.push(resolved);
+                }
+            }
+            Item::Impl(i) => {
+                if let Some(resolved) = self.resolve_impl(i) {
+                    program.impls.push(resolved);
+                }
+            }
+        }
     }
 
     fn resolve_struct(&mut self, s: &StructDef) -> Option<ResolvedStruct> {
@@ -260,6 +873,8 @@ impl Resolver {
                 kind: DefKind::TypeParam,
                 span: type_param.span,
                 parent: Some(def_id),
+                module_id: self.current_module,
+                is_pub: false,
             };
             self.defs.insert(param_id, param_info);
             self.scope.define(type_param.name.name.clone(), param_id);
@@ -274,6 +889,8 @@ impl Resolver {
                 kind: DefKind::Field,
                 span: field.span,
                 parent: Some(def_id),
+                module_id: self.current_module,
+                is_pub: false, // TODO: Support pub fields
             };
             self.defs.insert(field_id, field_info);
             
@@ -308,6 +925,8 @@ impl Resolver {
                 kind: DefKind::EnumVariant,
                 span: variant.span,
                 parent: Some(def_id),
+                module_id: self.current_module,
+                is_pub: false, // Variants inherit visibility from enum
             };
             self.defs.insert(variant_id, variant_info);
             
@@ -323,6 +942,8 @@ impl Resolver {
                     kind: DefKind::Field,
                     span: field.span,
                     parent: Some(variant_id),
+                    module_id: self.current_module,
+                    is_pub: false,
                 };
                 self.defs.insert(field_id, field_info);
                 
@@ -371,6 +992,8 @@ impl Resolver {
                 kind: DefKind::TypeParam,
                 span: type_param.span,
                 parent: Some(def_id),
+                module_id: self.current_module,
+                is_pub: false,
             };
             self.defs.insert(param_id, param_info);
             self.scope.define(type_param.name.name.clone(), param_id);
@@ -484,6 +1107,8 @@ impl Resolver {
                 kind: DefKind::Method,
                 span: f.span,
                 parent,
+                module_id: self.current_module,
+                is_pub: f.is_pub,
             };
             self.defs.insert(id, info);
             id
@@ -502,6 +1127,8 @@ impl Resolver {
                 kind: DefKind::TypeParam,
                 span: type_param.span,
                 parent: Some(def_id),
+                module_id: self.current_module,
+                is_pub: false,
             };
             self.defs.insert(param_id, param_info);
             self.scope.define(type_param.name.name.clone(), param_id);
@@ -534,6 +1161,8 @@ impl Resolver {
                 kind: DefKind::Local,
                 span: p.name.span,
                 parent: Some(def_id),
+                module_id: self.current_module,
+                is_pub: false,
             };
             self.defs.insert(param_def_id, info.clone());
             self.scope.define(p.name.name.clone(), param_def_id);
@@ -580,6 +1209,8 @@ impl Resolver {
                 kind: DefKind::Method,
                 span: f.span,
                 parent,
+                module_id: self.current_module,
+                is_pub: f.is_pub,
             };
             self.defs.insert(id, info);
             id
@@ -601,6 +1232,8 @@ impl Resolver {
                 kind: DefKind::TypeParam,
                 span: type_param.span,
                 parent: Some(def_id),
+                module_id: self.current_module,
+                is_pub: false,
             };
             self.defs.insert(param_id, param_info);
             self.scope.define(type_param.name.name.clone(), param_id);
@@ -629,6 +1262,7 @@ impl Resolver {
                 DefKind::Parameter,
                 param.span,
                 Some(def_id),
+                false, // parameters are not public
             );
             
             let ty = self.resolve_type(&param.ty);
@@ -677,6 +1311,8 @@ impl Resolver {
                 kind: DefKind::Parameter,
                 span: param.span,
                 parent: Some(def_id),
+                module_id: self.current_module,
+                is_pub: false,
             };
             self.defs.insert(param_id, param_info);
             
@@ -727,6 +1363,27 @@ impl Resolver {
                 // Check for Self
                 if name == "Self" {
                     return ResolvedType::SelfType;
+                }
+                
+                // Check for namespaced type (e.g., "io.Display" encoded as "io.Display")
+                // This is a workaround until we have proper type path syntax
+                if let Some(dot_pos) = name.find('.') {
+                    let ns_name = &name[..dot_pos];
+                    let type_name = &name[dot_pos + 1..];
+                    if let Some((def_id, is_pub)) = self.lookup_in_namespace_with_visibility(ns_name, type_name) {
+                        // Check visibility - types from other modules must be public
+                        if !is_pub {
+                            self.error(
+                                format!("type '{}' is private", type_name),
+                                ty.span,
+                            );
+                        }
+                        return ResolvedType::Named {
+                            name: type_name.to_string(),
+                            def_id: Some(def_id),
+                            type_args: resolved_args,
+                        };
+                    }
                 }
                 
                 // Look up user-defined type first (allows shadowing primitives like String)
@@ -800,6 +1457,7 @@ impl Resolver {
                     DefKind::Local,
                     l.span,
                     None,
+                    false, // locals are not public
                 );
                 self.current_locals.push(def_id);
                 
@@ -865,6 +1523,59 @@ impl Resolver {
             }
             
             ExprKind::Field(base, field) => {
+                // Check if this is a namespace access (e.g., io.print or std.io.print)
+                // First, try to resolve the full namespace path
+                if let Some(ns_path) = self.collect_namespace_path(base) {
+                    // Try to resolve: look for nested namespace or item
+                    if let Some(result) = self.resolve_namespace_access(&ns_path, &field.name, field.span, expr.span) {
+                        return result;
+                    }
+                }
+                
+                // Check if this is a simple namespace access (e.g., io.print)
+                if let ExprKind::Ident(ref ident) = base.kind {
+                    if self.is_namespace(&ident.name) {
+                        // This is a namespace access - resolve to the item in the namespace
+                        if let Some((def_id, is_pub)) = self.lookup_in_namespace_with_visibility(&ident.name, &field.name) {
+                            // Check visibility - items from other modules must be public
+                            if !is_pub {
+                                self.error(
+                                    format!("'{}' is private", field.name),
+                                    field.span,
+                                );
+                            }
+                            return ResolvedExpr {
+                                kind: ResolvedExprKind::Var {
+                                    name: field.name.clone(),
+                                    def_id,
+                                },
+                                span: expr.span,
+                            };
+                        } else {
+                            // Check if this is a child namespace (will be resolved later in the chain)
+                            if let Some(ns) = self.namespaces.get(&ident.name) {
+                                if ns.children.contains_key(&field.name) {
+                                    // This is accessing a child namespace, return a special marker
+                                    // that will be handled by the next level of field access
+                                    return ResolvedExpr {
+                                        kind: ResolvedExprKind::NamespacePath(vec![ident.name.clone(), field.name.clone()]),
+                                        span: expr.span,
+                                    };
+                                }
+                            }
+                            self.error(
+                                format!("cannot find '{}' in namespace '{}'", field.name, ident.name),
+                                field.span,
+                            );
+                            return ResolvedExpr {
+                                kind: ResolvedExprKind::Error,
+                                span: expr.span,
+                            };
+                        }
+                    }
+                }
+                
+                // Regular field access
                 ResolvedExprKind::Field {
                     expr: Box::new(self.resolve_expr(base)),
                     field: field.name.clone(),
@@ -917,7 +1628,7 @@ impl Resolver {
                 
                 // Create a new scope for the loop body with the binding
                 self.push_scope();
-                let binding_def = self.define(binding.name.clone(), DefKind::Local, binding.span, None);
+                let binding_def = self.define(binding.name.clone(), DefKind::Local, binding.span, None, false);
                 let resolved_body = self.resolve_block(body);
                 self.pop_scope();
                 
@@ -977,7 +1688,7 @@ impl Resolver {
                 
                 // Define parameters in scope
                 let resolved_params: Vec<_> = params.iter().map(|p| {
-                    let def_id = self.define(p.name.name.clone(), DefKind::Parameter, p.span, None);
+                    let def_id = self.define(p.name.name.clone(), DefKind::Parameter, p.span, None, false);
                     let ty = p.ty.as_ref().map(|t| self.resolve_type(t));
                     ResolvedLambdaParam {
                         def_id,
@@ -1066,6 +1777,7 @@ impl Resolver {
                     DefKind::Local,
                     ident.span,
                     None,
+                    false, // locals are not public
                 );
                 self.current_locals.push(def_id);
                 

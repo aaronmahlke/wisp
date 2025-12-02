@@ -2,6 +2,7 @@
 
 use wisp_lexer::Span;
 use std::collections::HashMap;
+use std::path::PathBuf;
 
 /// Unique identifier for definitions (types, functions, variables)
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -10,6 +11,21 @@ pub struct DefId(pub u32);
 impl DefId {
     pub fn new(id: u32) -> Self {
         Self(id)
+    }
+}
+
+/// Unique identifier for modules (source files)
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub struct ModuleId(pub u32);
+
+impl ModuleId {
+    pub fn new(id: u32) -> Self {
+        Self(id)
+    }
+    
+    /// The root module (the main source file being compiled)
+    pub fn root() -> Self {
+        Self(0)
     }
 }
 
@@ -39,6 +55,64 @@ pub struct DefInfo {
     pub span: Span,
     /// Parent definition (e.g., struct for a field, impl for a method)
     pub parent: Option<DefId>,
+    /// Module where this definition is located
+    pub module_id: ModuleId,
+    /// Whether this definition is public (accessible from other modules)
+    pub is_pub: bool,
+}
+
+/// Information about a module (source file)
+#[derive(Debug, Clone)]
+pub struct ModuleInfo {
+    pub id: ModuleId,
+    pub path: PathBuf,
+    /// All definitions in this module
+    pub defs: Vec<DefId>,
+}
+
+/// Registry of all modules in the program
+#[derive(Debug, Default)]
+pub struct ModuleRegistry {
+    pub modules: HashMap<ModuleId, ModuleInfo>,
+    pub path_to_id: HashMap<PathBuf, ModuleId>,
+    next_id: u32,
+}
+
+impl ModuleRegistry {
+    pub fn new() -> Self {
+        Self::default()
+    }
+    
+    /// Register a new module and return its ID
+    pub fn register(&mut self, path: PathBuf) -> ModuleId {
+        if let Some(&id) = self.path_to_id.get(&path) {
+            return id;
+        }
+        
+        let id = ModuleId::new(self.next_id);
+        self.next_id += 1;
+        
+        self.modules.insert(id, ModuleInfo {
+            id,
+            path: path.clone(),
+            defs: Vec::new(),
+        });
+        self.path_to_id.insert(path, id);
+        
+        id
+    }
+    
+    /// Add a definition to a module
+    pub fn add_def(&mut self, module_id: ModuleId, def_id: DefId) {
+        if let Some(module) = self.modules.get_mut(&module_id) {
+            module.defs.push(def_id);
+        }
+    }
+    
+    /// Get module ID by path
+    pub fn get_by_path(&self, path: &PathBuf) -> Option<ModuleId> {
+        self.path_to_id.get(path).copied()
+    }
 }
 
 /// The resolved program with all definitions
@@ -48,6 +122,8 @@ pub struct ResolvedProgram {
     pub defs: HashMap<DefId, DefInfo>,
     /// Map from name to definition at global scope
     pub globals: HashMap<String, DefId>,
+    /// Module registry
+    pub modules: ModuleRegistry,
     /// Struct definitions
     pub structs: Vec<ResolvedStruct>,
     /// Enum definitions  
@@ -102,6 +178,7 @@ impl ResolvedProgram {
         Self {
             defs: HashMap::new(),
             globals: HashMap::new(),
+            modules: ModuleRegistry::new(),
             structs: Vec::new(),
             enums: Vec::new(),
             traits: Vec::new(),
@@ -466,6 +543,10 @@ pub enum ResolvedExprKind {
     StringInterp {
         parts: Vec<ResolvedStringInterpPart>,
     },
+    
+    /// Namespace path (intermediate state for nested namespace resolution)
+    /// e.g., `std.io` before accessing `.print`
+    NamespacePath(Vec<String>),
     
     /// Error (for recovery)
     Error,

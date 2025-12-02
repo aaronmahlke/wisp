@@ -1,6 +1,6 @@
 use wisp_ast::*;
 use wisp_lexer::{Lexer, Span, SpannedToken, Token};
-use std::collections::HashSet;
+use std::collections::{HashSet, HashMap};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -42,33 +42,158 @@ pub fn parse_with_imports(source: &str, file_path: &Path) -> Result<SourceFile, 
     parse_with_imports_recursive(source, base_dir, &mut visited)
 }
 
+/// Configuration for import resolution
+pub struct ImportConfig {
+    /// Path to the standard library
+    pub std_path: PathBuf,
+    /// Path to the project root (from wisp.toml or source dir)
+    pub project_root: PathBuf,
+}
+
+impl ImportConfig {
+    /// Create a new ImportConfig by detecting project root and std path
+    pub fn detect(source_file: &Path) -> Self {
+        let source_dir = source_file.parent().unwrap_or(Path::new("."));
+        
+        // Find project root by looking for wisp.toml
+        let project_root = find_project_root(source_dir)
+            .unwrap_or_else(|| source_dir.to_path_buf());
+        
+        // Find std path from WISP_STD_PATH env var or relative to project
+        let std_path = std::env::var("WISP_STD_PATH")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| project_root.join("std"));
+        
+        Self { std_path, project_root }
+    }
+}
+
+/// Find project root by walking up looking for wisp.toml
+fn find_project_root(start: &Path) -> Option<PathBuf> {
+    let mut current = start.to_path_buf();
+    loop {
+        if current.join("wisp.toml").exists() {
+            return Some(current);
+        }
+        if !current.pop() {
+            return None;
+        }
+    }
+}
+
 fn parse_with_imports_recursive(
     source: &str,
     base_dir: &Path,
     visited: &mut HashSet<PathBuf>,
 ) -> Result<SourceFile, String> {
-    let ast = Parser::parse(source).map_err(|e| format!("Parse error: {}", e))?;
+    // For backwards compatibility, flatten the imports into a single SourceFile
+    let with_imports = parse_with_imports_structured(source, base_dir, visited)?;
     
     let mut all_items = Vec::new();
+    
+    // Add imported module items first (they need to be defined before use)
+    for module in with_imports.imported_modules {
+        // Add the import declaration
+        all_items.push(Item::Import(module.import));
+        // Add all items from the module
+        all_items.extend(module.items);
+    }
+    
+    // Add local items
+    all_items.extend(with_imports.local_items);
+    
+    Ok(SourceFile { items: all_items })
+}
+
+/// A cache of parsed modules keyed by canonical path
+pub type ModuleCache = HashMap<PathBuf, Vec<Item>>;
+
+/// Parse a file with imports, preserving namespace structure
+/// Uses a module cache to ensure each module is only parsed once
+/// but its items can be referenced by multiple namespaces
+pub fn parse_with_imports_structured(
+    source: &str,
+    base_dir: &Path,
+    visited: &mut HashSet<PathBuf>,
+) -> Result<SourceFileWithImports, String> {
+    let mut module_cache: ModuleCache = HashMap::new();
+    parse_with_imports_structured_cached(source, base_dir, visited, &mut module_cache)
+}
+
+/// Cache entry includes both items and the module's own imports
+type ModuleCacheEntry = (Vec<Item>, Vec<ImportDecl>);
+type ModuleCacheWithImports = HashMap<PathBuf, ModuleCacheEntry>;
+
+fn parse_with_imports_structured_cached(
+    source: &str,
+    base_dir: &Path,
+    visited: &mut HashSet<PathBuf>,
+    module_cache: &mut ModuleCache,
+) -> Result<SourceFileWithImports, String> {
+    // Use a separate cache that includes import info
+    let mut imports_cache: ModuleCacheWithImports = HashMap::new();
+    parse_with_imports_impl(source, base_dir, visited, module_cache, &mut imports_cache)
+}
+
+fn parse_with_imports_impl(
+    source: &str,
+    base_dir: &Path,
+    visited: &mut HashSet<PathBuf>,
+    module_cache: &mut ModuleCache,
+    imports_cache: &mut ModuleCacheWithImports,
+) -> Result<SourceFileWithImports, String> {
+    let ast = Parser::parse(source).map_err(|e| format!("Parse error: {}", e))?;
+    
+    // Detect import config from base_dir
+    let config = ImportConfig::detect(base_dir);
+    
+    let mut local_items = Vec::new();
+    let mut local_imports = Vec::new();  // Track this module's imports
+    let mut imported_modules = Vec::new();
     
     for item in ast.items {
         match item {
             Item::Import(import) => {
-                // Resolve import path relative to base_dir
-                let import_path = base_dir.join(&import.path);
-                let import_path = if import_path.extension().is_none() {
-                    import_path.with_extension("ws")
-                } else {
-                    import_path
-                };
+                // Track this import for scope resolution
+                local_imports.push(import.clone());
+                
+                // Resolve import path based on type
+                let import_path = resolve_import_path(&import.path, base_dir, &config)?;
                 
                 let canonical = match import_path.canonicalize() {
                     Ok(c) => c,
-                    Err(e) => return Err(format!("Cannot find import '{}': {}", import.path, e)),
+                    Err(e) => return Err(format!("Cannot find import '{}': {}", format_import_path(&import.path), e)),
                 };
                 
-                // Skip if already imported
+                // Check if we've already parsed this module
+                if let Some((cached_items, cached_imports)) = imports_cache.get(&canonical) {
+                    // Use cached items for this namespace
+                    imported_modules.push(ImportedModule {
+                        import,
+                        items: cached_items.clone(),
+                        module_imports: cached_imports.clone(),
+                    });
+                    continue;
+                }
+                
+                // Also check the simple cache (for backwards compatibility)
+                if let Some(cached_items) = module_cache.get(&canonical) {
+                    imported_modules.push(ImportedModule {
+                        import,
+                        items: cached_items.clone(),
+                        module_imports: vec![],
+                    });
+                    continue;
+                }
+                
+                // Check if we're currently parsing this module (cycle detection)
                 if visited.contains(&canonical) {
+                    // Cycle detected - add empty module to break the cycle
+                    imported_modules.push(ImportedModule {
+                        import,
+                        items: vec![],
+                        module_imports: vec![],
+                    });
                     continue;
                 }
                 visited.insert(canonical.clone());
@@ -76,20 +201,117 @@ fn parse_with_imports_recursive(
                 // Read and parse the imported file
                 let import_source = match fs::read_to_string(&import_path) {
                     Ok(s) => s,
-                    Err(e) => return Err(format!("Cannot read import '{}': {}", import.path, e)),
+                    Err(e) => return Err(format!("Cannot read import '{}': {}", format_import_path(&import.path), e)),
                 };
                 
                 let import_dir = import_path.parent().unwrap_or(Path::new("."));
-                let imported_ast = parse_with_imports_recursive(&import_source, import_dir, visited)?;
+                let imported_ast = parse_with_imports_impl(&import_source, import_dir, visited, module_cache, imports_cache)?;
                 
-                // Add all items from the imported file
-                all_items.extend(imported_ast.items);
+                // Get the module's local items and its own imports
+                let module_items = imported_ast.local_items.clone();
+                
+                // Collect the imports that were declared in this module
+                // These are stored in the imported_modules that came from parsing this file
+                // Actually, we need to extract them from the original AST...
+                // The local_imports from the recursive call would be empty since we're processing
+                // the result, not the intermediate state.
+                
+                // Re-parse just to get imports (inefficient but correct for now)
+                let module_own_imports: Vec<ImportDecl> = {
+                    let temp_ast = Parser::parse(&import_source).map_err(|e| format!("Parse error: {}", e))?;
+                    temp_ast.items.iter().filter_map(|item| {
+                        if let Item::Import(imp) = item {
+                            Some(imp.clone())
+                        } else {
+                            None
+                        }
+                    }).collect()
+                };
+                
+                // Cache this module's items and imports
+                module_cache.insert(canonical.clone(), module_items.clone());
+                imports_cache.insert(canonical.clone(), (module_items.clone(), module_own_imports.clone()));
+                
+                // First, add the transitive imports as separate modules
+                // (they'll create their own namespaces)
+                for sub_module in imported_ast.imported_modules {
+                    imported_modules.push(sub_module);
+                }
+                
+                // Then add this module with its local items and its own imports
+                imported_modules.push(ImportedModule {
+                    import,
+                    items: module_items,
+                    module_imports: module_own_imports,
+                });
             }
-            other => all_items.push(other),
+            other => local_items.push(other),
         }
     }
     
-    Ok(SourceFile { items: all_items })
+    Ok(SourceFileWithImports {
+        local_items,
+        imported_modules,
+    })
+}
+
+/// Resolve an import path to a file system path
+fn resolve_import_path(path: &ImportPath, _base_dir: &Path, config: &ImportConfig) -> Result<PathBuf, String> {
+    let resolved = match path {
+        ImportPath::Std(segments) => {
+            let mut p = config.std_path.clone();
+            if segments.is_empty() {
+                // `import std` -> look for std/mod.ws
+                p.join("mod.ws")
+            } else {
+                for seg in segments {
+                    p = p.join(seg);
+                }
+                p.with_extension("ws")
+            }
+        }
+        ImportPath::Project(segments) => {
+            let mut p = config.project_root.clone();
+            if segments.is_empty() {
+                // `import @/` -> look for mod.ws in project root
+                p.join("mod.ws")
+            } else {
+                for seg in segments {
+                    p = p.join(seg);
+                }
+                p.with_extension("ws")
+            }
+        }
+        ImportPath::Package(name, segments) => {
+            // Future: resolve from packages directory
+            let mut p = config.project_root.join("packages").join(name);
+            if segments.is_empty() {
+                p.join("mod.ws")
+            } else {
+                for seg in segments {
+                    p = p.join(seg);
+                }
+                p.with_extension("ws")
+            }
+        }
+    };
+    
+    Ok(resolved)
+}
+
+/// Format an import path for error messages
+fn format_import_path(path: &ImportPath) -> String {
+    match path {
+        ImportPath::Std(segs) => format!("std/{}", segs.join("/")),
+        ImportPath::Project(segs) => format!("@/{}", segs.join("/")),
+        ImportPath::Package(name, segs) => {
+            if segs.is_empty() {
+                format!("pkg/{}", name)
+            } else {
+                format!("pkg/{}/{}", name, segs.join("/"))
+            }
+        }
+    }
 }
 
 impl<'src> Parser<'src> {
@@ -182,14 +404,30 @@ impl<'src> Parser<'src> {
     }
 
     fn parse_item(&mut self) -> ParseResult<Item> {
+        // Check for optional pub keyword
+        let is_pub = if self.check(&Token::Pub) {
+            self.advance();
+            true
+        } else {
+            false
+        };
+        
         match self.peek() {
-            Token::Import => self.parse_import().map(Item::Import),
-            Token::Fn => self.parse_fn_def().map(Item::Function),
-            Token::Extern => self.parse_extern_item(),
-            Token::Struct => self.parse_struct_def().map(Item::Struct),
-            Token::Enum => self.parse_enum_def().map(Item::Enum),
-            Token::Trait => self.parse_trait_def().map(Item::Trait),
-            Token::Impl => self.parse_impl_block().map(Item::Impl),
+            Token::Import => self.parse_import(is_pub).map(Item::Import),
+            Token::Fn => self.parse_fn_def(is_pub).map(Item::Function),
+            Token::Extern => self.parse_extern_item(is_pub),
+            Token::Struct => self.parse_struct_def(is_pub).map(Item::Struct),
+            Token::Enum => self.parse_enum_def(is_pub).map(Item::Enum),
+            Token::Trait => self.parse_trait_def(is_pub).map(Item::Trait),
+            Token::Impl => {
+                if is_pub {
+                    return Err(ParseError {
+                        message: "impl blocks cannot be public (methods inside can be)".to_string(),
+                        span: self.peek_span(),
+                    });
+                }
+                self.parse_impl_block().map(Item::Impl)
+            }
             _ => Err(ParseError {
                 message: format!("expected item (import, fn, extern, struct, enum, trait, impl), found '{}'", self.peek()),
                 span: self.peek_span(),
@@ -197,7 +435,7 @@ impl<'src> Parser<'src> {
         }
     }
     
-    fn parse_extern_item(&mut self) -> ParseResult<Item> {
+    fn parse_extern_item(&mut self, is_pub: bool) -> ParseResult<Item> {
         let start = self.peek_span();
         self.expect(Token::Extern)?;
         
@@ -220,7 +458,7 @@ impl<'src> Parser<'src> {
                 let end_span = return_type.as_ref().map(|t| t.span).unwrap_or(start);
                 let span = Span::new(start.start, end_span.end);
                 
-                Ok(Item::ExternFunction(ExternFnDef { name, params, return_type, span }))
+                Ok(Item::ExternFunction(ExternFnDef { is_pub, name, params, return_type, span }))
             }
             Token::Static => {
                 // extern static NAME: TYPE
@@ -231,7 +469,7 @@ impl<'src> Parser<'src> {
                 
                 let span = Span::new(start.start, ty.span.end);
                 
-                Ok(Item::ExternStatic(ExternStaticDef { name, ty, span }))
+                Ok(Item::ExternStatic(ExternStaticDef { is_pub, name, ty, span }))
             }
             _ => Err(ParseError {
                 message: format!("expected 'fn' or 'static' after 'extern', found '{}'", self.peek()),
@@ -240,29 +478,175 @@ impl<'src> Parser<'src> {
         }
     }
     
-    fn parse_import(&mut self) -> ParseResult<ImportDecl> {
+    fn parse_import(&mut self, is_pub: bool) -> ParseResult<ImportDecl> {
         let start = self.peek_span();
         self.expect(Token::Import)?;
         
-        // Expect a string literal for the path
-        let path = match self.peek().clone() {
-            Token::StringLiteral(s) => {
-                self.advance();
-                s
-            }
-            _ => return Err(ParseError {
-                message: format!("expected string literal after 'import', found '{}'", self.peek()),
-                span: self.peek_span(),
-            }),
+        // Check for destructure-only syntax: import { items } from path
+        if self.check(&Token::LBrace) {
+            return self.parse_destructure_import(start, is_pub);
+        }
+        
+        // Parse path: std/io, @/utils/math, or pkg/name/sub
+        let path = self.parse_import_path()?;
+        
+        // Check for alias: import std/io as stdio
+        let alias = if self.check(&Token::As) {
+            self.advance();
+            Some(self.expect_ident()?)
+        } else {
+            None
+        };
+        
+        // Check for inline destructuring: import std/io { print, File }
+        let items = if self.check(&Token::LBrace) {
+            Some(self.parse_import_items()?)
+        } else {
+            None
         };
         
         let end = self.peek_span();
-        let span = Span::new(start.start, end.end);
-        
-        Ok(ImportDecl { path, span })
+        Ok(ImportDecl {
+            is_pub,
+            path,
+            alias,
+            items,
+            destructure_only: false,
+            span: Span::new(start.start, end.start),
+        })
     }
     
-    fn parse_fn_def(&mut self) -> ParseResult<FnDef> {
+    /// Parse destructure-only import: import { print, File as F } from std/io
+    fn parse_destructure_import(&mut self, start: Span, is_pub: bool) -> ParseResult<ImportDecl> {
+        let items = self.parse_import_items()?;
+        
+        // Expect "from"
+        if let Token::Ident(ref s) = self.peek().clone() {
+            if s == "from" {
+                self.advance();
+            } else {
+                return Err(ParseError {
+                    message: format!("expected 'from' after import items, found '{}'", s),
+                    span: self.peek_span(),
+                });
+            }
+        } else {
+            return Err(ParseError {
+                message: format!("expected 'from' after import items, found '{}'", self.peek()),
+                span: self.peek_span(),
+            });
+        }
+        
+        let path = self.parse_import_path()?;
+        let end = self.peek_span();
+        
+        Ok(ImportDecl {
+            is_pub,
+            path,
+            alias: None,
+            items: Some(items),
+            destructure_only: true,
+            span: Span::new(start.start, end.start),
+        })
+    }
+    
+    /// Parse import path: std/io, @/utils/math, pkg/name/sub
+    fn parse_import_path(&mut self) -> ParseResult<ImportPath> {
+        // Check for @ prefix (project-relative)
+        if self.check(&Token::At) {
+            self.advance();
+            self.expect(Token::Slash)?;
+            let segments = self.parse_path_segments()?;
+            return Ok(ImportPath::Project(segments));
+        }
+        
+        // Otherwise, expect an identifier (std, pkg, or custom)
+        let first = self.expect_ident()?;
+        
+        match first.name.as_str() {
+            "std" => {
+                // Check if there's a slash - if not, this is `import std` (the whole std lib)
+                if self.check(&Token::Slash) {
+                    self.advance();
+                    let segments = self.parse_path_segments()?;
+                    Ok(ImportPath::Std(segments))
+                } else {
+                    // `import std` with no subpath - will resolve to std/mod.ws
+                    Ok(ImportPath::Std(vec![]))
+                }
+            }
+            "pkg" => {
+                self.expect(Token::Slash)?;
+                let pkg_name = self.expect_ident()?.name;
+                if self.check(&Token::Slash) {
+                    self.advance();
+                    let segments = self.parse_path_segments()?;
+                    Ok(ImportPath::Package(pkg_name, segments))
+                } else {
+                    Ok(ImportPath::Package(pkg_name, vec![]))
+                }
+            }
+            _ => {
+                // Treat as std path for backwards compatibility: io -> std/io
+                let mut segments = vec![first.name];
+                while self.check(&Token::Slash) {
+                    self.advance();
+                    let seg = self.expect_ident()?;
+                    segments.push(seg.name);
+                }
+                Ok(ImportPath::Std(segments))
+            }
+        }
+    }
+    
+    /// Parse path segments: io, utils/math
+    fn parse_path_segments(&mut self) -> ParseResult<Vec<String>> {
+        let mut segments = vec![];
+        let first = self.expect_ident()?;
+        segments.push(first.name);
+        
+        while self.check(&Token::Slash) {
+            self.advance();
+            let seg = self.expect_ident()?;
+            segments.push(seg.name);
+        }
+        
+        Ok(segments)
+    }
+    
+    /// Parse import items: { print, File as F }
+    fn parse_import_items(&mut self) -> ParseResult<Vec<ImportItem>> {
+        self.expect(Token::LBrace)?;
+        let mut items = vec![];
+        
+        while !self.check(&Token::RBrace) && !self.check(&Token::Eof) {
+            let start = self.peek_span();
+            let name = self.expect_ident()?;
+            
+            let alias = if self.check(&Token::As) {
+                self.advance();
+                Some(self.expect_ident()?)
+            } else {
+                None
+            };
+            
+            let end = self.peek_span();
+            items.push(ImportItem {
+                name,
+                alias,
+                span: Span::new(start.start, end.start),
+            });
+            
+            if !self.check(&Token::RBrace) {
+                self.expect(Token::Comma)?;
+            }
+        }
+        
+        self.expect(Token::RBrace)?;
+        Ok(items)
+    }
+    
+    fn parse_fn_def(&mut self, is_pub: bool) -> ParseResult<FnDef> {
         let start = self.peek_span();
         self.expect(Token::Fn)?;
         
@@ -298,7 +682,7 @@ impl<'src> Parser<'src> {
             .unwrap_or(start);
         let span = Span::new(start.start, end_span.end);
         
-        Ok(FnDef { name, type_params, params, return_type, body, span })
+        Ok(FnDef { is_pub, name, type_params, params, return_type, body, span })
     }
     
     /// Parse generic parameters: <T, U: Clone + Debug, V = i32>
@@ -422,7 +806,7 @@ impl<'src> Parser<'src> {
         Ok(Param { name, is_mut, ty, span })
     }
 
-    fn parse_struct_def(&mut self) -> ParseResult<StructDef> {
+    fn parse_struct_def(&mut self, is_pub: bool) -> ParseResult<StructDef> {
         let start = self.peek_span();
         self.expect(Token::Struct)?;
         
@@ -441,7 +825,7 @@ impl<'src> Parser<'src> {
         
         let span = Span::new(start.start, end.span.end);
         
-        Ok(StructDef { name, type_params, fields, span })
+        Ok(StructDef { is_pub, name, type_params, fields, span })
     }
 
     fn parse_struct_fields(&mut self) -> ParseResult<Vec<StructField>> {
@@ -465,7 +849,7 @@ impl<'src> Parser<'src> {
         Ok(fields)
     }
 
-    fn parse_enum_def(&mut self) -> ParseResult<EnumDef> {
+    fn parse_enum_def(&mut self, is_pub: bool) -> ParseResult<EnumDef> {
         let start = self.peek_span();
         self.expect(Token::Enum)?;
         
@@ -484,7 +868,7 @@ impl<'src> Parser<'src> {
         
         let span = Span::new(start.start, end.span.end);
         
-        Ok(EnumDef { name, type_params, variants, span })
+        Ok(EnumDef { is_pub, name, type_params, variants, span })
     }
 
     fn parse_enum_variants(&mut self) -> ParseResult<Vec<EnumVariant>> {
@@ -536,7 +920,7 @@ impl<'src> Parser<'src> {
         Ok(fields)
     }
 
-    fn parse_trait_def(&mut self) -> ParseResult<TraitDef> {
+    fn parse_trait_def(&mut self, is_pub: bool) -> ParseResult<TraitDef> {
         let start = self.peek_span();
         self.expect(Token::Trait)?;
         
@@ -553,13 +937,20 @@ impl<'src> Parser<'src> {
         
         let mut methods = Vec::new();
         while !self.check(&Token::RBrace) && !self.is_at_end() {
-            methods.push(self.parse_fn_def()?);
+            // Trait methods can also be pub (for documentation, defaults to trait visibility)
+            let method_is_pub = if self.check(&Token::Pub) {
+                self.advance();
+                true
+            } else {
+                false
+            };
+            methods.push(self.parse_fn_def(method_is_pub)?);
         }
         
         let end = self.expect(Token::RBrace)?;
         let span = Span::new(start.start, end.span.end);
         
-        Ok(TraitDef { name, type_params, methods, span })
+        Ok(TraitDef { is_pub, name, type_params, methods, span })
     }
 
     fn parse_impl_block(&mut self) -> ParseResult<ImplBlock> {
@@ -589,7 +980,14 @@ impl<'src> Parser<'src> {
         
         let mut methods = Vec::new();
         while !self.check(&Token::RBrace) && !self.is_at_end() {
-            methods.push(self.parse_fn_def()?);
+            // Methods in impl blocks can be pub
+            let method_is_pub = if self.check(&Token::Pub) {
+                self.advance();
+                true
+            } else {
+                false
+            };
+            methods.push(self.parse_fn_def(method_is_pub)?);
         }
         
         let end = self.expect(Token::RBrace)?;

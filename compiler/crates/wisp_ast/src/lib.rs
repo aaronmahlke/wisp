@@ -9,6 +9,26 @@ pub struct SourceFile {
     pub items: Vec<Item>,
 }
 
+/// A module with its namespace information
+#[derive(Debug, Clone)]
+pub struct ImportedModule {
+    /// The import declaration that brought this module in
+    pub import: ImportDecl,
+    /// Items defined in this module (not including imports)
+    pub items: Vec<Item>,
+    /// Imports declared within this module (for scope resolution)
+    pub module_imports: Vec<ImportDecl>,
+}
+
+/// A source file with import information preserved
+#[derive(Debug, Clone)]
+pub struct SourceFileWithImports {
+    /// Items defined in this file
+    pub local_items: Vec<Item>,
+    /// Imported modules with their namespaces
+    pub imported_modules: Vec<ImportedModule>,
+}
+
 /// Top-level items
 #[derive(Debug, Clone)]
 pub enum Item {
@@ -22,16 +42,69 @@ pub enum Item {
     Impl(ImplBlock),
 }
 
+/// Import path type
+#[derive(Debug, Clone, PartialEq)]
+pub enum ImportPath {
+    /// Standard library: std/io
+    Std(Vec<String>),
+    /// Project-relative: @/utils/math
+    Project(Vec<String>),
+    /// External package: pkg/name/sub (future)
+    Package(String, Vec<String>),
+}
+
+impl ImportPath {
+    /// Get the last segment of the path (for default namespace name)
+    pub fn last_segment(&self) -> Option<&str> {
+        match self {
+            ImportPath::Std(segs) => {
+                if segs.is_empty() {
+                    Some("std")  // `import std` -> namespace is "std"
+                } else {
+                    segs.last().map(|s| s.as_str())
+                }
+            }
+            ImportPath::Project(segs) => segs.last().map(|s| s.as_str()),
+            ImportPath::Package(name, segs) => {
+                if segs.is_empty() {
+                    Some(name.as_str())  // `import pkg/foo` -> namespace is "foo"
+                } else {
+                    segs.last().map(|s| s.as_str())
+                }
+            }
+        }
+    }
+}
+
+/// Import item (for destructuring imports)
+#[derive(Debug, Clone)]
+pub struct ImportItem {
+    pub name: Ident,
+    pub alias: Option<Ident>,
+    pub span: Span,
+}
+
 /// Import declaration
 #[derive(Debug, Clone)]
 pub struct ImportDecl {
-    pub path: String,
+    /// Whether this is a `pub import` (for re-exporting in mod.ws)
+    pub is_pub: bool,
+    /// The import path (std/io, @/utils, etc.)
+    pub path: ImportPath,
+    /// Namespace alias: `import std/io as stdio`
+    pub alias: Option<Ident>,
+    /// Destructured items: `import { print, File as F } from std/io`
+    pub items: Option<Vec<ImportItem>>,
+    /// If true, only destructured items are imported (no namespace)
+    /// `import { print } from std/io` vs `import std/io { print }`
+    pub destructure_only: bool,
     pub span: Span,
 }
 
 /// External function declaration (C FFI)
 #[derive(Debug, Clone)]
 pub struct ExternFnDef {
+    pub is_pub: bool,
     pub name: Ident,
     pub params: Vec<Param>,
     pub return_type: Option<TypeExpr>,
@@ -41,6 +114,7 @@ pub struct ExternFnDef {
 /// External static variable declaration (C FFI)
 #[derive(Debug, Clone)]
 pub struct ExternStaticDef {
+    pub is_pub: bool,
     pub name: Ident,
     pub ty: TypeExpr,
     pub span: Span,
@@ -58,6 +132,7 @@ pub struct GenericParam {
 /// Function definition
 #[derive(Debug, Clone)]
 pub struct FnDef {
+    pub is_pub: bool,
     pub name: Ident,
     pub type_params: Vec<GenericParam>,  // Generic type parameters
     pub params: Vec<Param>,
@@ -78,6 +153,7 @@ pub struct Param {
 /// Struct definition
 #[derive(Debug, Clone)]
 pub struct StructDef {
+    pub is_pub: bool,
     pub name: Ident,
     pub type_params: Vec<GenericParam>,  // Generic type parameters
     pub fields: Vec<StructField>,
@@ -95,6 +171,7 @@ pub struct StructField {
 /// Enum definition
 #[derive(Debug, Clone)]
 pub struct EnumDef {
+    pub is_pub: bool,
     pub name: Ident,
     pub type_params: Vec<GenericParam>,  // Generic type parameters
     pub variants: Vec<EnumVariant>,
@@ -112,6 +189,7 @@ pub struct EnumVariant {
 /// Trait definition
 #[derive(Debug, Clone)]
 pub struct TraitDef {
+    pub is_pub: bool,
     pub name: Ident,
     pub type_params: Vec<GenericParam>,  // Generic type parameters
     pub methods: Vec<FnDef>,
@@ -436,7 +514,28 @@ impl Item {
         match self {
             Item::Import(i) => {
                 let ind = "  ".repeat(indent);
-                format!("{}Import \"{}\"\n", ind, i.path)
+                let path_str = match &i.path {
+                    ImportPath::Std(segs) => format!("std/{}", segs.join("/")),
+                    ImportPath::Project(segs) => format!("@/{}", segs.join("/")),
+                    ImportPath::Package(name, segs) => format!("pkg/{}/{}", name, segs.join("/")),
+                };
+                let alias_str = i.alias.as_ref()
+                    .map(|a| format!(" as {}", a.name))
+                    .unwrap_or_default();
+                let items_str = i.items.as_ref()
+                    .map(|items| {
+                        let names: Vec<_> = items.iter().map(|item| {
+                            if let Some(alias) = &item.alias {
+                                format!("{} as {}", item.name.name, alias.name)
+                            } else {
+                                item.name.name.clone()
+                            }
+                        }).collect();
+                        format!(" {{ {} }}", names.join(", "))
+                    })
+                    .unwrap_or_default();
+                let from_str = if i.destructure_only { " from " } else { "" };
+                format!("{}Import{}{}{}{}\n", ind, from_str, items_str, path_str, alias_str)
             }
             Item::Function(f) => f.pretty_print(indent),
             Item::ExternFunction(f) => f.pretty_print(indent),
@@ -452,13 +551,15 @@ impl Item {
 impl ExternStaticDef {
     pub fn pretty_print(&self, indent: usize) -> String {
         let ind = "  ".repeat(indent);
-        format!("{}ExternStatic '{}': {}\n", ind, self.name.name, self.ty.pretty_print())
+        let pub_str = if self.is_pub { "pub " } else { "" };
+        format!("{}{}ExternStatic '{}': {}\n", ind, pub_str, self.name.name, self.ty.pretty_print())
     }
 }
 
 impl ExternFnDef {
     pub fn pretty_print(&self, indent: usize) -> String {
         let ind = "  ".repeat(indent);
+        let pub_str = if self.is_pub { "pub " } else { "" };
         let params_str = self.params.iter()
             .map(|p| format!("{}: {}", p.name.name, p.ty.pretty_print()))
             .collect::<Vec<_>>()
@@ -466,13 +567,14 @@ impl ExternFnDef {
         let ret_str = self.return_type.as_ref()
             .map(|t| format!(" -> {}", t.pretty_print()))
             .unwrap_or_default();
-        format!("{}ExternFn '{}'({}){}\n", ind, self.name.name, params_str, ret_str)
+        format!("{}{}ExternFn '{}'({}){}\n", ind, pub_str, self.name.name, params_str, ret_str)
     }
 }
 
 impl FnDef {
     pub fn pretty_print(&self, indent: usize) -> String {
         let ind = "  ".repeat(indent);
+        let pub_str = if self.is_pub { "pub " } else { "" };
         
         // Format generic parameters
         let generics = if self.type_params.is_empty() {
@@ -491,7 +593,7 @@ impl FnDef {
             format!("<{}>", params.join(", "))
         };
         
-        let mut out = format!("{}FnDef '{}{}'\n", ind, self.name.name, generics);
+        let mut out = format!("{}{}FnDef '{}{}'\n", ind, pub_str, self.name.name, generics);
         
         if !self.params.is_empty() {
             out.push_str(&format!("{}  params:\n", ind));
@@ -518,6 +620,7 @@ impl FnDef {
 impl StructDef {
     pub fn pretty_print(&self, indent: usize) -> String {
         let ind = "  ".repeat(indent);
+        let pub_str = if self.is_pub { "pub " } else { "" };
         
         // Format generic parameters
         let generics = if self.type_params.is_empty() {
@@ -529,7 +632,7 @@ impl StructDef {
             format!("<{}>", params.join(", "))
         };
         
-        let mut out = format!("{}StructDef '{}{}'\n", ind, self.name.name, generics);
+        let mut out = format!("{}{}StructDef '{}{}'\n", ind, pub_str, self.name.name, generics);
         for field in &self.fields {
             out.push_str(&format!("{}  {}: {}\n", ind, field.name.name, field.ty.pretty_print()));
         }
@@ -540,7 +643,8 @@ impl StructDef {
 impl EnumDef {
     pub fn pretty_print(&self, indent: usize) -> String {
         let ind = "  ".repeat(indent);
-        let mut out = format!("{}EnumDef '{}'\n", ind, self.name.name);
+        let pub_str = if self.is_pub { "pub " } else { "" };
+        let mut out = format!("{}{}EnumDef '{}'\n", ind, pub_str, self.name.name);
         for variant in &self.variants {
             if variant.fields.is_empty() {
                 out.push_str(&format!("{}  {}\n", ind, variant.name.name));
@@ -559,7 +663,8 @@ impl EnumDef {
 impl TraitDef {
     pub fn pretty_print(&self, indent: usize) -> String {
         let ind = "  ".repeat(indent);
-        let mut out = format!("{}TraitDef '{}'\n", ind, self.name.name);
+        let pub_str = if self.is_pub { "pub " } else { "" };
+        let mut out = format!("{}{}TraitDef '{}'\n", ind, pub_str, self.name.name);
         for method in &self.methods {
             out.push_str(&method.pretty_print(indent + 1));
         }

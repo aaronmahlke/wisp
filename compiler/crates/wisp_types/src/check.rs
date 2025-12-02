@@ -1604,6 +1604,16 @@ impl TypeChecker {
                 }, target)
             }
             
+            ResolvedExprKind::NamespacePath(path) => {
+                // This is an intermediate state that should be resolved during field access
+                // If we get here, it means we have something like `std.io` without a final member access
+                self.error(
+                    format!("namespace path '{}' cannot be used as a value", path.join(".")),
+                    expr.span
+                );
+                (TypedExprKind::Error, Type::Error)
+            }
+            
             ResolvedExprKind::Error => (TypedExprKind::Error, Type::Error),
             
             ResolvedExprKind::StringInterp { parts } => {
