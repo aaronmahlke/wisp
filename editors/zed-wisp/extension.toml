@@ -10,7 +10,7 @@ languages = ["languages/wisp"]
 [grammars.wisp]
 repository = "https://github.com/aaronmahlke/wisp"
 path = "tree-sitter-wisp"
-rev = "e8b8de73a5d3c04c3c807d11a8de82b281d61bdd"
+rev = "f03593d3595fe08e7101d4e0a6688e77a632701a"
 
 [language_servers.wisp-lsp]
 language = "Wisp"
