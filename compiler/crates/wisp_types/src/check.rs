@@ -1,0 +1,1411 @@
+//! Type checking pass
+
+use wisp_hir::*;
+use wisp_lexer::Span;
+use crate::types::*;
+use std::collections::{HashMap, HashSet};
+
+/// Type error
+#[derive(Debug, Clone)]
+pub struct TypeError {
+    pub message: String,
+    pub span: Span,
+}
+
+impl std::fmt::Display for TypeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{} at {}..{}", self.message, self.span.start, self.span.end)
+    }
+}
+
+impl std::error::Error for TypeError {}
+
+/// A specific instantiation of a generic function
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct GenericInstantiation {
+    /// The generic function's DefId
+    pub func_def_id: DefId,
+    /// The concrete types for each type parameter
+    pub type_args: Vec<Type>,
+}
+
+/// Type parameter info including bounds
+#[derive(Debug, Clone)]
+pub struct TypeParamInfo {
+    pub def_id: DefId,
+    pub name: String,
+    pub bounds: Vec<DefId>,  // Trait DefIds
+}
+
+/// Type checker
+pub struct TypeChecker {
+    ctx: TypeContext,
+    errors: Vec<TypeError>,
+    /// Current function's return type
+    current_return_type: Option<Type>,
+    /// Expression types (by span for now, could use NodeId)
+    expr_types: HashMap<(usize, usize), Type>,
+    /// Method lookup: (struct DefId, method name) -> (method DefId, method type)
+    methods: HashMap<(DefId, String), (DefId, Type)>,
+    /// Current Self type (when inside an impl block)
+    current_self_type: Option<Type>,
+    /// Collected generic instantiations
+    generic_instantiations: HashSet<GenericInstantiation>,
+    /// Map from generic function DefId to its type parameters (with bounds)
+    generic_functions: HashMap<DefId, Vec<TypeParamInfo>>,
+    /// Trait methods: trait DefId -> [(method name, method type with Self as placeholder)]
+    trait_methods: HashMap<DefId, Vec<(String, Type)>>,
+    /// Trait implementations: (type DefId, trait DefId) -> impl methods
+    trait_impls: HashMap<(DefId, DefId), Vec<(String, DefId, Type)>>,
+}
+
+impl TypeChecker {
+    pub fn new() -> Self {
+        Self {
+            ctx: TypeContext::new(),
+            errors: Vec::new(),
+            current_return_type: None,
+            expr_types: HashMap::new(),
+            methods: HashMap::new(),
+            current_self_type: None,
+            generic_instantiations: HashSet::new(),
+            generic_functions: HashMap::new(),
+            trait_methods: HashMap::new(),
+            trait_impls: HashMap::new(),
+        }
+    }
+
+    /// Type check a resolved program
+    pub fn check(program: &ResolvedProgram) -> Result<TypedProgram, Vec<TypeError>> {
+        let mut checker = TypeChecker::new();
+        let result = checker.check_program(program);
+        
+        if checker.errors.is_empty() {
+            Ok(result)
+        } else {
+            Err(checker.errors)
+        }
+    }
+
+    fn error(&mut self, message: String, span: Span) {
+        self.errors.push(TypeError { message, span });
+    }
+
+    fn check_program(&mut self, program: &ResolvedProgram) -> TypedProgram {
+        // First pass: register all type names and struct/enum info
+        for s in &program.structs {
+            self.ctx.register_type_name(s.def_id, s.name.clone());
+            self.ctx.register_def_type(s.def_id, Type::Struct(s.def_id));
+        }
+        
+        for e in &program.enums {
+            self.ctx.register_type_name(e.def_id, e.name.clone());
+            self.ctx.register_def_type(e.def_id, Type::Enum(e.def_id));
+        }
+
+        // Second pass: register struct fields and enum variants
+        for s in &program.structs {
+            let fields: Vec<_> = s.fields.iter()
+                .map(|f| (f.name.clone(), self.resolve_type(&f.ty)))
+                .collect();
+            self.ctx.register_struct_fields(s.def_id, fields);
+        }
+
+        for e in &program.enums {
+            let variants: Vec<_> = e.variants.iter()
+                .map(|v| {
+                    let field_types: Vec<_> = v.fields.iter()
+                        .map(|f| self.resolve_type(&f.ty))
+                        .collect();
+                    (v.name.clone(), v.def_id, field_types)
+                })
+                .collect();
+            self.ctx.register_enum_variants(e.def_id, variants);
+        }
+
+        // Register trait names and methods
+        for t in &program.traits {
+            self.ctx.register_type_name(t.def_id, t.name.clone());
+            
+            // Collect trait method signatures
+            let mut methods = Vec::new();
+            for m in &t.methods {
+                // Register type params for method
+                for tp in &m.type_params {
+                    self.ctx.register_type_param(tp.def_id, tp.name.clone());
+                }
+                let method_type = self.function_type(m);
+                methods.push((m.name.clone(), method_type));
+            }
+            self.trait_methods.insert(t.def_id, methods);
+        }
+
+        // Third pass: register function types and names
+        for f in &program.functions {
+            // Register type parameters first so resolve_type can find them
+            for tp in &f.type_params {
+                self.ctx.register_type_param(tp.def_id, tp.name.clone());
+            }
+            let fn_type = self.function_type(f);
+            self.ctx.register_def_type(f.def_id, fn_type);
+            self.ctx.register_type_name(f.def_id, f.name.clone());
+            
+            // Track generic functions with their bounds
+            if !f.type_params.is_empty() {
+                let type_params: Vec<_> = f.type_params.iter()
+                    .map(|tp| {
+                        // Extract trait DefIds from bounds
+                        let bounds: Vec<DefId> = tp.bounds.iter()
+                            .filter_map(|b| {
+                                if let ResolvedType::Named { def_id: Some(id), .. } = b {
+                                    Some(*id)
+                                } else {
+                                    None
+                                }
+                            })
+                            .collect();
+                        TypeParamInfo {
+                            def_id: tp.def_id,
+                            name: tp.name.clone(),
+                            bounds,
+                        }
+                    })
+                    .collect();
+                self.generic_functions.insert(f.def_id, type_params);
+            }
+        }
+        
+        for imp in &program.impls {
+            // Get the struct DefId from the target type
+            let target_struct_id = match &imp.target_type {
+                ResolvedType::Named { def_id: Some(id), .. } => Some(*id),
+                _ => None,
+            };
+            
+            let mut impl_methods = Vec::new();
+            
+            for m in &imp.methods {
+                let fn_type = self.function_type(m);
+                self.ctx.register_def_type(m.def_id, fn_type.clone());
+                self.ctx.register_type_name(m.def_id, m.name.clone());
+                
+                // Register in method lookup table
+                if let Some(struct_id) = target_struct_id {
+                    self.methods.insert((struct_id, m.name.clone()), (m.def_id, fn_type.clone()));
+                }
+                
+                impl_methods.push((m.name.clone(), m.def_id, fn_type));
+            }
+            
+            // Register trait implementation
+            if let (Some(trait_def), Some(struct_id)) = (imp.trait_def, target_struct_id) {
+                self.trait_impls.insert((struct_id, trait_def), impl_methods);
+            }
+        }
+        
+        // Register extern function types
+        for f in &program.extern_functions {
+            let fn_type = self.extern_function_type(f);
+            self.ctx.register_def_type(f.def_id, fn_type);
+            self.ctx.register_type_name(f.def_id, f.name.clone());
+        }
+        
+        // Register extern static types
+        for s in &program.extern_statics {
+            let ty = self.resolve_type(&s.ty);
+            self.ctx.register_def_type(s.def_id, ty);
+            self.ctx.register_type_name(s.def_id, s.name.clone());
+        }
+
+        // Fourth pass: type check function bodies
+        let mut typed_functions = Vec::new();
+        for f in &program.functions {
+            typed_functions.push(self.check_function(f));
+        }
+
+        let mut typed_impls = Vec::new();
+        for imp in &program.impls {
+            // Set current_self_type for this impl block
+            let target_type = self.resolve_type(&imp.target_type);
+            self.current_self_type = Some(target_type.clone());
+            
+            let mut methods = Vec::new();
+            for m in &imp.methods {
+                methods.push(self.check_function(m));
+            }
+            
+            self.current_self_type = None;
+            
+            typed_impls.push(TypedImpl {
+                trait_def: imp.trait_def,
+                target_type,
+                methods,
+            });
+        }
+        
+        // Create typed extern functions
+        let mut typed_extern_functions = Vec::new();
+        for f in &program.extern_functions {
+            let params: Vec<_> = f.params.iter()
+                .map(|p| TypedParam {
+                    def_id: p.def_id,
+                    name: p.name.clone(),
+                    is_mut: p.is_mut,
+                    ty: self.resolve_type(&p.ty),
+                })
+                .collect();
+            let return_type = f.return_type.as_ref()
+                .map(|t| self.resolve_type(t))
+                .unwrap_or(Type::Unit);
+            typed_extern_functions.push(TypedExternFunction {
+                def_id: f.def_id,
+                name: f.name.clone(),
+                params,
+                return_type,
+            });
+        }
+
+        // Create typed extern statics
+        let mut typed_extern_statics = Vec::new();
+        for s in &program.extern_statics {
+            let ty = self.resolve_type(&s.ty);
+            typed_extern_statics.push(TypedExternStatic {
+                def_id: s.def_id,
+                name: s.name.clone(),
+                ty,
+            });
+        }
+
+        TypedProgram {
+            ctx: std::mem::take(&mut self.ctx),
+            structs: program.structs.clone(),
+            enums: program.enums.clone(),
+            functions: typed_functions,
+            extern_functions: typed_extern_functions,
+            extern_statics: typed_extern_statics,
+            impls: typed_impls,
+            generic_instantiations: std::mem::take(&mut self.generic_instantiations),
+        }
+    }
+
+    fn function_type(&self, f: &ResolvedFunction) -> Type {
+        let params: Vec<_> = f.params.iter()
+            .map(|p| self.resolve_type(&p.ty))
+            .collect();
+        let ret = f.return_type.as_ref()
+            .map(|t| self.resolve_type(t))
+            .unwrap_or(Type::Unit);
+        Type::Function {
+            params,
+            ret: Box::new(ret),
+        }
+    }
+    
+    fn extern_function_type(&self, f: &ResolvedExternFunction) -> Type {
+        let params: Vec<_> = f.params.iter()
+            .map(|p| self.resolve_type(&p.ty))
+            .collect();
+        let ret = f.return_type.as_ref()
+            .map(|t| self.resolve_type(t))
+            .unwrap_or(Type::Unit);
+        Type::Function {
+            params,
+            ret: Box::new(ret),
+        }
+    }
+
+    fn resolve_type(&self, ty: &ResolvedType) -> Type {
+        match ty {
+            ResolvedType::Named { name, def_id, type_args } => {
+                // Resolve type arguments
+                let _resolved_args: Vec<_> = type_args.iter()
+                    .map(|arg| self.resolve_type(arg))
+                    .collect();
+                
+                if let Some(prim) = parse_type_name(name) {
+                    // For now, primitives don't have type args
+                    prim
+                } else if let Some(id) = def_id {
+                    // Check if it's a type parameter
+                    if self.ctx.is_type_param(*id) {
+                        Type::TypeParam(*id, name.clone())
+                    } else if let Some(existing) = self.ctx.get_def_type(*id) {
+                        // TODO: Apply type arguments to generic types
+                        existing.clone()
+                    } else {
+                        Type::Struct(*id) // Default to struct
+                    }
+                } else {
+                    Type::Error
+                }
+            }
+            ResolvedType::Ref { is_mut, inner } => Type::Ref {
+                is_mut: *is_mut,
+                inner: Box::new(self.resolve_type(inner)),
+            },
+            ResolvedType::Slice { elem } => Type::Slice(Box::new(self.resolve_type(elem))),
+            ResolvedType::Unit => Type::Unit,
+            ResolvedType::SelfType => {
+                self.current_self_type.clone().unwrap_or(Type::Error)
+            }
+            ResolvedType::Error => Type::Error,
+        }
+    }
+
+    fn check_function(&mut self, f: &ResolvedFunction) -> TypedFunction {
+        // Register type parameters
+        for tp in &f.type_params {
+            self.ctx.register_type_param(tp.def_id, tp.name.clone());
+        }
+        
+        // Register parameter types
+        for p in &f.params {
+            let ty = self.resolve_type(&p.ty);
+            self.ctx.register_def_type(p.def_id, ty);
+        }
+
+        // Set return type context
+        let return_type = f.return_type.as_ref()
+            .map(|t| self.resolve_type(t))
+            .unwrap_or(Type::Unit);
+        self.current_return_type = Some(return_type.clone());
+
+        // Check body
+        let body = f.body.as_ref().map(|b| self.check_block(b, Some(&return_type)));
+
+        self.current_return_type = None;
+
+        TypedFunction {
+            def_id: f.def_id,
+            name: f.name.clone(),
+            params: f.params.iter().map(|p| {
+                TypedParam {
+                    def_id: p.def_id,
+                    name: p.name.clone(),
+                    is_mut: p.is_mut,
+                    ty: self.resolve_type(&p.ty),
+                }
+            }).collect(),
+            return_type,
+            body,
+        }
+    }
+
+    fn check_block(&mut self, block: &ResolvedBlock, expected: Option<&Type>) -> TypedBlock {
+        let mut stmts = Vec::new();
+        let mut last_type = Type::Unit;
+
+        for (i, stmt) in block.stmts.iter().enumerate() {
+            let is_last = i == block.stmts.len() - 1;
+            let (typed_stmt, stmt_type) = self.check_stmt(stmt);
+            stmts.push(typed_stmt);
+            
+            if is_last {
+                last_type = stmt_type;
+            }
+        }
+
+        // Check that block type matches expected
+        if let Some(expected) = expected {
+            if let Err(e) = self.ctx.unify(&last_type, expected) {
+                self.error(format!("block type mismatch: {}", e), block.span);
+            }
+        }
+
+        TypedBlock {
+            stmts,
+            ty: self.ctx.apply(&last_type),
+        }
+    }
+
+    fn check_stmt(&mut self, stmt: &ResolvedStmt) -> (TypedStmt, Type) {
+        match stmt {
+            ResolvedStmt::Let { def_id, name, is_mut, ty, init, span } => {
+                let declared_type = ty.as_ref().map(|t| self.resolve_type(t));
+                
+                let init_type = init.as_ref().map(|e| {
+                    let typed = self.check_expr(e);
+                    typed.ty.clone()
+                });
+
+                // Determine the type
+                let var_type = match (&declared_type, &init_type) {
+                    (Some(d), Some(i)) => {
+                        if let Err(e) = self.ctx.unify(d, i) {
+                            self.error(format!("type mismatch in let: {}", e), *span);
+                        }
+                        self.ctx.apply(d)
+                    }
+                    (Some(d), None) => d.clone(),
+                    (None, Some(i)) => i.clone(),
+                    (None, None) => {
+                        self.error("cannot infer type without initializer".to_string(), *span);
+                        Type::Error
+                    }
+                };
+
+                self.ctx.register_def_type(*def_id, var_type.clone());
+
+                let typed_init = init.as_ref().map(|e| self.check_expr(e));
+
+                (TypedStmt::Let {
+                    def_id: *def_id,
+                    name: name.clone(),
+                    is_mut: *is_mut,
+                    ty: var_type,
+                    init: typed_init,
+                    span: *span,
+                }, Type::Unit)
+            }
+            ResolvedStmt::Expr(expr) => {
+                let typed = self.check_expr(expr);
+                let ty = typed.ty.clone();
+                (TypedStmt::Expr(typed), ty)
+            }
+        }
+    }
+
+    fn check_expr(&mut self, expr: &ResolvedExpr) -> TypedExpr {
+        let (kind, ty) = match &expr.kind {
+            ResolvedExprKind::IntLiteral(n) => {
+                (TypedExprKind::IntLiteral(*n), Type::I32) // Default to i32
+            }
+            ResolvedExprKind::FloatLiteral(n) => {
+                (TypedExprKind::FloatLiteral(*n), Type::F64) // Default to f64
+            }
+            ResolvedExprKind::BoolLiteral(b) => {
+                (TypedExprKind::BoolLiteral(*b), Type::Bool)
+            }
+            ResolvedExprKind::StringLiteral(s) => {
+                (TypedExprKind::StringLiteral(s.clone()), Type::String)
+            }
+            
+            ResolvedExprKind::Var { name, def_id } => {
+                let ty = self.ctx.get_def_type(*def_id)
+                    .cloned()
+                    .unwrap_or_else(|| {
+                        self.error(format!("no type for variable '{}'", name), expr.span);
+                        Type::Error
+                    });
+                (TypedExprKind::Var { name: name.clone(), def_id: *def_id }, ty)
+            }
+            
+            ResolvedExprKind::Binary { left, op, right } => {
+                let left_typed = self.check_expr(left);
+                let right_typed = self.check_expr(right);
+                
+                let result_type = self.check_binary_op(*op, &left_typed.ty, &right_typed.ty, expr.span);
+                
+                (TypedExprKind::Binary {
+                    left: Box::new(left_typed),
+                    op: *op,
+                    right: Box::new(right_typed),
+                }, result_type)
+            }
+            
+            ResolvedExprKind::Unary { op, expr: inner } => {
+                let inner_typed = self.check_expr(inner);
+                let result_type = self.check_unary_op(*op, &inner_typed.ty, expr.span);
+                
+                (TypedExprKind::Unary {
+                    op: *op,
+                    expr: Box::new(inner_typed),
+                }, result_type)
+            }
+            
+            ResolvedExprKind::Call { callee, args } => {
+                // Check if this is a method call: expr.method(args)
+                if let ResolvedExprKind::Field { expr: receiver, field: method_name, .. } = &callee.kind {
+                    // First, check the receiver type
+                    let receiver_typed = self.check_expr(receiver);
+                    
+                    // Get the struct id (with auto-deref for references)
+                    let struct_id = match &receiver_typed.ty {
+                        Type::Struct(id) => Some(*id),
+                        Type::Ref { inner, .. } => {
+                            if let Type::Struct(id) = inner.as_ref() {
+                                Some(*id)
+                            } else {
+                                None
+                            }
+                        }
+                        _ => None,
+                    };
+                    
+                    // Check if receiver is a type parameter with trait bounds
+                    let type_param_info = match &receiver_typed.ty {
+                        Type::TypeParam(def_id, _) => {
+                            // Find the bounds for this type param
+                            self.find_type_param_bounds(*def_id)
+                        }
+                        Type::Ref { inner, .. } => {
+                            if let Type::TypeParam(def_id, _) = inner.as_ref() {
+                                self.find_type_param_bounds(*def_id)
+                            } else {
+                                None
+                            }
+                        }
+                        _ => None,
+                    };
+                    
+                    // Look up method on struct
+                    if let Some(struct_id) = struct_id {
+                        if let Some((method_def_id, method_type)) = self.methods.get(&(struct_id, method_name.clone())).cloned() {
+                            // This is a method call!
+                            let args_typed: Vec<_> = args.iter().map(|a| self.check_expr(a)).collect();
+                            
+                            let result_type = if let Type::Function { params, ret } = &method_type {
+                                // Method's first param is &self or &mut self
+                                // Check remaining args against remaining params
+                                let method_params = &params[1..]; // Skip self param
+                                
+                                if args_typed.len() != method_params.len() {
+                                    self.error(
+                                        format!("method '{}' expected {} arguments, got {}", 
+                                            method_name, method_params.len(), args_typed.len()),
+                                        expr.span
+                                    );
+                                } else {
+                                    for (i, (arg, param)) in args_typed.iter().zip(method_params.iter()).enumerate() {
+                                        if let Err(e) = self.ctx.unify(&arg.ty, param) {
+                                            self.error(
+                                                format!("argument {} type mismatch: {}", i + 1, e),
+                                                expr.span
+                                            );
+                                        }
+                                    }
+                                }
+                                (**ret).clone()
+                            } else {
+                                Type::Error
+                            };
+                            
+                            return TypedExpr {
+                                kind: TypedExprKind::MethodCall {
+                                    receiver: Box::new(receiver_typed),
+                                    method: method_name.clone(),
+                                    method_def_id,
+                                    args: args_typed,
+                                },
+                                ty: result_type,
+                                span: expr.span,
+                            };
+                        }
+                    }
+                    
+                    // Look up method via trait bounds on type parameter
+                    if let Some(bounds) = type_param_info {
+                        if let Some(method_type) = self.lookup_trait_method(&bounds, method_name) {
+                            let args_typed: Vec<_> = args.iter().map(|a| self.check_expr(a)).collect();
+                            
+                            let result_type = if let Type::Function { params, ret } = &method_type {
+                                let method_params = &params[1..]; // Skip self param
+                                
+                                if args_typed.len() != method_params.len() {
+                                    self.error(
+                                        format!("method '{}' expected {} arguments, got {}", 
+                                            method_name, method_params.len(), args_typed.len()),
+                                        expr.span
+                                    );
+                                }
+                                // Note: we don't check arg types here since they're generic
+                                (**ret).clone()
+                            } else {
+                                Type::Error
+                            };
+                            
+                            // For trait method calls on type params, we use TraitMethodCall
+                            return TypedExpr {
+                                kind: TypedExprKind::TraitMethodCall {
+                                    receiver: Box::new(receiver_typed),
+                                    method: method_name.clone(),
+                                    trait_bounds: bounds,
+                                    args: args_typed,
+                                },
+                                ty: result_type,
+                                span: expr.span,
+                            };
+                        }
+                    }
+                    
+                    // Not a method - fall through to regular field access + call
+                    // This will error on the field access
+                }
+                
+                // Regular function call
+                let callee_typed = self.check_expr(callee);
+                let args_typed: Vec<_> = args.iter().map(|a| self.check_expr(a)).collect();
+                
+                // Check if this is a call to a generic function
+                let callee_def_id = match &callee_typed.kind {
+                    TypedExprKind::Var { def_id, .. } => Some(*def_id),
+                    _ => None,
+                };
+                
+                let (result_type, type_args) = match &callee_typed.ty {
+                    Type::Function { params, ret } => {
+                        // Check argument count
+                        if args_typed.len() != params.len() {
+                            self.error(
+                                format!("expected {} arguments, got {}", params.len(), args_typed.len()),
+                                expr.span
+                            );
+                            ((**ret).clone(), None)
+                        } else {
+                            // For generic functions, infer type arguments
+                            let inferred_type_args = if let Some(def_id) = callee_def_id {
+                                if let Some(type_params) = self.generic_functions.get(&def_id).cloned() {
+                                    // Create a mapping from TypeParam DefId to concrete type
+                                    let mut type_arg_map: HashMap<DefId, Type> = HashMap::new();
+                                    
+                                    // Infer type arguments by matching params with args
+                                    for (arg, param) in args_typed.iter().zip(params.iter()) {
+                                        self.infer_type_args(param, &arg.ty, &mut type_arg_map);
+                                    }
+                                    
+                                    // Build the type args vector in order
+                                    let type_args: Vec<Type> = type_params.iter()
+                                        .map(|tp_info| {
+                                            type_arg_map.get(&tp_info.def_id).cloned().unwrap_or(Type::Error)
+                                        })
+                                        .collect();
+                                    
+                                    // Check trait bounds are satisfied
+                                    for (tp_info, concrete_type) in type_params.iter().zip(type_args.iter()) {
+                                        for &trait_def_id in &tp_info.bounds {
+                                            if !self.type_implements_trait(concrete_type, trait_def_id) {
+                                                let trait_name = self.ctx.get_type_name(trait_def_id)
+                                                    .unwrap_or_else(|| format!("trait#{}", trait_def_id.0));
+                                                self.error(
+                                                    format!("type {} does not implement trait {}", 
+                                                        concrete_type.display(&self.ctx), trait_name),
+                                                    expr.span
+                                                );
+                                            }
+                                        }
+                                    }
+                                    
+                                    // Record the instantiation
+                                    if !type_args.iter().any(|t| matches!(t, Type::Error)) {
+                                        self.generic_instantiations.insert(GenericInstantiation {
+                                            func_def_id: def_id,
+                                            type_args: type_args.clone(),
+                                        });
+                                    }
+                                    
+                                    Some(type_args)
+                                } else {
+                                    None
+                                }
+                            } else {
+                                None
+                            };
+                            
+                            // Check argument types (unification handles TypeParam)
+                            for (i, (arg, param)) in args_typed.iter().zip(params.iter()).enumerate() {
+                                if let Err(e) = self.ctx.unify(&arg.ty, param) {
+                                    self.error(
+                                        format!("argument {} type mismatch: {}", i + 1, e),
+                                        expr.span
+                                    );
+                                }
+                            }
+                            
+                            // Substitute type parameters in return type
+                            let final_ret = if let Some(ref type_args) = inferred_type_args {
+                                if let Some(def_id) = callee_def_id {
+                                    if let Some(type_params) = self.generic_functions.get(&def_id) {
+                                        // Extract just (DefId, String) pairs for substitution
+                                        let tp_pairs: Vec<_> = type_params.iter()
+                                            .map(|tp| (tp.def_id, tp.name.clone()))
+                                            .collect();
+                                        self.substitute_type_params(ret, &tp_pairs, type_args)
+                                    } else {
+                                        (**ret).clone()
+                                    }
+                                } else {
+                                    (**ret).clone()
+                                }
+                            } else {
+                                (**ret).clone()
+                            };
+                            
+                            (final_ret, inferred_type_args)
+                        }
+                    }
+                    Type::Error => (Type::Error, None),
+                    _ => {
+                        self.error(format!("cannot call non-function type"), expr.span);
+                        (Type::Error, None)
+                    }
+                };
+                
+                // Create the call expression, including type args if this is a generic call
+                let call_kind = if let Some(type_args) = type_args {
+                    if let Some(def_id) = callee_def_id {
+                        TypedExprKind::GenericCall {
+                            func_def_id: def_id,
+                            type_args,
+                            args: args_typed,
+                        }
+                    } else {
+                        TypedExprKind::Call {
+                            callee: Box::new(callee_typed),
+                            args: args_typed,
+                        }
+                    }
+                } else {
+                    TypedExprKind::Call {
+                        callee: Box::new(callee_typed),
+                        args: args_typed,
+                    }
+                };
+                
+                (call_kind, result_type)
+            }
+            
+            ResolvedExprKind::Field { expr: base, field, .. } => {
+                let base_typed = self.check_expr(base);
+                
+                let field_type = match &base_typed.ty {
+                    Type::Struct(struct_id) => {
+                        self.ctx.get_struct_field(*struct_id, field)
+                            .cloned()
+                            .unwrap_or_else(|| {
+                                self.error(format!("no field '{}' on struct", field), expr.span);
+                                Type::Error
+                            })
+                    }
+                    Type::Ref { inner, .. } => {
+                        // Auto-deref for field access
+                        if let Type::Struct(struct_id) = inner.as_ref() {
+                            self.ctx.get_struct_field(*struct_id, field)
+                                .cloned()
+                                .unwrap_or_else(|| {
+                                    self.error(format!("no field '{}' on struct", field), expr.span);
+                                    Type::Error
+                                })
+                        } else {
+                            self.error(format!("cannot access field on non-struct type"), expr.span);
+                            Type::Error
+                        }
+                    }
+                    Type::Error => Type::Error,
+                    _ => {
+                        self.error(format!("cannot access field on non-struct type"), expr.span);
+                        Type::Error
+                    }
+                };
+                
+                (TypedExprKind::Field {
+                    expr: Box::new(base_typed),
+                    field: field.clone(),
+                }, field_type)
+            }
+            
+            ResolvedExprKind::StructLit { struct_def, fields } => {
+                let struct_type = Type::Struct(*struct_def);
+                
+                // Check field types
+                let mut typed_fields = Vec::new();
+                for (name, field_expr) in fields {
+                    let typed = self.check_expr(field_expr);
+                    
+                    if let Some(expected) = self.ctx.get_struct_field(*struct_def, name).cloned() {
+                        if let Err(e) = self.ctx.unify(&typed.ty, &expected) {
+                            self.error(format!("field '{}' type mismatch: {}", name, e), field_expr.span);
+                        }
+                    }
+                    
+                    typed_fields.push((name.clone(), typed));
+                }
+                
+                (TypedExprKind::StructLit {
+                    struct_def: *struct_def,
+                    fields: typed_fields,
+                }, struct_type)
+            }
+            
+            ResolvedExprKind::If { cond, then_block, else_block } => {
+                let cond_typed = self.check_expr(cond);
+                
+                // Condition must be bool
+                if let Err(e) = self.ctx.unify(&cond_typed.ty, &Type::Bool) {
+                    self.error(format!("if condition must be bool: {}", e), expr.span);
+                }
+                
+                let then_typed = self.check_block(then_block, None);
+                let then_ty = then_typed.ty.clone();
+                
+                let (else_typed, result_type) = match else_block {
+                    Some(ResolvedElse::Block(b)) => {
+                        let typed = self.check_block(b, Some(&then_ty));
+                        let ty = typed.ty.clone();
+                        (Some(TypedElse::Block(typed)), ty)
+                    }
+                    Some(ResolvedElse::If(e)) => {
+                        let typed = self.check_expr(e);
+                        let ty = typed.ty.clone();
+                        (Some(TypedElse::If(Box::new(typed))), ty)
+                    }
+                    None => (None, Type::Unit),
+                };
+                
+                // Unify then and else types
+                if else_typed.is_some() {
+                    if let Err(e) = self.ctx.unify(&then_ty, &result_type) {
+                        self.error(format!("if/else type mismatch: {}", e), expr.span);
+                    }
+                }
+                
+                let final_ty = self.ctx.apply(&then_ty);
+                
+                (TypedExprKind::If {
+                    cond: Box::new(cond_typed),
+                    then_block: then_typed,
+                    else_block: else_typed,
+                }, final_ty)
+            }
+            
+            ResolvedExprKind::While { cond, body } => {
+                let cond_typed = self.check_expr(cond);
+                
+                if let Err(e) = self.ctx.unify(&cond_typed.ty, &Type::Bool) {
+                    self.error(format!("while condition must be bool: {}", e), expr.span);
+                }
+                
+                let body_typed = self.check_block(body, None);
+                
+                (TypedExprKind::While {
+                    cond: Box::new(cond_typed),
+                    body: body_typed,
+                }, Type::Unit)
+            }
+            
+            ResolvedExprKind::Block(block) => {
+                let typed = self.check_block(block, None);
+                let ty = typed.ty.clone();
+                (TypedExprKind::Block(typed), ty)
+            }
+            
+            ResolvedExprKind::Assign { target, value } => {
+                let target_typed = self.check_expr(target);
+                let value_typed = self.check_expr(value);
+                
+                if let Err(e) = self.ctx.unify(&target_typed.ty, &value_typed.ty) {
+                    self.error(format!("assignment type mismatch: {}", e), expr.span);
+                }
+                
+                (TypedExprKind::Assign {
+                    target: Box::new(target_typed),
+                    value: Box::new(value_typed),
+                }, Type::Unit)
+            }
+            
+            ResolvedExprKind::Ref { is_mut, expr: inner } => {
+                let inner_typed = self.check_expr(inner);
+                let ref_type = Type::Ref {
+                    is_mut: *is_mut,
+                    inner: Box::new(inner_typed.ty.clone()),
+                };
+                
+                (TypedExprKind::Ref {
+                    is_mut: *is_mut,
+                    expr: Box::new(inner_typed),
+                }, ref_type)
+            }
+            
+            ResolvedExprKind::Deref(inner) => {
+                let inner_typed = self.check_expr(inner);
+                
+                let result_type = match &inner_typed.ty {
+                    Type::Ref { inner, .. } => (**inner).clone(),
+                    Type::Error => Type::Error,
+                    _ => {
+                        self.error("cannot dereference non-reference type".to_string(), expr.span);
+                        Type::Error
+                    }
+                };
+                
+                (TypedExprKind::Deref(Box::new(inner_typed)), result_type)
+            }
+            
+            ResolvedExprKind::Match { scrutinee, arms } => {
+                let scrutinee_typed = self.check_expr(scrutinee);
+                
+                let mut result_type = self.ctx.fresh_var();
+                let mut typed_arms = Vec::new();
+                
+                for arm in arms {
+                    let typed_arm = self.check_match_arm(arm, &scrutinee_typed.ty);
+                    if let Err(e) = self.ctx.unify(&typed_arm.body.ty, &result_type) {
+                        self.error(format!("match arm type mismatch: {}", e), arm.span);
+                    }
+                    result_type = self.ctx.apply(&result_type);
+                    typed_arms.push(typed_arm);
+                }
+                
+                (TypedExprKind::Match {
+                    scrutinee: Box::new(scrutinee_typed),
+                    arms: typed_arms,
+                }, self.ctx.apply(&result_type))
+            }
+            
+            ResolvedExprKind::Index { expr: base, index } => {
+                let base_typed = self.check_expr(base);
+                let index_typed = self.check_expr(index);
+                
+                // Index must be integer
+                if !index_typed.ty.is_integer() && !matches!(index_typed.ty, Type::Error) {
+                    self.error("index must be an integer".to_string(), expr.span);
+                }
+                
+                let elem_type = match &base_typed.ty {
+                    Type::Slice(elem) => (**elem).clone(),
+                    Type::Array(elem, _) => (**elem).clone(),
+                    Type::Ref { inner, .. } => {
+                        match inner.as_ref() {
+                            Type::Slice(elem) => (**elem).clone(),
+                            Type::Array(elem, _) => (**elem).clone(),
+                            _ => {
+                                self.error("cannot index non-array type".to_string(), expr.span);
+                                Type::Error
+                            }
+                        }
+                    }
+                    Type::Error => Type::Error,
+                    _ => {
+                        self.error("cannot index non-array type".to_string(), expr.span);
+                        Type::Error
+                    }
+                };
+                
+                (TypedExprKind::Index {
+                    expr: Box::new(base_typed),
+                    index: Box::new(index_typed),
+                }, elem_type)
+            }
+            
+            ResolvedExprKind::Error => (TypedExprKind::Error, Type::Error),
+        };
+
+        TypedExpr { kind, ty, span: expr.span }
+    }
+
+    fn check_binary_op(&mut self, op: wisp_ast::BinOp, left: &Type, right: &Type, span: Span) -> Type {
+        use wisp_ast::BinOp;
+        
+        match op {
+            // Arithmetic
+            BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Mod => {
+                if let Err(e) = self.ctx.unify(left, right) {
+                    self.error(format!("arithmetic type mismatch: {}", e), span);
+                    return Type::Error;
+                }
+                if !left.is_numeric() && !matches!(left, Type::Var(_) | Type::Error) {
+                    self.error("arithmetic requires numeric types".to_string(), span);
+                    return Type::Error;
+                }
+                self.ctx.apply(left)
+            }
+            // Comparison
+            BinOp::Eq | BinOp::NotEq | BinOp::Lt | BinOp::Gt | BinOp::LtEq | BinOp::GtEq => {
+                if let Err(e) = self.ctx.unify(left, right) {
+                    self.error(format!("comparison type mismatch: {}", e), span);
+                }
+                Type::Bool
+            }
+            // Logical
+            BinOp::And | BinOp::Or => {
+                if let Err(e) = self.ctx.unify(left, &Type::Bool) {
+                    self.error(format!("logical operator requires bool: {}", e), span);
+                }
+                if let Err(e) = self.ctx.unify(right, &Type::Bool) {
+                    self.error(format!("logical operator requires bool: {}", e), span);
+                }
+                Type::Bool
+            }
+        }
+    }
+
+    fn check_unary_op(&mut self, op: wisp_ast::UnaryOp, inner: &Type, span: Span) -> Type {
+        use wisp_ast::UnaryOp;
+        
+        match op {
+            UnaryOp::Neg => {
+                if !inner.is_numeric() && !matches!(inner, Type::Var(_) | Type::Error) {
+                    self.error("negation requires numeric type".to_string(), span);
+                    Type::Error
+                } else {
+                    inner.clone()
+                }
+            }
+            UnaryOp::Not => {
+                if let Err(e) = self.ctx.unify(inner, &Type::Bool) {
+                    self.error(format!("logical not requires bool: {}", e), span);
+                }
+                Type::Bool
+            }
+        }
+    }
+
+    fn check_match_arm(&mut self, arm: &ResolvedMatchArm, scrutinee_type: &Type) -> TypedMatchArm {
+        // TODO: proper pattern type checking
+        let pattern = self.check_pattern(&arm.pattern, scrutinee_type);
+        let body = self.check_expr(&arm.body);
+        
+        TypedMatchArm {
+            pattern,
+            body,
+        }
+    }
+
+    fn check_pattern(&mut self, pattern: &ResolvedPattern, expected: &Type) -> TypedPattern {
+        match &pattern.kind {
+            ResolvedPatternKind::Wildcard => TypedPattern::Wildcard,
+            ResolvedPatternKind::Binding { def_id, name } => {
+                self.ctx.register_def_type(*def_id, expected.clone());
+                TypedPattern::Binding { def_id: *def_id, name: name.clone(), ty: expected.clone() }
+            }
+            ResolvedPatternKind::Literal(expr) => {
+                let typed = self.check_expr(expr);
+                TypedPattern::Literal(typed)
+            }
+            ResolvedPatternKind::Variant { variant_def, fields } => {
+                // TODO: check variant fields match
+                let mut typed_fields = Vec::new();
+                for p in fields {
+                    let var = self.ctx.fresh_var();
+                    typed_fields.push(self.check_pattern(p, &var));
+                }
+                TypedPattern::Variant {
+                    variant_def: *variant_def,
+                    fields: typed_fields,
+                }
+            }
+        }
+    }
+    
+    /// Infer type arguments by matching a parameter type with an argument type
+    fn infer_type_args(&self, param_type: &Type, arg_type: &Type, map: &mut HashMap<DefId, Type>) {
+        match param_type {
+            Type::TypeParam(def_id, _) => {
+                // If this type param isn't already inferred, bind it to the arg type
+                if !map.contains_key(def_id) {
+                    map.insert(*def_id, arg_type.clone());
+                }
+            }
+            Type::Ref { inner, .. } => {
+                if let Type::Ref { inner: arg_inner, .. } = arg_type {
+                    self.infer_type_args(inner, arg_inner, map);
+                }
+            }
+            Type::Slice(elem) => {
+                if let Type::Slice(arg_elem) = arg_type {
+                    self.infer_type_args(elem, arg_elem, map);
+                }
+            }
+            Type::Array(elem, _) => {
+                if let Type::Array(arg_elem, _) = arg_type {
+                    self.infer_type_args(elem, arg_elem, map);
+                }
+            }
+            Type::Tuple(elems) => {
+                if let Type::Tuple(arg_elems) = arg_type {
+                    for (e, a) in elems.iter().zip(arg_elems.iter()) {
+                        self.infer_type_args(e, a, map);
+                    }
+                }
+            }
+            Type::Function { params, ret } => {
+                if let Type::Function { params: arg_params, ret: arg_ret } = arg_type {
+                    for (p, a) in params.iter().zip(arg_params.iter()) {
+                        self.infer_type_args(p, a, map);
+                    }
+                    self.infer_type_args(ret, arg_ret, map);
+                }
+            }
+            _ => {}
+        }
+    }
+    
+    /// Substitute type parameters with concrete types
+    fn substitute_type_params(&self, ty: &Type, type_params: &[(DefId, String)], type_args: &[Type]) -> Type {
+        match ty {
+            Type::TypeParam(def_id, _) => {
+                // Find the index of this type param
+                for (i, (tp_def_id, _)) in type_params.iter().enumerate() {
+                    if tp_def_id == def_id {
+                        return type_args.get(i).cloned().unwrap_or(ty.clone());
+                    }
+                }
+                ty.clone()
+            }
+            Type::Ref { is_mut, inner } => Type::Ref {
+                is_mut: *is_mut,
+                inner: Box::new(self.substitute_type_params(inner, type_params, type_args)),
+            },
+            Type::Slice(elem) => Type::Slice(Box::new(self.substitute_type_params(elem, type_params, type_args))),
+            Type::Array(elem, size) => Type::Array(
+                Box::new(self.substitute_type_params(elem, type_params, type_args)),
+                *size,
+            ),
+            Type::Tuple(elems) => Type::Tuple(
+                elems.iter().map(|e| self.substitute_type_params(e, type_params, type_args)).collect()
+            ),
+            Type::Function { params, ret } => Type::Function {
+                params: params.iter().map(|p| self.substitute_type_params(p, type_params, type_args)).collect(),
+                ret: Box::new(self.substitute_type_params(ret, type_params, type_args)),
+            },
+            _ => ty.clone(),
+        }
+    }
+    
+    /// Get the collected generic instantiations
+    pub fn get_generic_instantiations(&self) -> &HashSet<GenericInstantiation> {
+        &self.generic_instantiations
+    }
+    
+    /// Check if a type implements a trait
+    fn type_implements_trait(&self, ty: &Type, trait_def_id: DefId) -> bool {
+        match ty {
+            Type::Struct(struct_def_id) => {
+                // Check if there's an impl for this (struct, trait) pair
+                self.trait_impls.contains_key(&(*struct_def_id, trait_def_id))
+            }
+            Type::Enum(enum_def_id) => {
+                self.trait_impls.contains_key(&(*enum_def_id, trait_def_id))
+            }
+            // Primitives could have built-in trait impls, but for now return false
+            _ => false,
+        }
+    }
+    
+    /// Look up a method on a type parameter via its trait bounds
+    fn lookup_trait_method(&self, type_param_bounds: &[DefId], method_name: &str) -> Option<Type> {
+        for &trait_def_id in type_param_bounds {
+            if let Some(methods) = self.trait_methods.get(&trait_def_id) {
+                for (name, method_type) in methods {
+                    if name == method_name {
+                        return Some(method_type.clone());
+                    }
+                }
+            }
+        }
+        None
+    }
+    
+    /// Find the trait bounds for a type parameter by its DefId
+    fn find_type_param_bounds(&self, type_param_def_id: DefId) -> Option<Vec<DefId>> {
+        // Search through all generic functions for this type param
+        for type_params in self.generic_functions.values() {
+            for tp_info in type_params {
+                if tp_info.def_id == type_param_def_id && !tp_info.bounds.is_empty() {
+                    return Some(tp_info.bounds.clone());
+                }
+            }
+        }
+        None
+    }
+}
+
+impl Default for TypeChecker {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// === Typed AST ===
+
+#[derive(Debug)]
+pub struct TypedProgram {
+    pub ctx: TypeContext,
+    pub structs: Vec<ResolvedStruct>,
+    pub enums: Vec<ResolvedEnum>,
+    pub functions: Vec<TypedFunction>,
+    pub extern_functions: Vec<TypedExternFunction>,
+    pub extern_statics: Vec<TypedExternStatic>,
+    pub impls: Vec<TypedImpl>,
+    /// Collected generic instantiations for monomorphization
+    pub generic_instantiations: HashSet<GenericInstantiation>,
+}
+
+/// Typed extern function declaration
+#[derive(Debug)]
+pub struct TypedExternFunction {
+    pub def_id: DefId,
+    pub name: String,
+    pub params: Vec<TypedParam>,
+    pub return_type: Type,
+}
+
+/// Typed extern static declaration
+#[derive(Debug)]
+pub struct TypedExternStatic {
+    pub def_id: DefId,
+    pub name: String,
+    pub ty: Type,
+}
+
+impl TypedProgram {
+    pub fn pretty_print(&self) -> String {
+        let mut out = String::new();
+        
+        out.push_str("=== Typed Program ===\n\n");
+        
+        out.push_str("--- Structs ---\n");
+        for s in &self.structs {
+            out.push_str(&format!("  struct {} {{\n", s.name));
+            if let Some(fields) = self.ctx.get_struct_fields(s.def_id) {
+                for (name, ty) in fields {
+                    out.push_str(&format!("    {}: {}\n", name, ty.display(&self.ctx)));
+                }
+            }
+            out.push_str("  }\n");
+        }
+        
+        out.push_str("\n--- Enums ---\n");
+        for e in &self.enums {
+            out.push_str(&format!("  enum {} {{\n", e.name));
+            if let Some(variants) = self.ctx.get_enum_variants(e.def_id) {
+                for (name, _, fields) in variants {
+                    if fields.is_empty() {
+                        out.push_str(&format!("    {}\n", name));
+                    } else {
+                        let field_strs: Vec<_> = fields.iter().map(|t| t.display(&self.ctx)).collect();
+                        out.push_str(&format!("    {}({})\n", name, field_strs.join(", ")));
+                    }
+                }
+            }
+            out.push_str("  }\n");
+        }
+        
+        out.push_str("\n--- Functions ---\n");
+        for f in &self.functions {
+            let params: Vec<_> = f.params.iter()
+                .map(|p| format!("{}: {}", p.name, p.ty.display(&self.ctx)))
+                .collect();
+            out.push_str(&format!("  fn {}({}) -> {}\n", 
+                f.name, 
+                params.join(", "),
+                f.return_type.display(&self.ctx)
+            ));
+        }
+        
+        out.push_str("\n--- Impls ---\n");
+        for i in &self.impls {
+            out.push_str(&format!("  impl {}\n", i.target_type.display(&self.ctx)));
+            for m in &i.methods {
+                let params: Vec<_> = m.params.iter()
+                    .map(|p| format!("{}: {}", p.name, p.ty.display(&self.ctx)))
+                    .collect();
+                out.push_str(&format!("    fn {}({}) -> {}\n",
+                    m.name,
+                    params.join(", "),
+                    m.return_type.display(&self.ctx)
+                ));
+            }
+        }
+        
+        out
+    }
+}
+
+#[derive(Debug)]
+pub struct TypedImpl {
+    pub trait_def: Option<DefId>,
+    pub target_type: Type,
+    pub methods: Vec<TypedFunction>,
+}
+
+#[derive(Debug)]
+pub struct TypedFunction {
+    pub def_id: DefId,
+    pub name: String,
+    pub params: Vec<TypedParam>,
+    pub return_type: Type,
+    pub body: Option<TypedBlock>,
+}
+
+#[derive(Debug)]
+pub struct TypedParam {
+    pub def_id: DefId,
+    pub name: String,
+    pub is_mut: bool,
+    pub ty: Type,
+}
+
+#[derive(Debug)]
+pub struct TypedBlock {
+    pub stmts: Vec<TypedStmt>,
+    pub ty: Type,
+}
+
+#[derive(Debug)]
+pub enum TypedStmt {
+    Let {
+        def_id: DefId,
+        name: String,
+        is_mut: bool,
+        ty: Type,
+        init: Option<TypedExpr>,
+        span: Span,
+    },
+    Expr(TypedExpr),
+}
+
+#[derive(Debug)]
+pub struct TypedExpr {
+    pub kind: TypedExprKind,
+    pub ty: Type,
+    pub span: Span,
+}
+
+#[derive(Debug)]
+pub enum TypedExprKind {
+    IntLiteral(i64),
+    FloatLiteral(f64),
+    BoolLiteral(bool),
+    StringLiteral(String),
+    Var { name: String, def_id: DefId },
+    Binary { left: Box<TypedExpr>, op: wisp_ast::BinOp, right: Box<TypedExpr> },
+    Unary { op: wisp_ast::UnaryOp, expr: Box<TypedExpr> },
+    Call { callee: Box<TypedExpr>, args: Vec<TypedExpr> },
+    /// Call to a generic function with inferred type arguments
+    GenericCall { func_def_id: DefId, type_args: Vec<Type>, args: Vec<TypedExpr> },
+    MethodCall { receiver: Box<TypedExpr>, method: String, method_def_id: DefId, args: Vec<TypedExpr> },
+    /// Method call on a type parameter via trait bounds
+    TraitMethodCall { receiver: Box<TypedExpr>, method: String, trait_bounds: Vec<DefId>, args: Vec<TypedExpr> },
+    Field { expr: Box<TypedExpr>, field: String },
+    StructLit { struct_def: DefId, fields: Vec<(String, TypedExpr)> },
+    If { cond: Box<TypedExpr>, then_block: TypedBlock, else_block: Option<TypedElse> },
+    While { cond: Box<TypedExpr>, body: TypedBlock },
+    Block(TypedBlock),
+    Assign { target: Box<TypedExpr>, value: Box<TypedExpr> },
+    Ref { is_mut: bool, expr: Box<TypedExpr> },
+    Deref(Box<TypedExpr>),
+    Match { scrutinee: Box<TypedExpr>, arms: Vec<TypedMatchArm> },
+    Index { expr: Box<TypedExpr>, index: Box<TypedExpr> },
+    Error,
+}
+
+#[derive(Debug)]
+pub enum TypedElse {
+    Block(TypedBlock),
+    If(Box<TypedExpr>),
+}
+
+#[derive(Debug)]
+pub struct TypedMatchArm {
+    pub pattern: TypedPattern,
+    pub body: TypedExpr,
+}
+
+#[derive(Debug)]
+pub enum TypedPattern {
+    Wildcard,
+    Binding { def_id: DefId, name: String, ty: Type },
+    Literal(TypedExpr),
+    Variant { variant_def: DefId, fields: Vec<TypedPattern> },
+}
+

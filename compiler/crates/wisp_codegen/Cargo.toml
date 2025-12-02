@@ -1,0 +1,16 @@
+[package]
+name = "wisp_codegen"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+wisp_mir = { path = "../wisp_mir" }
+wisp_hir = { path = "../wisp_hir" }
+wisp_types = { path = "../wisp_types" }
+cranelift-codegen = "0.113"
+cranelift-frontend = "0.113"
+cranelift-module = "0.113"
+cranelift-object = "0.113"
+cranelift-native = "0.113"
+target-lexicon = "0.12"
+

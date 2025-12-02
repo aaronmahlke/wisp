@@ -1,0 +1,11 @@
+[package]
+name = "wisp_borrowck"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+wisp_lexer = { path = "../wisp_lexer" }
+wisp_ast = { path = "../wisp_ast" }
+wisp_hir = { path = "../wisp_hir" }
+wisp_types = { path = "../wisp_types" }
+

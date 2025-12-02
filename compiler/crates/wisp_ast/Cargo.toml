@@ -1,0 +1,8 @@
+[package]
+name = "wisp_ast"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+wisp_lexer = { path = "../wisp_lexer" }
+

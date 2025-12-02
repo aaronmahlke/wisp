@@ -1,0 +1,23 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/wisp_lexer",
+    "crates/wisp_ast",
+    "crates/wisp_parser",
+    "crates/wisp_hir",
+    "crates/wisp_types",
+    "crates/wisp_borrowck",
+    "crates/wisp_mir",
+    "crates/wisp_codegen",
+    "crates/wisp_driver",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+
+[workspace.dependencies]
+logos = "0.14"
+ariadne = "0.4"
+

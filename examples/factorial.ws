@@ -1,0 +1,16 @@
+// Factorial using a while loop
+
+fn factorial(n: i32) -> i32 {
+    let mut result = 1
+    let mut i = 1
+    while i <= n {
+        result = result * i
+        i = i + 1
+    }
+    result
+}
+
+fn main() -> i32 {
+    factorial(5)  // Should be 120
+}
+

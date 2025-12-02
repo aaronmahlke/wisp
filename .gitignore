@@ -1,0 +1,9 @@
+# Build artifacts
+.build/
+
+# Compiler build artifacts (Rust/Cargo)
+compiler/target/
+
+# Object files and executables that might be left around
+*.o
+
