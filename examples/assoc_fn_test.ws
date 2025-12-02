@@ -27,9 +27,11 @@ fn main() -> i32 {
     // Call associated function
     let p = Point.new(x: 10, y: 20);
 
-    print(&"p = ");
+    print(value: &"p = ");
     p.print_point();
     println();
+
+    let mut s: i32 = 12;
 
     0
 }

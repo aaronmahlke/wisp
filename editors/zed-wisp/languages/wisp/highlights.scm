@@ -7,13 +7,15 @@
   "else"
   "while"
   "loop"
+  "for"
+  "in"
+  "match"
   "return"
   "break"
   "struct"
   "enum"
   "trait"
   "impl"
-  "for"
   "pub"
   "extern"
   "static"
@@ -60,7 +62,11 @@
   ">>="
   "->"
   "::"
+  ".."
 ] @operator
+
+; Wildcard pattern in match
+"_" @variable.builtin
 
 ; Punctuation
 [
@@ -116,6 +122,12 @@
 ; Variables and parameters
 (parameter
   name: (identifier) @variable.parameter)
+
+(lambda_parameter
+  name: (identifier) @variable.parameter)
+
+(for_expression
+  pattern: (identifier) @variable)
 
 (let_statement
   pattern: (identifier) @variable)
