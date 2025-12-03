@@ -5,6 +5,7 @@ struct SomeStruct {
     value: i32,
 }
 
+
 impl Display for SomeStruct {
     fn to_string(&self) -> String {
         "{self.value}"
