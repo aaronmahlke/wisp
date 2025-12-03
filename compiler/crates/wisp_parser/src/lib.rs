@@ -495,7 +495,7 @@ impl<'src> Parser<'src> {
         // Parse path: std/io, @/utils/math, or pkg/name/sub
         let path = self.parse_import_path()?;
         
-        // Check for alias: import std/io as stdio
+        // Check for alias: import std.io as stdio
         let alias = if self.check(&Token::As) {
             self.advance();
             Some(self.expect_ident()?)
@@ -503,9 +503,17 @@ impl<'src> Parser<'src> {
             None
         };
         
-        // Check for inline destructuring: import std/io { print, File }
+        // Check for inline destructuring: import std.io { print, File } or import std.io.{ print, File }
         let items = if self.check(&Token::LBrace) {
             Some(self.parse_import_items()?)
+        } else if self.check(&Token::Dot) {
+            // Check if it's a dot followed by brace: .{
+            if self.pos + 1 < self.tokens.len() && matches!(self.tokens[self.pos + 1].token, Token::LBrace) {
+                self.advance(); // consume the dot
+                Some(self.parse_import_items()?)
+            } else {
+                None
+            }
         } else {
             None
         };
@@ -560,7 +568,7 @@ impl<'src> Parser<'src> {
         // Check for @ prefix (project-relative)
         if self.check(&Token::At) {
             self.advance();
-            self.expect(Token::Slash)?;
+            self.expect(Token::Dot)?;
             let segments = self.parse_path_segments()?;
             return Ok(ImportPath::Project(segments));
         }
@@ -570,8 +578,8 @@ impl<'src> Parser<'src> {
         
         match first.name.as_str() {
             "std" => {
-                // Check if there's a slash - if not, this is `import std` (the whole std lib)
-                if self.check(&Token::Slash) {
+                // Check if there's a dot - if not, this is `import std` (the whole std lib)
+                if self.check(&Token::Dot) {
                     self.advance();
                     let segments = self.parse_path_segments()?;
                     Ok(ImportPath::Std(segments))
@@ -581,9 +589,9 @@ impl<'src> Parser<'src> {
                 }
             }
             "pkg" => {
-                self.expect(Token::Slash)?;
+                self.expect(Token::Dot)?;
                 let pkg_name = self.expect_ident()?.name;
-                if self.check(&Token::Slash) {
+                if self.check(&Token::Dot) {
                     self.advance();
                     let segments = self.parse_path_segments()?;
                     Ok(ImportPath::Package(pkg_name, segments))
@@ -592,9 +600,9 @@ impl<'src> Parser<'src> {
                 }
             }
             _ => {
-                // Treat as std path for backwards compatibility: io -> std/io
+                // Treat as std path for backwards compatibility: io -> std.io
                 let mut segments = vec![first.name];
-                while self.check(&Token::Slash) {
+                while self.check(&Token::Dot) {
                     self.advance();
                     let seg = self.expect_ident()?;
                     segments.push(seg.name);
@@ -610,7 +618,12 @@ impl<'src> Parser<'src> {
         let first = self.expect_ident()?;
         segments.push(first.name);
         
-        while self.check(&Token::Slash) {
+        while self.check(&Token::Dot) {
+            // Look ahead to see if there's a { after the dot (for inline destructuring)
+            // If so, don't consume the dot
+            if self.pos + 1 < self.tokens.len() && matches!(self.tokens[self.pos + 1].token, Token::LBrace) {
+                break;
+            }
             self.advance();
             let seg = self.expect_ident()?;
             segments.push(seg.name);

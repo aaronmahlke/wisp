@@ -4,6 +4,7 @@ use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::RwLock;
+use std::env;
 
 use tower_lsp::jsonrpc::Result;
 use tower_lsp::lsp_types::*;
@@ -416,7 +417,7 @@ impl LanguageServer for WispLanguageServer {
                 hover_provider: Some(HoverProviderCapability::Simple(true)),
                 definition_provider: Some(OneOf::Left(true)),
                 completion_provider: Some(CompletionOptions {
-                    trigger_characters: Some(vec![".".to_string(), ":".to_string(), "{".to_string()]),
+                    trigger_characters: Some(vec![".".to_string(), ":".to_string(), "{".to_string(), "/".to_string()]),
                     ..Default::default()
                 }),
                 signature_help_provider: Some(SignatureHelpOptions {
@@ -643,14 +644,15 @@ impl LanguageServer for WispLanguageServer {
                 eprintln!("LSP Completion: namespaces available: {:?}", doc.namespaces.keys().collect::<Vec<_>>());
                 
                 // Check if we're in an import statement
-                if let Some(import_context) = find_import_context(before_cursor) {
-                    eprintln!("LSP Completion: import context: {:?}", import_context);
-                    let suggestions = get_import_suggestions(&import_context);
-                    for (name, kind) in suggestions {
+                if let Some(import_path) = find_import_context(before_cursor) {
+                    eprintln!("LSP Completion: import path: {:?}", import_path);
+                    let suggestions = get_import_suggestions(uri, &import_path);
+                    for (idx, (name, kind)) in suggestions.iter().enumerate() {
                         items.push(CompletionItem {
                             label: name.clone(),
-                            kind: Some(kind),
-                            sort_text: Some(format!("0{}", name)),
+                            kind: Some(*kind),
+                            // Use leading zeros to sort imports first, then alphabetically
+                            sort_text: Some(format!("00{:03}{}", idx, name)),
                             ..Default::default()
                         });
                     }
@@ -962,10 +964,8 @@ fn lookup_namespace_path<'a>(namespaces: &'a HashMap<String, NamespaceInfo>, pat
     Some(current)
 }
 
-/// Detect if we're in an import statement and return the current path prefix
-/// Returns: Some((prefix, after_slash)) where prefix is "std", "@", "pkg" and after_slash is what's typed after
-fn find_import_context(text: &str) -> Option<(String, String)> {
-    // Look for "import " or "import { ... } from " pattern
+/// Detect if we're in an import statement and return the import path being typed
+fn find_import_context(text: &str) -> Option<String> {
     let trimmed = text.trim_end();
     
     // Check if we're after "import "
@@ -976,69 +976,139 @@ fn find_import_context(text: &str) -> Option<(String, String)> {
         if after_import.starts_with('{') {
             // Check for "from" pattern
             if let Some(from_pos) = after_import.rfind("from ") {
-                let after_from = &after_import[from_pos + 5..];
-                return parse_import_path(after_from);
+                return Some(after_import[from_pos + 5..].trim().to_string());
             }
             return None;
         }
         
-        return parse_import_path(after_import);
+        return Some(after_import.trim().to_string());
     }
     
     None
 }
 
-/// Parse an import path and return (prefix, typed_after_slash)
-fn parse_import_path(path: &str) -> Option<(String, String)> {
-    let path = path.trim();
+/// Get import suggestions by scanning the filesystem
+fn get_import_suggestions(uri: &Url, current_path: &str) -> Vec<(String, CompletionItemKind)> {
+    let mut suggestions = Vec::new();
     
-    if path.starts_with("std/") {
-        Some(("std".to_string(), path[4..].to_string()))
-    } else if path.starts_with("std") && !path.contains('/') {
-        // Just "std" without /
-        Some(("std".to_string(), String::new()))
-    } else if path.starts_with("@/") {
-        Some(("@".to_string(), path[2..].to_string()))
-    } else if path.starts_with("@") && !path.contains('/') {
-        Some(("@".to_string(), String::new()))
-    } else if path.starts_with("pkg/") {
-        // pkg/name/subpath
-        Some(("pkg".to_string(), path[4..].to_string()))
-    } else if path.is_empty() {
-        // Just "import " - suggest prefixes
-        Some(("".to_string(), String::new()))
-    } else {
-        None
+    // Get the source file path for resolving relative to project
+    let file_path = uri.to_file_path().ok();
+    
+    if current_path.is_empty() {
+        // Just typed "import " - suggest prefixes
+        suggestions.push(("std".to_string(), CompletionItemKind::MODULE));
+        suggestions.push(("@".to_string(), CompletionItemKind::MODULE));
+        return suggestions;
+    }
+    
+    // Parse the current path to determine what to suggest
+    if current_path.starts_with("std.") || current_path == "std" {
+        // Scan std directory
+        let std_path = get_std_path(file_path.as_ref());
+        let subpath = if current_path.starts_with("std.") {
+            &current_path[4..]
+        } else {
+            ""
+        };
+        suggestions.extend(scan_module_directory(&std_path, subpath));
+    } else if current_path.starts_with("@.") || current_path == "@" {
+        // Scan project directory
+        if let Some(project_root) = file_path.as_ref().and_then(|p| find_project_root(p)) {
+            let subpath = if current_path.starts_with("@.") {
+                &current_path[2..]
+            } else {
+                ""
+            };
+            suggestions.extend(scan_module_directory(&project_root, subpath));
+        }
+    } else if current_path == "s" || current_path == "st" || current_path == "std" {
+        // Partial "std" - suggest it
+        if "std".starts_with(current_path) {
+            suggestions.push(("std".to_string(), CompletionItemKind::MODULE));
+        }
+    } else if current_path == "@" {
+        suggestions.push(("@".to_string(), CompletionItemKind::MODULE));
+    }
+    
+    suggestions
+}
+
+/// Get the std library path
+fn get_std_path(file_path: Option<&PathBuf>) -> PathBuf {
+    // Try WISP_STD_PATH env var
+    if let Ok(std_path) = env::var("WISP_STD_PATH") {
+        return PathBuf::from(std_path);
+    }
+    
+    // Fall back to project_root/std
+    if let Some(path) = file_path {
+        if let Some(project_root) = find_project_root(path) {
+            return project_root.join("std");
+        }
+    }
+    
+    // Last resort: assume std is in current directory
+    PathBuf::from("std")
+}
+
+/// Find project root by looking for wisp.toml
+fn find_project_root(start: &Path) -> Option<PathBuf> {
+    let mut current = start.parent()?.to_path_buf();
+    loop {
+        if current.join("wisp.toml").exists() {
+            return Some(current);
+        }
+        if !current.pop() {
+            return None;
+        }
     }
 }
 
-/// Get import suggestions based on context
-fn get_import_suggestions(context: &(String, String)) -> Vec<(String, CompletionItemKind)> {
-    let (prefix, typed) = context;
+/// Scan a directory for .ws modules
+fn scan_module_directory(base_path: &Path, subpath: &str) -> Vec<(String, CompletionItemKind)> {
     let mut suggestions = Vec::new();
     
-    if prefix.is_empty() {
-        // Suggest import prefixes
-        suggestions.push(("std".to_string(), CompletionItemKind::MODULE));
-        suggestions.push(("@".to_string(), CompletionItemKind::MODULE));
-        suggestions.push(("pkg".to_string(), CompletionItemKind::MODULE));
-    } else if prefix == "std" {
-        // Suggest std library modules
-        let std_modules = ["io", "string", "ops"];
-        for module in std_modules {
-            if typed.is_empty() || module.starts_with(typed) {
-                suggestions.push((module.to_string(), CompletionItemKind::MODULE));
+    let dir_to_scan = if subpath.is_empty() {
+        base_path.to_path_buf()
+    } else {
+        // If subpath has a partial name at the end, scan the parent directory
+        let parts: Vec<&str> = subpath.split('.').collect();
+        let mut dir = base_path.to_path_buf();
+        
+        // Add complete path segments (all but the last if it's partial)
+        for part in &parts[..parts.len().saturating_sub(1)] {
+            if !part.is_empty() {
+                dir = dir.join(part);
             }
         }
-    } else if prefix == "@" {
-        // For project-local imports, we'd need to scan the filesystem
-        // For now, just indicate it's for local imports
-        suggestions.push(("(project modules)".to_string(), CompletionItemKind::TEXT));
-    } else if prefix == "pkg" {
-        // For package imports, we'd need package info
-        suggestions.push(("(package name)".to_string(), CompletionItemKind::TEXT));
+        dir
+    };
+    
+    // Get the partial name being typed (last segment)
+    let partial = subpath.split('.').last().unwrap_or("");
+    
+    if let Ok(entries) = fs::read_dir(&dir_to_scan) {
+        for entry in entries.flatten() {
+            if let Ok(file_type) = entry.file_type() {
+                let name = entry.file_name().to_string_lossy().to_string();
+                
+                if file_type.is_file() && name.ends_with(".ws") && name != "mod.ws" {
+                    // Module file (e.g., io.ws -> suggest "io")
+                    let module_name = name.trim_end_matches(".ws");
+                    if partial.is_empty() || module_name.starts_with(partial) {
+                        suggestions.push((module_name.to_string(), CompletionItemKind::MODULE));
+                    }
+                } else if file_type.is_dir() && !name.starts_with('.') {
+                    // Directory - might contain modules
+                    if partial.is_empty() || name.starts_with(partial) {
+                        suggestions.push((name, CompletionItemKind::FOLDER));
+                    }
+                }
+            }
+        }
     }
     
+    suggestions.sort_by(|a, b| a.0.cmp(&b.0));
     suggestions
 }
 
@@ -1441,13 +1511,9 @@ fn collect_expr_variable_defs(
 fn extract_namespaces_from_imports(source: &wisp_ast::SourceFileWithImports) -> HashMap<String, NamespaceInfo> {
     let mut namespaces = HashMap::new();
     
-    // Find the direct (non-transitive) import of std or other top-level namespace
+    // Process all imported modules (transitive and direct)
     for module in &source.imported_modules {
-        if module.is_transitive {
-            continue;
-        }
-        
-        // Get the namespace name for this direct import
+        // Get the namespace name for this import
         let ns_name = if let Some(ref alias) = module.import.alias {
             alias.name.clone()
         } else {
@@ -1460,48 +1526,73 @@ fn extract_namespaces_from_imports(source: &wisp_ast::SourceFileWithImports) -> 
             continue;
         }
         
-        // Create namespace info
-        let mut ns_info = NamespaceInfo::default();
+        // Get or create namespace info
+        let ns_info = namespaces.entry(ns_name.clone()).or_insert_with(NamespaceInfo::default);
         
-        // Add children from module_imports (e.g., `pub import std/io as io` in std/mod.ws)
-        for sub_import in &module.module_imports {
-            let child_name = if let Some(ref alias) = sub_import.alias {
-                alias.name.clone()
-            } else {
-                sub_import.path.last_segment()
-                    .map(|s| s.to_string())
-                    .unwrap_or_default()
-            };
+        // If this is a direct import (not transitive), add its PUBLIC items directly
+        if !module.is_transitive {
+            for item in &module.items {
+                if is_item_public(item) {
+                    if let Some((name, kind)) = get_item_name_and_kind(item) {
+                        ns_info.items.insert(name, (kind, String::new()));
+                    }
+                }
+            }
             
-            if !child_name.is_empty() {
-                // Create a child namespace (we don't have full item info, just the structure)
-                let mut child_info = NamespaceInfo::default();
+            // Add children from module_imports (e.g., `pub import std/io as io` in std/mod.ws)
+            for sub_import in &module.module_imports {
+                let child_name = if let Some(ref alias) = sub_import.alias {
+                    alias.name.clone()
+                } else {
+                    sub_import.path.last_segment()
+                        .map(|s| s.to_string())
+                        .unwrap_or_default()
+                };
                 
-                // Try to find items for this child from other transitive imports
-                for transitive in &source.imported_modules {
-                    if transitive.is_transitive {
-                        let transitive_name = transitive.import.path.last_segment()
-                            .map(|s| s.to_string())
-                            .unwrap_or_default();
-                        if transitive_name == child_name {
-                            // Add items from this module
-                            for item in &transitive.items {
-                                if let Some((name, kind)) = get_item_name_and_kind(item) {
-                                    child_info.items.insert(name, (kind, String::new()));
+                if !child_name.is_empty() {
+                    // Create a child namespace and populate it from transitive imports
+                    let mut child_info = NamespaceInfo::default();
+                    
+                    // Find the transitive import that matches this child
+                    for transitive in &source.imported_modules {
+                        if transitive.is_transitive {
+                            let transitive_name = transitive.import.path.last_segment()
+                                .map(|s| s.to_string())
+                                .unwrap_or_default();
+                            if transitive_name == child_name {
+                                // Add PUBLIC items from this module
+                                for item in &transitive.items {
+                                    if is_item_public(item) {
+                                        if let Some((name, kind)) = get_item_name_and_kind(item) {
+                                            child_info.items.insert(name, (kind, String::new()));
+                                        }
+                                    }
                                 }
                             }
                         }
                     }
+                    
+                    ns_info.children.insert(child_name, child_info);
                 }
-                
-                ns_info.children.insert(child_name, child_info);
             }
         }
-        
-        namespaces.insert(ns_name, ns_info);
     }
     
     namespaces
+}
+
+/// Check if an item is public
+fn is_item_public(item: &wisp_ast::Item) -> bool {
+    match item {
+        wisp_ast::Item::Function(f) => f.is_pub,
+        wisp_ast::Item::ExternFunction(f) => f.is_pub,
+        wisp_ast::Item::ExternStatic(s) => s.is_pub,
+        wisp_ast::Item::Struct(s) => s.is_pub,
+        wisp_ast::Item::Enum(e) => e.is_pub,
+        wisp_ast::Item::Trait(t) => t.is_pub,
+        wisp_ast::Item::Impl(_) => true, // Impl blocks are always visible if the type is visible
+        wisp_ast::Item::Import(_) => false, // Imports are not items in the namespace
+    }
 }
 
 /// Get the name and kind of an item for namespace info
