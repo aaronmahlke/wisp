@@ -22,7 +22,7 @@ fn somefunc() {}
 fn main() {
     let something = SomeStruct { value: 3}
     let a = SomeStruct {value: 32 }
-    somefunc();
+    somefunc()
     let x = add(23, 23)
     let b = add(b_thing: 23)
 }

@@ -7,21 +7,20 @@
   "else"
   "while"
   "loop"
-  "for"
-  "in"
-  "match"
   "return"
   "break"
   "struct"
   "enum"
   "trait"
   "impl"
+  "for"
+  "in"
+  "match"
+  "as"
   "pub"
   "extern"
   "static"
   "import"
-  "from"
-  "as"
   "defer"
   "self"
 ] @keyword
@@ -64,11 +63,7 @@
   ">>="
   "->"
   "::"
-  ".."
 ] @operator
-
-; Wildcard pattern in match
-"_" @variable.builtin
 
 ; Punctuation
 [
@@ -86,22 +81,6 @@
   ":"
   ";"
 ] @punctuation.delimiter
-
-; Import paths and items
-; std, pkg, @ are modules/namespaces in import paths
-(import_path "std") @module
-(import_path "pkg") @module
-(import_path "@") @module
-(import_path (identifier) @module)
-
-(import_item
-  name: (identifier) @function)
-
-(import_item
-  alias: (identifier) @function)
-
-(import_statement
-  alias: (identifier) @module)
 
 ; Types
 (primitive_type) @type.builtin
@@ -141,12 +120,6 @@
 (parameter
   name: (identifier) @variable.parameter)
 
-(lambda_parameter
-  name: (identifier) @variable.parameter)
-
-(for_expression
-  pattern: (identifier) @variable)
-
 (let_statement
   pattern: (identifier) @variable)
 
@@ -165,10 +138,16 @@
 ; Literals
 (integer_literal) @number
 (float_literal) @number.float
-(string_literal) @string
+(string) @string
+(string_content) @string
 (char_literal) @character
 (escape_sequence) @string.escape
 (boolean_literal) @constant.builtin
+
+; String interpolation delimiters
+(interpolation
+  "{" @punctuation.special
+  "}" @punctuation.special)
 
 ; Comments
 (line_comment) @comment

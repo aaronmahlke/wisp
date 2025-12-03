@@ -14,7 +14,7 @@ version = "0.5.0"
 [grammars.wisp]
 repository = "https://github.com/aaronmahlke/wisp"
 path = "tree-sitter-wisp"
-rev = "02061bad5715366d88c74ddd30762b4c1e66f361"
+rev = "273975b98a69ac359a0fde26c7b1c8edfb54026d"
 
 [language_servers.wisp-lsp]
 language = "Wisp"
