@@ -1,5 +1,4 @@
-import "../std/io"
-import "../std/string"
+import std.io.{ print }
 
 fn day_name(day: i32) -> str {
     match day {

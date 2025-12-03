@@ -48,22 +48,21 @@ fn main() -> i32 {
     let b = a * 2       // 30
     let c = b - 10      // 20
     let d = c / 4       // 5
-    
+
     // Test comparisons
     let e = if d == 5 { 1 } else { 0 }  // 1
-    
+
     // Test function calls
     let f = abs(0 - 7)  // 7
     let g = max(3, 8)   // 8
     let h = min(3, 8)   // 3
-    
+
     // Test loop
     let i = sum_to(5)   // 15
-    
+
     // Test modulo
     let j = is_even(4)  // 1
-    
+
     // Combine results: d + e + f + g + h + i + j = 5 + 1 + 7 + 8 + 3 + 15 + 1 = 40
     d + e + f + g + h + i + j
 }
-

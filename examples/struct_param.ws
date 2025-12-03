@@ -1,6 +1,6 @@
 // Test struct parameters
 
-import "../std/io"
+import std.io
 
 struct Rectangle {
     width: i32,

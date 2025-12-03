@@ -1,5 +1,5 @@
 // Wisp Language Showcase
-import "../std/io"
+import std.io.{ print }
 
 // Data Structures
 struct Vec2 {
@@ -37,13 +37,7 @@ fn vec2_length_squared(v: &Vec2) -> i32 {
 }
 
 fn vec2_print(label: str, v: &Vec2) {
-    print(&label);
-    print(&"(");
-    print(&v.x);
-    print(&", ");
-    print(&v.y);
-    print(&")");
-    println();
+    print(&"{label}({v.x}, {v.y})");
 }
 
 // Player Functions (immutable - return new player)

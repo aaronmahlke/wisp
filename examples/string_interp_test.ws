@@ -1,5 +1,5 @@
-import "../std/io"
-import "../std/string"
+import std.io
+import std/string
 
 fn main() {
     // Test basic string interpolation

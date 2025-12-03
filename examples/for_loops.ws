@@ -1,5 +1,5 @@
-import "../std/io"
-import "../std/string"
+import std.io.{ print }
+import { String } from std.string
 
 fn main() {
     // Basic for loop with range

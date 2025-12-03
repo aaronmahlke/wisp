@@ -1,4 +1,4 @@
-import "../std/io"
+import std.io
 
 // Generic identity function
 fn identity<T>(x: T) -> T {

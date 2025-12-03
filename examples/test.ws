@@ -1,5 +1,4 @@
-import "../std/io"
-
+import std.io/print
 fn main() {
-    print("Hello World");
+    print(&"Hi")
 }

@@ -1,6 +1,6 @@
 // Wisp Standard Library - String type (heap-allocated)
 
-// Memory allocation functions
+// Memory allocation functions (internal - not exported)
 extern fn malloc(size: i64) -> i64
 extern fn realloc(ptr: i64, size: i64) -> i64
 extern fn free(ptr: i64)
@@ -9,7 +9,7 @@ extern fn memset(dest: i64, c: i32, n: i64) -> i64
 extern fn strlen(s: i64) -> i64
 
 // Heap-allocated, growable string
-struct String {
+pub struct String {
     ptr: i64,   // pointer to char buffer
     len: i64,   // current length (not including null terminator)
     cap: i64,   // capacity (including space for null terminator)
@@ -17,7 +17,7 @@ struct String {
 
 impl String {
     // Create an empty string
-    fn new() -> String {
+    pub fn new() -> String {
         let cap: i64 = 16;  // Initial capacity
         let ptr = malloc(cap);
         // Null terminate the empty string
@@ -28,7 +28,7 @@ impl String {
     }
     
     // Create a string from a string literal
-    fn from(s: str) -> String {
+    pub fn from(s: str) -> String {
         // str is already a pointer (i64)
         let s_ptr = s as i64;
         let slen = strlen(s_ptr);
@@ -40,18 +40,18 @@ impl String {
     }
     
     // Get the length of the string
-    fn len(&self) -> i64 {
+    pub fn len(&self) -> i64 {
         self.len
     }
     
     // Check if the string is empty
-    fn is_empty(&self) -> bool {
+    pub fn is_empty(&self) -> bool {
         let zero: i64 = 0;
         self.len == zero
     }
     
     // Ensure capacity for at least `min_cap` bytes
-    fn reserve(&mut self, min_cap: i64) {
+    pub fn reserve(&mut self, min_cap: i64) {
         if min_cap > self.cap {
             // Double capacity or use min_cap, whichever is larger
             let two: i64 = 2;
@@ -65,7 +65,7 @@ impl String {
     }
     
     // Append a string literal
-    fn push_str(&mut self, s: str) {
+    pub fn push_str(&mut self, s: str) {
         let s_ptr = s as i64;
         let slen = strlen(s_ptr);
         let new_len = self.len + slen;
@@ -79,7 +79,7 @@ impl String {
     }
     
     // Append another String
-    fn push_string(&mut self, s: &String) {
+    pub fn push_string(&mut self, s: &String) {
         let new_len = self.len + s.len;
         let one: i64 = 1;
         self.reserve(new_len + one);
@@ -92,7 +92,7 @@ impl String {
     }
     
     // Concatenate with a string literal and return a new String
-    fn concat(&self, s: str) -> String {
+    pub fn concat(&self, s: str) -> String {
         let s_ptr = s as i64;
         let slen = strlen(s_ptr);
         let new_len = self.len + slen;
@@ -109,7 +109,7 @@ impl String {
     }
     
     // Concatenate with another String and return a new String
-    fn concat_string(&self, s: &String) -> String {
+    pub fn concat_string(&self, s: &String) -> String {
         let new_len = self.len + s.len;
         let one: i64 = 1;
         let cap = new_len + one;
@@ -126,7 +126,7 @@ impl String {
     }
     
     // Free the string's memory
-    fn drop(&mut self) {
+    pub fn drop(&mut self) {
         free(self.ptr);
         let zero: i64 = 0;
         self.ptr = zero;
@@ -135,13 +135,22 @@ impl String {
     }
     
     // Get the raw pointer (for printing)
-    fn as_ptr(&self) -> i64 {
+    pub fn as_ptr(&self) -> i64 {
         self.ptr
+    }
+    
+    // Create a copy of this string
+    pub fn clone(&self) -> String {
+        let one: i64 = 1;
+        let cap = self.len + one;
+        let ptr = malloc(cap);
+        let _ = memcpy(ptr, self.ptr, self.len + one);
+        String { ptr: ptr, len: self.len, cap: cap }
     }
 }
 
 // Import ops for Add trait
-import "../std/ops"
+import std.ops
 
 // Implement Add for String concatenation
 impl Add for String {

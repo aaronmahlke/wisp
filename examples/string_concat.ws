@@ -1,5 +1,5 @@
-import "../std/io"
-import "../std/string"
+import std.io
+import std/string
 
 extern fn puts(s: i64) -> i32
 

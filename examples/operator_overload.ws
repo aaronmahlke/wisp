@@ -1,5 +1,5 @@
-import "../std/io"
-import "../std/ops"
+import std.io
+import std/ops
 
 struct Point {
     x: i32,

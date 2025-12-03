@@ -12,10 +12,10 @@ impl zed::Extension for WispExtension {
         _language_server_id: &LanguageServerId,
         worktree: &zed::Worktree,
     ) -> Result<zed::Command> {
-        // Try to find wisp_driver in PATH first
+        // Find wisp in PATH - it should be installed to ~/.cargo/bin/wisp
         let path = worktree
-            .which("wisp_driver")
-            .unwrap_or_else(|| "/Users/aaronmahlke/git/wisp/compiler/target/release/wisp_driver".to_string());
+            .which("wisp")
+            .ok_or_else(|| "wisp not found in PATH. Run: cargo install --path compiler/crates/wisp_driver".to_string())?;
 
         Ok(zed::Command {
             command: path,

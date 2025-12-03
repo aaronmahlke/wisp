@@ -1,6 +1,6 @@
 // Test struct return values
 
-import "../std/io"
+import std.io
 
 struct Point {
     x: i32,

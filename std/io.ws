@@ -1,15 +1,14 @@
 // Wisp Standard Library - I/O functions
 
-import "../std/string"
+import std.string
 
+// Internal C FFI - not exported
 extern fn putchar(c: i32) -> i32
 extern fn fputs(s: str, stream: i64) -> i32
-
-// macOS: stdout is a global pointer called __stdoutp
 extern static __stdoutp: i64
 
 // Display trait - types that can be printed and converted to String
-trait Display {
+pub trait Display {
     fn print(&self)
     fn to_string(&self) -> String
 }
@@ -127,17 +126,13 @@ impl Display for String {
     }
     
     fn to_string(&self) -> String {
-        // Return a copy of the string
-        let one: i64 = 1;
-        let cap = self.len + one;
-        let ptr = malloc(cap);
-        let _ = memcpy(ptr, self.ptr, self.len + one);
-        String { ptr: ptr, len: self.len, cap: cap }
+        // Return a copy of the string using the public clone method
+        self.clone()
     }
 }
 
 // Generic print function - prints any type that implements Display, with newline
-fn print<T: Display>(value: &T) {
+pub fn print<T: Display>(value: &T) {
     value.print();
     let _ = putchar(10);
 }

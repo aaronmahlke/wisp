@@ -1,4 +1,4 @@
-import "../std/io"
+import std.io
 
 // Define a trait
 trait Printable {

@@ -1,6 +1,6 @@
 // Test import system
 
-import "../std/io"
+import std.io
 
 fn main() -> i32 {
     print_i32(42)

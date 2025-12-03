@@ -1,6 +1,6 @@
 // Test struct support
 
-import "../std/io"
+import std.io
 
 struct Point {
     x: i32,

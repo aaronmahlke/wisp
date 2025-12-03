@@ -1,5 +1,4 @@
-import "../std/io"
-import "../std/string"
+import std.io.{ print }
 
 fn main() {
     // Lambda with type annotations

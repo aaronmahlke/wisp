@@ -20,6 +20,8 @@
   "extern"
   "static"
   "import"
+  "from"
+  "as"
   "defer"
   "self"
 ] @keyword
@@ -84,6 +86,22 @@
   ":"
   ";"
 ] @punctuation.delimiter
+
+; Import paths and items
+; std, pkg, @ are modules/namespaces in import paths
+(import_path "std") @module
+(import_path "pkg") @module
+(import_path "@") @module
+(import_path (identifier) @module)
+
+(import_item
+  name: (identifier) @function)
+
+(import_item
+  alias: (identifier) @function)
+
+(import_statement
+  alias: (identifier) @module)
 
 ; Types
 (primitive_type) @type.builtin
