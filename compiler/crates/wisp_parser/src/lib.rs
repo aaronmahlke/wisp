@@ -172,6 +172,7 @@ fn parse_with_imports_impl(
                         import,
                         items: cached_items.clone(),
                         module_imports: cached_imports.clone(),
+                        is_transitive: false,
                     });
                     continue;
                 }
@@ -182,6 +183,7 @@ fn parse_with_imports_impl(
                         import,
                         items: cached_items.clone(),
                         module_imports: vec![],
+                        is_transitive: false,
                     });
                     continue;
                 }
@@ -193,6 +195,7 @@ fn parse_with_imports_impl(
                         import,
                         items: vec![],
                         module_imports: vec![],
+                        is_transitive: false,
                     });
                     continue;
                 }
@@ -233,8 +236,9 @@ fn parse_with_imports_impl(
                 imports_cache.insert(canonical.clone(), (module_items.clone(), module_own_imports.clone()));
                 
                 // First, add the transitive imports as separate modules
-                // (they'll create their own namespaces)
-                for sub_module in imported_ast.imported_modules {
+                // Mark them as transitive so they don't create top-level namespaces
+                for mut sub_module in imported_ast.imported_modules {
+                    sub_module.is_transitive = true;
                     imported_modules.push(sub_module);
                 }
                 
@@ -243,6 +247,7 @@ fn parse_with_imports_impl(
                     import,
                     items: module_items,
                     module_imports: module_own_imports,
+                    is_transitive: false,
                 });
             }
             other => local_items.push(other),

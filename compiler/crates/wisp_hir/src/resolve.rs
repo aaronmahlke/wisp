@@ -87,6 +87,16 @@ impl Namespace {
     fn lookup(&self, name: &str) -> Option<DefId> {
         self.names.get(name).copied()
     }
+    
+    /// Convert to NamespaceData for the resolved program
+    fn to_namespace_data(&self) -> crate::hir::NamespaceData {
+        crate::hir::NamespaceData {
+            items: self.names.clone(),
+            children: self.children.iter()
+                .map(|(k, v)| (k.clone(), v.to_namespace_data()))
+                .collect(),
+        }
+    }
 }
 
 /// Name resolver
@@ -101,6 +111,9 @@ pub struct Resolver {
     globals: HashMap<String, DefId>,
     /// Namespaces from imports: namespace_name -> Namespace (only public items)
     namespaces: HashMap<String, Namespace>,
+    /// Top-level accessible namespaces (not transitive imports)
+    /// Only these can be accessed directly (e.g., `io.print` if `import std/io`)
+    accessible_namespaces: HashSet<String>,
     /// Per-module scopes: ModuleId -> Scope (all items in that module, public or private)
     module_scopes: HashMap<ModuleId, Scope>,
     /// Errors encountered
@@ -129,6 +142,7 @@ impl Resolver {
             defs: HashMap::new(),
             globals: HashMap::new(),
             namespaces: HashMap::new(),
+            accessible_namespaces: HashSet::new(),
             module_scopes: HashMap::new(),
             errors: Vec::new(),
             current_locals: Vec::new(),
@@ -259,9 +273,9 @@ impl Resolver {
         true
     }
     
-    /// Check if a name is a namespace
+    /// Check if a name is an accessible namespace (not a transitive import)
     fn is_namespace(&self, name: &str) -> bool {
-        self.namespaces.contains_key(name)
+        self.accessible_namespaces.contains(name)
     }
     
     /// Collect namespace path from a field access chain (e.g., std.io -> ["std", "io"])
@@ -279,10 +293,14 @@ impl Resolver {
                 if let Some(mut path) = self.collect_namespace_path(base) {
                     // Check if this field is a child namespace
                     if let Some(ns) = self.lookup_child_namespace(&path, &field.name) {
+                        eprintln!("DEBUG collect_namespace_path: path={:?}, field={}, ns.children.keys={:?}, ns.names.keys={:?}", 
+                            path, field.name, ns.children.keys().collect::<Vec<_>>(), ns.names.keys().collect::<Vec<_>>());
                         if ns.children.contains_key(&field.name) || !ns.names.is_empty() {
                             path.push(field.name.clone());
                             return Some(path);
                         }
+                    } else {
+                        eprintln!("DEBUG collect_namespace_path: lookup_child_namespace({:?}, {}) returned None", path, field.name);
                     }
                 }
                 None
@@ -533,6 +551,11 @@ impl Resolver {
         program.defs = self.defs.clone();
         program.globals = self.globals.clone();
         program.modules = std::mem::take(&mut self.modules);
+        // Export namespaces for LSP
+        program.namespaces = self.namespaces.iter()
+            .filter(|(name, _)| self.accessible_namespaces.contains(*name))
+            .map(|(name, ns)| (name.clone(), ns.to_namespace_data()))
+            .collect();
         program
     }
     
@@ -575,16 +598,26 @@ impl Resolver {
             }
             
             // Create namespace if not destructure-only
+            // For transitive imports, we still create the namespace internally
+            // but it won't be accessible at the top level - only through parent namespaces
             if !ns_name.is_empty() && !module.import.destructure_only {
                 self.namespaces.entry(ns_name.clone()).or_insert_with(Namespace::new);
                 self.current_namespace = Some(ns_name.clone());
+                
+                // Only mark as accessible if not a transitive import
+                if !module.is_transitive {
+                    self.accessible_namespaces.insert(ns_name.clone());
+                }
             }
             
             // First, process this module's imports to bring imported items into this module's scope
             for import in &module.module_imports {
                 // This module imports another module - add its public items to this module's scope
                 let imported_ns = import.path.last_segment().unwrap_or("");
+                eprintln!("DEBUG: Looking for namespace '{}' (current_namespace: {:?})", imported_ns, self.current_namespace);
+                eprintln!("DEBUG: Available namespaces: {:?}", self.namespaces.keys().collect::<Vec<_>>());
                 if let Some(ns) = self.namespaces.get(imported_ns) {
+                    eprintln!("DEBUG: Found namespace '{}' with {} items", imported_ns, ns.names.len());
                     // Add all items from the imported namespace to this module's scope
                     for (name, &def_id) in &ns.names {
                         // Check if item is public
@@ -613,9 +646,14 @@ impl Resolver {
                         };
                         
                         if let Some(parent) = self.namespaces.get_mut(parent_ns) {
+                            eprintln!("DEBUG: Adding child '{}' to namespace '{}'", child_name, parent_ns);
                             parent.children.insert(child_name, child_ns);
+                        } else {
+                            eprintln!("DEBUG: Parent namespace '{}' not found!", parent_ns);
                         }
                     }
+                } else {
+                    eprintln!("DEBUG: Namespace '{}' NOT found in self.namespaces", imported_ns);
                 }
             }
             
@@ -792,6 +830,11 @@ impl Resolver {
         program.defs = self.defs.clone();
         program.globals = self.globals.clone();
         program.modules = std::mem::take(&mut self.modules);
+        // Export namespaces for LSP
+        program.namespaces = self.namespaces.iter()
+            .filter(|(name, _)| self.accessible_namespaces.contains(*name))
+            .map(|(name, ns)| (name.clone(), ns.to_namespace_data()))
+            .collect();
         program
     }
     

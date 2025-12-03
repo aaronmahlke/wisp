@@ -1,6 +1,6 @@
 //! Wisp Language Server Protocol implementation
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::RwLock;
@@ -11,7 +11,7 @@ use tower_lsp::{Client, LanguageServer, LspService, Server};
 
 use wisp_ast::{Item, SourceFile, StructField};
 use wisp_lexer::Span;
-use wisp_parser::parse_with_imports;
+use wisp_parser::{parse_with_imports, parse_with_imports_structured};
 use wisp_hir::{DefId, Resolver};
 use wisp_borrowck::BorrowChecker;
 
@@ -34,6 +34,15 @@ struct StructInfo {
     file: String,
 }
 
+/// Information about a namespace
+#[derive(Debug, Clone, Default)]
+struct NamespaceInfo {
+    /// Items in this namespace: name -> (kind, detail)
+    items: HashMap<String, (String, String)>, // (kind like "function"/"struct", detail/signature)
+    /// Child namespaces
+    children: HashMap<String, NamespaceInfo>,
+}
+
 /// Document state stored by the LSP
 #[derive(Debug, Default)]
 struct DocumentState {
@@ -51,6 +60,8 @@ struct DocumentState {
     structs: HashMap<String, StructInfo>,
     /// Variable definitions: name -> (definition span start, definition span end)
     variable_defs: HashMap<String, (usize, usize)>,
+    /// Namespaces: namespace_name -> info
+    namespaces: HashMap<String, NamespaceInfo>,
 }
 
 /// The Wisp LSP backend
@@ -76,13 +87,30 @@ impl WispLanguageServer {
         let mut functions = HashMap::new();
         let mut structs = HashMap::new();
         let mut variable_defs = HashMap::new();
+        
+        // Preserve namespaces from previous successful analysis
+        let previous_namespaces = if let Ok(docs) = self.documents.read() {
+            docs.get(uri).map(|d| d.namespaces.clone()).unwrap_or_default()
+        } else {
+            HashMap::new()
+        };
 
         // Get file path from URI
         let file_path = uri.to_file_path().unwrap_or_else(|_| PathBuf::from("."));
         let file_str = file_path.to_string_lossy().to_string();
 
-        // Run parser with import resolution
-        let ast = match parse_with_imports(text, &file_path) {
+        // Run parser with import resolution (structured for proper namespace handling)
+        let base_dir = file_path.parent().unwrap_or(Path::new("."));
+        
+        // Debug: log the paths being used
+        self.client.log_message(MessageType::INFO, format!(
+            "LSP: Analyzing {} (base_dir: {})", 
+            file_str, 
+            base_dir.display()
+        )).await;
+        
+        let mut visited = std::collections::HashSet::new();
+        let ast_with_imports = match parse_with_imports_structured(text, base_dir, &mut visited) {
             Ok(ast) => ast,
             Err(err) => {
                 diagnostics.push(Diagnostic {
@@ -104,8 +132,45 @@ impl WispLanguageServer {
                         functions,
                         structs,
                         variable_defs,
+                        namespaces: previous_namespaces.clone(),
                     });
                 }
+                self.client.publish_diagnostics(uri.clone(), diagnostics, None).await;
+                return;
+            }
+        };
+        
+        // Extract namespace info from parser result (works even if resolution fails later)
+        let parser_namespaces = extract_namespaces_from_imports(&ast_with_imports);
+        
+        // Debug: log imported modules
+        self.client.log_message(MessageType::INFO, format!(
+            "LSP: Found {} imported modules, {} local items", 
+            ast_with_imports.imported_modules.len(),
+            ast_with_imports.local_items.len()
+        )).await;
+        for (i, module) in ast_with_imports.imported_modules.iter().enumerate() {
+            self.client.log_message(MessageType::INFO, format!(
+                "  Module {}: {:?} (transitive: {}, {} module_imports)", 
+                i,
+                module.import.path,
+                module.is_transitive,
+                module.module_imports.len()
+            )).await;
+            for imp in &module.module_imports {
+                self.client.log_message(MessageType::INFO, format!(
+                    "    - module_import: {:?} (alias: {:?})", 
+                    imp.path,
+                    imp.alias.as_ref().map(|a| &a.name)
+                )).await;
+            }
+        }
+        
+        // Also get flat AST for collecting function/struct info
+        let ast = match parse_with_imports(text, &file_path) {
+            Ok(ast) => ast,
+            Err(_) => {
+                // Already handled above, but we need the flat AST for info collection
                 self.client.publish_diagnostics(uri.clone(), diagnostics, None).await;
                 return;
             }
@@ -201,8 +266,8 @@ impl WispLanguageServer {
             }
         }
 
-        // Run name resolution
-        let resolved = match Resolver::resolve(&ast) {
+        // Run name resolution with structured imports for proper namespace handling
+        let resolved = match Resolver::resolve_with_imports(&ast_with_imports) {
             Ok(resolved) => resolved,
             Err(errors) => {
                 for err in errors {
@@ -217,12 +282,31 @@ impl WispLanguageServer {
                         functions,
                         structs,
                         variable_defs,
+                        namespaces: parser_namespaces.clone(),
                     });
                 }
                 self.client.publish_diagnostics(uri.clone(), diagnostics, None).await;
                 return;
             }
         };
+        
+        // Debug: log namespaces from resolved program
+        self.client.log_message(MessageType::INFO, format!(
+            "LSP: Resolved program has {} namespaces: {:?}", 
+            resolved.namespaces.len(),
+            resolved.namespaces.keys().collect::<Vec<_>>()
+        )).await;
+        
+        // Debug: log namespace children
+        for (ns_name, ns_data) in &resolved.namespaces {
+            self.client.log_message(MessageType::INFO, format!(
+                "LSP: Namespace '{}' has {} items, {} children: {:?}", 
+                ns_name,
+                ns_data.items.len(),
+                ns_data.children.len(),
+                ns_data.children.keys().collect::<Vec<_>>()
+            )).await;
+        }
 
         // Run type checker
         let typed = match wisp_types::TypeChecker::check(&resolved) {
@@ -230,6 +314,11 @@ impl WispLanguageServer {
             Err(errors) => {
                 for err in errors {
                     diagnostics.push(span_to_diagnostic(text, err.span, &err.message, DiagnosticSeverity::ERROR));
+                }
+                // Collect namespace info even on type error
+                let mut namespaces = HashMap::new();
+                for (ns_name, ns_data) in &resolved.namespaces {
+                    namespaces.insert(ns_name.clone(), convert_namespace_data(ns_data, &resolved));
                 }
                 if let Ok(mut docs) = self.documents.write() {
                     docs.insert(uri.clone(), DocumentState {
@@ -240,6 +329,7 @@ impl WispLanguageServer {
                         functions,
                         structs,
                         variable_defs,
+                        namespaces,
                     });
                 }
                 self.client.publish_diagnostics(uri.clone(), diagnostics, None).await;
@@ -281,6 +371,12 @@ impl WispLanguageServer {
         
         // Collect variable definitions for go-to-definition
         collect_variable_defs(&typed, &mut variable_defs, source_len);
+        
+        // Collect namespace info from resolved program
+        let mut namespaces = HashMap::new();
+        for (ns_name, ns_data) in &resolved.namespaces {
+            namespaces.insert(ns_name.clone(), convert_namespace_data(ns_data, &resolved));
+        }
 
         // Run borrow checker
         let checker = BorrowChecker::new(&typed);
@@ -300,6 +396,7 @@ impl WispLanguageServer {
                 functions,
                 structs,
                 variable_defs,
+                namespaces,
             });
         }
 
@@ -538,6 +635,30 @@ impl LanguageServer for WispLanguageServer {
                 
                 // Check if we're inside a struct literal (look for StructName { before cursor)
                 let before_cursor = &doc.source[..offset];
+                
+                // Debug: log completion context
+                eprintln!("LSP Completion: offset={}, before_cursor ends with: {:?}", 
+                    offset, 
+                    before_cursor.chars().rev().take(20).collect::<String>().chars().rev().collect::<String>());
+                eprintln!("LSP Completion: namespaces available: {:?}", doc.namespaces.keys().collect::<Vec<_>>());
+                
+                // Check if we're in an import statement
+                if let Some(import_context) = find_import_context(before_cursor) {
+                    eprintln!("LSP Completion: import context: {:?}", import_context);
+                    let suggestions = get_import_suggestions(&import_context);
+                    for (name, kind) in suggestions {
+                        items.push(CompletionItem {
+                            label: name.clone(),
+                            kind: Some(kind),
+                            sort_text: Some(format!("0{}", name)),
+                            ..Default::default()
+                        });
+                    }
+                    if !items.is_empty() {
+                        return Ok(Some(CompletionResponse::Array(items)));
+                    }
+                }
+                
                 if let Some(struct_context) = find_struct_literal_context(before_cursor) {
                     // We're inside a struct literal, suggest fields
                     if let Some(struct_info) = doc.structs.get(&struct_context) {
@@ -551,6 +672,49 @@ impl LanguageServer for WispLanguageServer {
                             });
                         }
                         return Ok(Some(CompletionResponse::Array(items)));
+                    }
+                }
+                
+                // Check if we're accessing a namespace (e.g., std. or io.)
+                let ns_context = find_namespace_context(before_cursor);
+                eprintln!("LSP Completion: find_namespace_context returned: {:?}", ns_context);
+                
+                if let Some(ns_path) = ns_context {
+                    eprintln!("LSP Completion: Looking up namespace path {:?}", ns_path);
+                    // Look up the namespace
+                    if let Some(ns_info) = lookup_namespace_path(&doc.namespaces, &ns_path) {
+                        eprintln!("LSP Completion: Found namespace with {} items, {} children", 
+                            ns_info.items.len(), ns_info.children.len());
+                        // Suggest items from this namespace
+                        for (name, (kind, _detail)) in &ns_info.items {
+                            let completion_kind = match kind.as_str() {
+                                "function" | "extern fn" => CompletionItemKind::FUNCTION,
+                                "struct" => CompletionItemKind::STRUCT,
+                                "enum" => CompletionItemKind::ENUM,
+                                "trait" => CompletionItemKind::INTERFACE,
+                                _ => CompletionItemKind::VARIABLE,
+                            };
+                            items.push(CompletionItem {
+                                label: name.clone(),
+                                kind: Some(completion_kind),
+                                detail: Some(kind.clone()),
+                                sort_text: Some(format!("0{}", name)), // Sort before keywords
+                                ..Default::default()
+                            });
+                        }
+                        // Suggest child namespaces
+                        for child_name in ns_info.children.keys() {
+                            items.push(CompletionItem {
+                                label: child_name.clone(),
+                                kind: Some(CompletionItemKind::MODULE),
+                                detail: Some("namespace".to_string()),
+                                sort_text: Some(format!("0{}", child_name)),
+                                ..Default::default()
+                            });
+                        }
+                        if !items.is_empty() {
+                            return Ok(Some(CompletionResponse::Array(items)));
+                        }
                     }
                 }
                 
@@ -572,6 +736,16 @@ impl LanguageServer for WispLanguageServer {
                             return Ok(Some(CompletionResponse::Array(items)));
                         }
                     }
+                }
+                
+                // Suggest top-level namespaces
+                for ns_name in doc.namespaces.keys() {
+                    items.push(CompletionItem {
+                        label: ns_name.clone(),
+                        kind: Some(CompletionItemKind::MODULE),
+                        detail: Some("namespace".to_string()),
+                        ..Default::default()
+                    });
                 }
                 
                 // Default: suggest all functions, structs, and keywords
@@ -727,6 +901,170 @@ fn find_function_call_context(text: &str) -> Option<String> {
         }
     }
     None
+}
+
+/// Find if we're after a namespace dot (e.g., "std." or "std.io.")
+/// Returns the namespace path as a vector of segments
+fn find_namespace_context(text: &str) -> Option<Vec<String>> {
+    // Look for pattern: identifier. or identifier.identifier. etc. at the end
+    let trimmed = text.trim_end();
+    if !trimmed.ends_with('.') {
+        return None;
+    }
+    
+    // Get the part before the last dot
+    let before_dot = &trimmed[..trimmed.len() - 1];
+    
+    // Collect the namespace path by going backwards through dots
+    let mut path = Vec::new();
+    let mut current = before_dot;
+    
+    loop {
+        // Find the last identifier
+        let word_start = current.rfind(|c: char| !c.is_alphanumeric() && c != '_')
+            .map(|i| i + 1)
+            .unwrap_or(0);
+        let word = &current[word_start..];
+        
+        if word.is_empty() {
+            break;
+        }
+        
+        path.push(word.to_string());
+        
+        // Check if there's a dot before this word
+        let before_word = current[..word_start].trim_end();
+        if before_word.ends_with('.') {
+            current = &before_word[..before_word.len() - 1];
+        } else {
+            break;
+        }
+    }
+    
+    if path.is_empty() {
+        None
+    } else {
+        path.reverse();
+        Some(path)
+    }
+}
+
+/// Look up a namespace by path
+fn lookup_namespace_path<'a>(namespaces: &'a HashMap<String, NamespaceInfo>, path: &[String]) -> Option<&'a NamespaceInfo> {
+    if path.is_empty() {
+        return None;
+    }
+    
+    let mut current = namespaces.get(&path[0])?;
+    for segment in &path[1..] {
+        current = current.children.get(segment)?;
+    }
+    Some(current)
+}
+
+/// Detect if we're in an import statement and return the current path prefix
+/// Returns: Some((prefix, after_slash)) where prefix is "std", "@", "pkg" and after_slash is what's typed after
+fn find_import_context(text: &str) -> Option<(String, String)> {
+    // Look for "import " or "import { ... } from " pattern
+    let trimmed = text.trim_end();
+    
+    // Check if we're after "import "
+    if let Some(import_pos) = trimmed.rfind("import ") {
+        let after_import = &trimmed[import_pos + 7..]; // Skip "import "
+        
+        // Skip if we're in destructure syntax: import { ... } from
+        if after_import.starts_with('{') {
+            // Check for "from" pattern
+            if let Some(from_pos) = after_import.rfind("from ") {
+                let after_from = &after_import[from_pos + 5..];
+                return parse_import_path(after_from);
+            }
+            return None;
+        }
+        
+        return parse_import_path(after_import);
+    }
+    
+    None
+}
+
+/// Parse an import path and return (prefix, typed_after_slash)
+fn parse_import_path(path: &str) -> Option<(String, String)> {
+    let path = path.trim();
+    
+    if path.starts_with("std/") {
+        Some(("std".to_string(), path[4..].to_string()))
+    } else if path.starts_with("std") && !path.contains('/') {
+        // Just "std" without /
+        Some(("std".to_string(), String::new()))
+    } else if path.starts_with("@/") {
+        Some(("@".to_string(), path[2..].to_string()))
+    } else if path.starts_with("@") && !path.contains('/') {
+        Some(("@".to_string(), String::new()))
+    } else if path.starts_with("pkg/") {
+        // pkg/name/subpath
+        Some(("pkg".to_string(), path[4..].to_string()))
+    } else if path.is_empty() {
+        // Just "import " - suggest prefixes
+        Some(("".to_string(), String::new()))
+    } else {
+        None
+    }
+}
+
+/// Get import suggestions based on context
+fn get_import_suggestions(context: &(String, String)) -> Vec<(String, CompletionItemKind)> {
+    let (prefix, typed) = context;
+    let mut suggestions = Vec::new();
+    
+    if prefix.is_empty() {
+        // Suggest import prefixes
+        suggestions.push(("std".to_string(), CompletionItemKind::MODULE));
+        suggestions.push(("@".to_string(), CompletionItemKind::MODULE));
+        suggestions.push(("pkg".to_string(), CompletionItemKind::MODULE));
+    } else if prefix == "std" {
+        // Suggest std library modules
+        let std_modules = ["io", "string", "ops"];
+        for module in std_modules {
+            if typed.is_empty() || module.starts_with(typed) {
+                suggestions.push((module.to_string(), CompletionItemKind::MODULE));
+            }
+        }
+    } else if prefix == "@" {
+        // For project-local imports, we'd need to scan the filesystem
+        // For now, just indicate it's for local imports
+        suggestions.push(("(project modules)".to_string(), CompletionItemKind::TEXT));
+    } else if prefix == "pkg" {
+        // For package imports, we'd need package info
+        suggestions.push(("(package name)".to_string(), CompletionItemKind::TEXT));
+    }
+    
+    suggestions
+}
+
+/// Convert NamespaceData from HIR to LSP NamespaceInfo
+fn convert_namespace_data(data: &wisp_hir::NamespaceData, resolved: &wisp_hir::ResolvedProgram) -> NamespaceInfo {
+    let mut items = HashMap::new();
+    for (name, def_id) in &data.items {
+        if let Some(def_info) = resolved.defs.get(def_id) {
+            let kind = match def_info.kind {
+                wisp_hir::DefKind::Function => "function",
+                wisp_hir::DefKind::Struct => "struct",
+                wisp_hir::DefKind::Enum => "enum",
+                wisp_hir::DefKind::Trait => "trait",
+                wisp_hir::DefKind::ExternFunction => "extern fn",
+                wisp_hir::DefKind::ExternStatic => "extern static",
+                _ => "item",
+            };
+            items.insert(name.clone(), (kind.to_string(), def_info.name.clone()));
+        }
+    }
+    
+    let children = data.children.iter()
+        .map(|(k, v)| (k.clone(), convert_namespace_data(v, resolved)))
+        .collect();
+    
+    NamespaceInfo { items, children }
 }
 
 /// Get the word at a given offset in the source
@@ -1095,6 +1433,86 @@ fn collect_expr_variable_defs(
             collect_block_variable_defs(body, variable_defs, source_len);
         }
         _ => {}
+    }
+}
+
+/// Extract namespace information from parsed imports
+/// This works even when resolution fails, giving us basic namespace structure for completion
+fn extract_namespaces_from_imports(source: &wisp_ast::SourceFileWithImports) -> HashMap<String, NamespaceInfo> {
+    let mut namespaces = HashMap::new();
+    
+    // Find the direct (non-transitive) import of std or other top-level namespace
+    for module in &source.imported_modules {
+        if module.is_transitive {
+            continue;
+        }
+        
+        // Get the namespace name for this direct import
+        let ns_name = if let Some(ref alias) = module.import.alias {
+            alias.name.clone()
+        } else {
+            module.import.path.last_segment()
+                .map(|s| s.to_string())
+                .unwrap_or_default()
+        };
+        
+        if ns_name.is_empty() || module.import.destructure_only {
+            continue;
+        }
+        
+        // Create namespace info
+        let mut ns_info = NamespaceInfo::default();
+        
+        // Add children from module_imports (e.g., `pub import std/io as io` in std/mod.ws)
+        for sub_import in &module.module_imports {
+            let child_name = if let Some(ref alias) = sub_import.alias {
+                alias.name.clone()
+            } else {
+                sub_import.path.last_segment()
+                    .map(|s| s.to_string())
+                    .unwrap_or_default()
+            };
+            
+            if !child_name.is_empty() {
+                // Create a child namespace (we don't have full item info, just the structure)
+                let mut child_info = NamespaceInfo::default();
+                
+                // Try to find items for this child from other transitive imports
+                for transitive in &source.imported_modules {
+                    if transitive.is_transitive {
+                        let transitive_name = transitive.import.path.last_segment()
+                            .map(|s| s.to_string())
+                            .unwrap_or_default();
+                        if transitive_name == child_name {
+                            // Add items from this module
+                            for item in &transitive.items {
+                                if let Some((name, kind)) = get_item_name_and_kind(item) {
+                                    child_info.items.insert(name, (kind, String::new()));
+                                }
+                            }
+                        }
+                    }
+                }
+                
+                ns_info.children.insert(child_name, child_info);
+            }
+        }
+        
+        namespaces.insert(ns_name, ns_info);
+    }
+    
+    namespaces
+}
+
+/// Get the name and kind of an item for namespace info
+fn get_item_name_and_kind(item: &wisp_ast::Item) -> Option<(String, String)> {
+    match item {
+        wisp_ast::Item::Function(f) => Some((f.name.name.clone(), "function".to_string())),
+        wisp_ast::Item::ExternFunction(f) => Some((f.name.name.clone(), "extern fn".to_string())),
+        wisp_ast::Item::Struct(s) => Some((s.name.name.clone(), "struct".to_string())),
+        wisp_ast::Item::Enum(e) => Some((e.name.name.clone(), "enum".to_string())),
+        wisp_ast::Item::Trait(t) => Some((t.name.name.clone(), "trait".to_string())),
+        _ => None,
     }
 }
 

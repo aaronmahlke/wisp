@@ -115,6 +115,15 @@ impl ModuleRegistry {
     }
 }
 
+/// Namespace information for LSP
+#[derive(Debug, Clone, Default)]
+pub struct NamespaceData {
+    /// Items in this namespace: name -> DefId
+    pub items: HashMap<String, DefId>,
+    /// Child namespaces
+    pub children: HashMap<String, NamespaceData>,
+}
+
 /// The resolved program with all definitions
 #[derive(Debug)]
 pub struct ResolvedProgram {
@@ -138,6 +147,8 @@ pub struct ResolvedProgram {
     pub extern_functions: Vec<ResolvedExternFunction>,
     /// External static variable declarations
     pub extern_statics: Vec<ResolvedExternStatic>,
+    /// Namespaces for LSP completion
+    pub namespaces: HashMap<String, NamespaceData>,
 }
 
 impl ResolvedProgram {
@@ -186,6 +197,7 @@ impl ResolvedProgram {
             functions: Vec::new(),
             extern_functions: Vec::new(),
             extern_statics: Vec::new(),
+            namespaces: HashMap::new(),
         }
     }
 

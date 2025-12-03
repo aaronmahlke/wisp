@@ -18,6 +18,9 @@ pub struct ImportedModule {
     pub items: Vec<Item>,
     /// Imports declared within this module (for scope resolution)
     pub module_imports: Vec<ImportDecl>,
+    /// If true, this module was imported transitively through another module
+    /// and should NOT create a top-level namespace
+    pub is_transitive: bool,
 }
 
 /// A source file with import information preserved
