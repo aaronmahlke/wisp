@@ -56,7 +56,7 @@
         },
         {
           "type": "SYMBOL",
-          "name": "string"
+          "name": "string_literal"
         }
       ]
     },
@@ -3208,7 +3208,7 @@
         },
         {
           "type": "SYMBOL",
-          "name": "string"
+          "name": "string_literal"
         },
         {
           "type": "SYMBOL",
@@ -3251,7 +3251,7 @@
         "value": "[0-9][0-9_]*\\.[0-9][0-9_]*([eE][+-]?[0-9_]+)?"
       }
     },
-    "string": {
+    "string_literal": {
       "type": "SEQ",
       "members": [
         {

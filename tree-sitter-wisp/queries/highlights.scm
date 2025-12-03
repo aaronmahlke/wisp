@@ -138,7 +138,7 @@
 ; Literals
 (integer_literal) @number
 (float_literal) @number.float
-(string) @string
+(string_literal) @string
 (string_content) @string
 (char_literal) @character
 (escape_sequence) @string.escape

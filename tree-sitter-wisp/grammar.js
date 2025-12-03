@@ -36,7 +36,7 @@ module.exports = grammar({
     // Import statement
     import_statement: $ => seq(
       'import',
-      $.string,
+      $.string_literal,
     ),
 
     // Extern declarations
@@ -549,7 +549,7 @@ module.exports = grammar({
     _literal: $ => choice(
       $.integer_literal,
       $.float_literal,
-      $.string,
+      $.string_literal,
       $.char_literal,
       $.boolean_literal,
     ),
@@ -565,7 +565,7 @@ module.exports = grammar({
       /[0-9][0-9_]*\.[0-9][0-9_]*([eE][+-]?[0-9_]+)?/,
     ),
 
-    string: $ => seq(
+    string_literal: $ => seq(
       '"',
       repeat(choice(
         $.string_content,
