@@ -14,6 +14,9 @@
   "trait"
   "impl"
   "for"
+  "in"
+  "match"
+  "as"
   "pub"
   "extern"
   "static"
@@ -135,10 +138,16 @@
 ; Literals
 (integer_literal) @number
 (float_literal) @number.float
-(string_literal) @string
+(string) @string
+(string_content) @string
 (char_literal) @character
 (escape_sequence) @string.escape
 (boolean_literal) @constant.builtin
+
+; String interpolation delimiters
+(interpolation
+  "{" @punctuation.special
+  "}" @punctuation.special)
 
 ; Comments
 (line_comment) @comment

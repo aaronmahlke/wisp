@@ -8,6 +8,7 @@ pub struct Parser<'src> {
     tokens: Vec<SpannedToken>,
     pos: usize,
     source: &'src str,
+    errors: Vec<ParseError>,
 }
 
 #[derive(Debug, Clone)]
@@ -25,6 +26,13 @@ impl std::fmt::Display for ParseError {
 impl std::error::Error for ParseError {}
 
 pub type ParseResult<T> = Result<T, ParseError>;
+
+/// Result type for error-recovering parsing that returns both the AST and any errors
+#[derive(Debug)]
+pub struct ParseResultWithErrors<T> {
+    pub ast: T,
+    pub errors: Vec<ParseError>,
+}
 
 /// Parse a file and recursively resolve imports
 /// 
@@ -153,12 +161,50 @@ fn parse_with_imports_impl(
     
     for item in ast.items {
         match item {
-            Item::Import(import) => {
+            Item::Import(mut import) => {
                 // Track this import for scope resolution
                 local_imports.push(import.clone());
                 
                 // Resolve import path based on type
                 let import_path = resolve_import_path(&import.path, base_dir, &config)?;
+                
+                // Check if we resolved to a parent module (item import case)
+                // e.g., `import std.io.print` resolved to `std/io.ws`
+                let item_name = detect_item_import(&import.path, &import_path);
+                if let Some(item_name_str) = item_name {
+                    // Transform this import to a destructure import
+                    // `import std.io.print` becomes effectively `import std.io { print }`
+                    let item_ident = Ident {
+                        name: item_name_str.clone(),
+                        span: import.span,
+                    };
+                    import.items = Some(vec![ImportItem {
+                        name: item_ident.clone(),
+                        alias: import.alias.clone(), // If there was an alias, apply it to the item
+                        span: import.span,
+                    }]);
+                    import.destructure_only = true;
+                    import.alias = None; // Clear the alias since it's now on the item
+                    
+                    // Update the path to be the parent module
+                    import.path = match import.path {
+                        ImportPath::Std(ref segs) => {
+                            let mut parent_segs = segs.clone();
+                            parent_segs.pop();
+                            ImportPath::Std(parent_segs)
+                        }
+                        ImportPath::Project(ref segs) => {
+                            let mut parent_segs = segs.clone();
+                            parent_segs.pop();
+                            ImportPath::Project(parent_segs)
+                        }
+                        ImportPath::Package(ref name, ref segs) => {
+                            let mut parent_segs = segs.clone();
+                            parent_segs.pop();
+                            ImportPath::Package(name.clone(), parent_segs)
+                        }
+                    };
+                }
                 
                 let canonical = match import_path.canonicalize() {
                     Ok(c) => c,
@@ -261,7 +307,35 @@ fn parse_with_imports_impl(
 }
 
 /// Resolve an import path to a file system path
+/// Detect if an import path was resolved to a parent module, indicating an item import
+/// e.g., `import std.io.print` where path has ["std", "io", "print"] but resolved to `std/io.ws`
+/// Returns Some("print") if this is an item import
+fn detect_item_import(path: &ImportPath, resolved_path: &Path) -> Option<String> {
+    let segments = match path {
+        ImportPath::Std(segs) | ImportPath::Project(segs) | ImportPath::Package(_, segs) => segs,
+    };
+    
+    if segments.is_empty() {
+        return None;
+    }
+    
+    // Get the last segment (potential item name)
+    let last_seg = segments.last()?;
+    
+    // Check if the resolved path doesn't include this last segment
+    // e.g., path is ["std", "io", "print"] but resolved is "std/io.ws"
+    let resolved_stem = resolved_path.file_stem()?.to_str()?;
+    
+    // If the last segment doesn't match the resolved file stem, it's an item import
+    if last_seg != resolved_stem && resolved_stem != "mod" {
+        return Some(last_seg.clone());
+    }
+    
+    None
+}
+
 fn resolve_import_path(path: &ImportPath, _base_dir: &Path, config: &ImportConfig) -> Result<PathBuf, String> {
+    // Try to resolve as a module path first
     let resolved = match path {
         ImportPath::Std(segments) => {
             let mut p = config.std_path.clone();
@@ -301,7 +375,76 @@ fn resolve_import_path(path: &ImportPath, _base_dir: &Path, config: &ImportConfi
         }
     };
     
-    Ok(resolved)
+    // If the file exists, we're done
+    if resolved.exists() {
+        return Ok(resolved);
+    }
+    
+    // Otherwise, maybe the last segment is an item name, not a module
+    // Try removing the last segment and resolving as a module
+    // e.g., `import std.io.print` -> try `std/io.ws` and import `print` from it
+    let parent_path = match path {
+        ImportPath::Std(segments) | ImportPath::Project(segments) | ImportPath::Package(_, segments) => {
+            if segments.len() > 1 {
+                let mut parent_segs = segments.clone();
+                parent_segs.pop();
+                match path {
+                    ImportPath::Std(_) => ImportPath::Std(parent_segs),
+                    ImportPath::Project(_) => ImportPath::Project(parent_segs),
+                    ImportPath::Package(pkg, _) => ImportPath::Package(pkg.clone(), parent_segs),
+                }
+            } else {
+                // Can't go further up
+                return Ok(resolved);
+            }
+        }
+    };
+    
+    // Try to resolve the parent path
+    let parent_resolved = match &parent_path {
+        ImportPath::Std(segments) => {
+            let mut p = config.std_path.clone();
+            if segments.is_empty() {
+                p.join("mod.ws")
+            } else {
+                for seg in segments {
+                    p = p.join(seg);
+                }
+                p.with_extension("ws")
+            }
+        }
+        ImportPath::Project(segments) => {
+            let mut p = config.project_root.clone();
+            if segments.is_empty() {
+                p.join("mod.ws")
+            } else {
+                for seg in segments {
+                    p = p.join(seg);
+                }
+                p.with_extension("ws")
+            }
+        }
+        ImportPath::Package(name, segments) => {
+            let mut p = config.project_root.join("packages").join(name);
+            if segments.is_empty() {
+                p.join("mod.ws")
+            } else {
+                for seg in segments {
+                    p = p.join(seg);
+                }
+                p.with_extension("ws")
+            }
+        }
+    };
+    
+    if parent_resolved.exists() {
+        // The parent module exists, so the last segment is likely an item name
+        // We'll resolve to the parent module, and the resolver will handle the item
+        Ok(parent_resolved)
+    } else {
+        // Neither interpretation works, return the original
+        Ok(resolved)
+    }
 }
 
 /// Format an import path for error messages
@@ -323,12 +466,22 @@ impl<'src> Parser<'src> {
     pub fn new(source: &'src str) -> ParseResult<Self> {
         let tokens = Lexer::tokenize(source)
             .map_err(|e| ParseError { message: e.message, span: e.span })?;
-        Ok(Self { tokens, pos: 0, source })
+        Ok(Self { tokens, pos: 0, source, errors: Vec::new() })
     }
 
     pub fn parse(source: &str) -> ParseResult<SourceFile> {
         let mut parser = Parser::new(source)?;
         parser.parse_source_file()
+    }
+    
+    /// Parse with error recovery - returns partial AST and all parse errors
+    pub fn parse_with_recovery(source: &str) -> Result<ParseResultWithErrors<SourceFile>, ParseError> {
+        let mut parser = Parser::new(source)?;
+        let ast = parser.parse_source_file()?;
+        Ok(ParseResultWithErrors {
+            ast,
+            errors: parser.errors,
+        })
     }
 
     // === Token Access ===
@@ -400,10 +553,44 @@ impl<'src> Parser<'src> {
 
     fn parse_source_file(&mut self) -> ParseResult<SourceFile> {
         let mut items = Vec::new();
+        let mut errors = Vec::new();
         
         while !self.is_at_end() {
-            items.push(self.parse_item()?);
+            match self.parse_item() {
+                Ok(item) => {
+                    items.push(item);
+                }
+                Err(err) => {
+                    // Record the error and try to continue parsing
+                    errors.push(err);
+                    
+                    // Skip to next likely item start (next line with 'import', 'fn', 'struct', etc.)
+                    // or advance at least one token to avoid infinite loop
+                    self.advance();
+                    
+                    // Try to recover by finding the next top-level keyword
+                    while !self.is_at_end() {
+                        match self.peek() {
+                            Token::Import | Token::Fn | Token::Extern | Token::Struct |
+                            Token::Enum | Token::Trait | Token::Impl | Token::Pub => {
+                                break; // Found a potential item start
+                            }
+                            _ => {
+                                self.advance();
+                            }
+                        }
+                    }
+                }
+            }
         }
+        
+        // If we couldn't parse anything, return the first error as a hard failure
+        if items.is_empty() && !errors.is_empty() {
+            return Err(errors.into_iter().next().unwrap());
+        }
+        
+        // Store errors in the parser for retrieval
+        self.errors = errors;
         
         Ok(SourceFile { items })
     }
@@ -492,7 +679,8 @@ impl<'src> Parser<'src> {
             return self.parse_destructure_import(start, is_pub);
         }
         
-        // Parse path: std/io, @/utils/math, or pkg/name/sub
+        // Parse path: std.io, @.utils.math, etc.
+        // This might include an item at the end: std.io.print
         let path = self.parse_import_path()?;
         
         // Check for alias: import std.io as stdio

@@ -1,5 +1,5 @@
 import std.io.{ print }
-import { String } from std.string
+import std.string.{ String }
 
 fn main() {
     // Basic for loop with range
@@ -7,14 +7,14 @@ fn main() {
     for i in 0..5 {
         print(&"  {i}");
     }
-    
+
     // Countdown (using arithmetic)
     print(&"Countdown:");
     for i in 0..5 {
         let n = 4 - i;
         print(&"  {n}");
     }
-    
+
     // Nested loops - print a triangle
     print(&"Triangle:");
     for row in 1..6 {

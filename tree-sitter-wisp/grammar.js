@@ -16,6 +16,7 @@ module.exports = grammar({
     [$.block, $.struct_expression],
     [$.identifier, $.field_initializer],
     [$.method_call_expression, $.field_expression],
+    [$.cast_expression, $.lambda_expression],
   ],
 
   rules: {
@@ -35,7 +36,7 @@ module.exports = grammar({
     // Import statement
     import_statement: $ => seq(
       'import',
-      $.string_literal,
+      $.string,
     ),
 
     // Extern declarations
@@ -220,10 +221,10 @@ module.exports = grammar({
       '()',
     ),
 
-    named_type: $ => seq(
+    named_type: $ => prec.left(seq(
       field('name', choice($.identifier, 'Self')),
       optional(field('type_arguments', $.type_arguments)),
-    ),
+    )),
 
     type_arguments: $ => seq(
       '<',
@@ -272,12 +273,12 @@ module.exports = grammar({
     lifetime: $ => seq('@', $.identifier),
 
     // Statements
-    block: $ => seq(
+    block: $ => prec(1, seq(
       '{',
       repeat($._statement),
       optional($._expression),
       '}',
-    ),
+    )),
 
     _statement: $ => choice(
       $.let_statement,
@@ -297,7 +298,7 @@ module.exports = grammar({
 
     expression_statement: $ => seq(
       $._expression,
-      ';',
+      optional(';'),
     ),
 
     return_statement: $ => seq(
@@ -326,11 +327,15 @@ module.exports = grammar({
       $.dereference_expression,
       $.assignment_expression,
       $.compound_assignment_expression,
+      $.cast_expression,
       $.if_expression,
       $.while_expression,
+      $.for_expression,
       $.loop_expression,
+      $.match_expression,
       $.break_expression,
       $.continue_expression,
+      $.lambda_expression,
       $.block,
       $.struct_expression,
       $.tuple_expression,
@@ -450,6 +455,56 @@ module.exports = grammar({
 
     continue_expression: $ => 'continue',
 
+    cast_expression: $ => prec.left(1, seq(
+      field('value', $._expression),
+      'as',
+      field('type', $._type),
+    )),
+
+    for_expression: $ => seq(
+      'for',
+      field('pattern', $.identifier),
+      'in',
+      field('iterator', $._expression),
+      field('body', $.block),
+    ),
+
+    match_expression: $ => seq(
+      'match',
+      field('value', $._expression),
+      '{',
+      repeat($.match_arm),
+      '}',
+    ),
+
+    match_arm: $ => prec.right(seq(
+      field('pattern', $.match_pattern),
+      '->',
+      field('value', $._expression),
+      optional(','),
+    )),
+
+    match_pattern: $ => choice(
+      $.identifier,
+      $.integer_literal,
+      $.boolean_literal,
+      '_',
+    ),
+
+    lambda_expression: $ => prec(1, seq(
+      '|',
+      optional(seq(
+        $.identifier,
+        repeat(seq(',', $.identifier)),
+        optional(','),
+      )),
+      '|',
+      choice(
+        $._expression,
+        $.block,
+      ),
+    )),
+
     struct_expression: $ => prec(1, seq(
       optional(seq(field('name', $.identifier), '::')),
       '{',
@@ -494,7 +549,7 @@ module.exports = grammar({
     _literal: $ => choice(
       $.integer_literal,
       $.float_literal,
-      $.string_literal,
+      $.string,
       $.char_literal,
       $.boolean_literal,
     ),
@@ -510,13 +565,22 @@ module.exports = grammar({
       /[0-9][0-9_]*\.[0-9][0-9_]*([eE][+-]?[0-9_]+)?/,
     ),
 
-    string_literal: $ => seq(
+    string: $ => seq(
       '"',
       repeat(choice(
+        $.string_content,
+        $.interpolation,
         $.escape_sequence,
-        /[^"\\]+/,
       )),
       '"',
+    ),
+
+    string_content: $ => token.immediate(prec(1, /[^"{\\]+/)),
+
+    interpolation: $ => seq(
+      token.immediate('{'),
+      field('expression', $._expression),
+      '}',
     ),
 
     char_literal: $ => seq(

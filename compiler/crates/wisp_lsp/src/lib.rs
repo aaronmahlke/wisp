@@ -12,7 +12,7 @@ use tower_lsp::{Client, LanguageServer, LspService, Server};
 
 use wisp_ast::{Item, SourceFile, StructField};
 use wisp_lexer::Span;
-use wisp_parser::{parse_with_imports, parse_with_imports_structured};
+use wisp_parser::{parse_with_imports, parse_with_imports_structured, Parser};
 use wisp_hir::{DefId, Resolver};
 use wisp_borrowck::BorrowChecker;
 
@@ -30,6 +30,15 @@ struct FunctionInfo {
 struct StructInfo {
     name: String,
     fields: Vec<(String, String)>, // (name, type)
+    definition: String,
+    span: Span,
+    file: String,
+}
+
+#[derive(Debug, Clone)]
+struct TraitInfo {
+    name: String,
+    methods: Vec<String>, // Method signatures
     definition: String,
     span: Span,
     file: String,
@@ -59,6 +68,8 @@ struct DocumentState {
     functions: HashMap<String, FunctionInfo>,
     /// Structs: name -> info
     structs: HashMap<String, StructInfo>,
+    /// Traits: name -> info
+    traits: HashMap<String, TraitInfo>,
     /// Variable definitions: name -> (definition span start, definition span end)
     variable_defs: HashMap<String, (usize, usize)>,
     /// Namespaces: namespace_name -> info
@@ -87,6 +98,7 @@ impl WispLanguageServer {
         let mut def_spans = HashMap::new();
         let mut functions = HashMap::new();
         let mut structs = HashMap::new();
+        let mut traits = HashMap::new();
         let mut variable_defs = HashMap::new();
         
         // Preserve namespaces from previous successful analysis
@@ -110,6 +122,20 @@ impl WispLanguageServer {
             base_dir.display()
         )).await;
         
+        // First, try to parse with error recovery to collect all parse errors
+        if let Ok(parse_result) = Parser::parse_with_recovery(text) {
+            // Add all parse errors as diagnostics
+            for err in &parse_result.errors {
+                diagnostics.push(Diagnostic {
+                    range: offset_to_range(text, err.span.start, err.span.end),
+                    severity: Some(DiagnosticSeverity::ERROR),
+                    source: Some("wisp".to_string()),
+                    message: err.message.clone(),
+                    ..Default::default()
+                });
+            }
+        }
+        
         let mut visited = std::collections::HashSet::new();
         let ast_with_imports = match parse_with_imports_structured(text, base_dir, &mut visited) {
             Ok(ast) => ast,
@@ -125,16 +151,22 @@ impl WispLanguageServer {
                     ..Default::default()
                 });
                 if let Ok(mut docs) = self.documents.write() {
-                    docs.insert(uri.clone(), DocumentState {
-                        source: text.to_string(),
-                        type_info,
-                        span_definitions,
-                        def_spans,
-                        functions,
-                        structs,
-                        variable_defs,
-                        namespaces: previous_namespaces.clone(),
-                    });
+                    // Keep old document state but update source
+                    if let Some(old_doc) = docs.get_mut(uri) {
+                        old_doc.source = text.to_string();
+                    } else {
+                        docs.insert(uri.clone(), DocumentState {
+                            source: text.to_string(),
+                            type_info,
+                            span_definitions,
+                            def_spans,
+                            functions,
+                            structs,
+                            traits,
+                            variable_defs,
+                            namespaces: previous_namespaces.clone(),
+                        });
+                    }
                 }
                 self.client.publish_diagnostics(uri.clone(), diagnostics, None).await;
                 return;
@@ -143,6 +175,53 @@ impl WispLanguageServer {
         
         // Extract namespace info from parser result (works even if resolution fails later)
         let parser_namespaces = extract_namespaces_from_imports(&ast_with_imports);
+        
+        // Collect traits from imported modules NOW (before the flat parse might fail)
+        // This ensures traits are available even if the current file has parse errors
+        for module in &ast_with_imports.imported_modules {
+            for item in &module.items {
+                if let Item::Trait(t) = item {
+                    if t.is_pub {
+                        let methods: Vec<String> = t.methods.iter()
+                            .map(|m| {
+                                let params: Vec<String> = m.params.iter()
+                                    .map(|p| {
+                                        if p.name.name == "self" {
+                                            // Use shorthand: &Self -> &self, &mut Self -> &mut self, Self -> self
+                                            let ty_str = p.ty.pretty_print();
+                                            if ty_str.starts_with("&mut ") {
+                                                "&mut self".to_string()
+                                            } else if ty_str.starts_with("&") {
+                                                "&self".to_string()
+                                            } else {
+                                                "self".to_string()
+                                            }
+                                        } else {
+                                            format!("{}: {}", p.name.name, p.ty.pretty_print())
+                                        }
+                                    })
+                                    .collect();
+                                let ret = m.return_type.as_ref()
+                                    .map(|ty| format!(" -> {}", ty.pretty_print()))
+                                    .unwrap_or_default();
+                                format!("    fn {}({}){}", m.name.name, params.join(", "), ret)
+                            })
+                            .collect();
+                        let definition = format!("trait {} {{\n{}\n}}", t.name.name, methods.join("\n"));
+                        traits.insert(
+                            t.name.name.clone(),
+                            TraitInfo {
+                                name: t.name.name.clone(),
+                                methods,
+                                definition,
+                                span: t.name.span,
+                                file: "imported".to_string(),
+                            }
+                        );
+                    }
+                }
+            }
+        }
         
         // Debug: log imported modules
         self.client.log_message(MessageType::INFO, format!(
@@ -167,17 +246,39 @@ impl WispLanguageServer {
             }
         }
         
-        // Also get flat AST for collecting function/struct info
+        // Also get flat AST for collecting function/struct/trait info
+        // If parsing fails, preserve previous document state but still show diagnostics
         let ast = match parse_with_imports(text, &file_path) {
             Ok(ast) => ast,
             Err(_) => {
-                // Already handled above, but we need the flat AST for info collection
+                // Parse error - preserve previous document state so hover/completion still works
+                // on the parts that were previously valid
+                if let Ok(mut docs) = self.documents.write() {
+                    // Keep the old document state but update the source
+                    if let Some(old_doc) = docs.get_mut(uri) {
+                        old_doc.source = text.to_string();
+                    } else {
+                        // No previous state, insert empty state
+                        docs.insert(uri.clone(), DocumentState {
+                            source: text.to_string(),
+                            type_info: HashMap::new(),
+                            span_definitions: HashMap::new(),
+                            def_spans: HashMap::new(),
+                            functions: HashMap::new(),
+                            structs: HashMap::new(),
+                            traits: HashMap::new(),
+                            variable_defs: HashMap::new(),
+                            namespaces: parser_namespaces.clone(),
+                        });
+                    }
+                }
                 self.client.publish_diagnostics(uri.clone(), diagnostics, None).await;
                 return;
             }
         };
 
-        // Collect function and struct info from AST
+        // Collect function, struct, and trait info from current file only
+        // (Traits from imports were already collected above)
         for item in &ast.items {
             match item {
                 Item::Function(func) => {
@@ -214,6 +315,44 @@ impl WispLanguageServer {
                             fields,
                             definition: format!("struct {} {{\n{}\n}}", s.name.name, fields_str.join(",\n")),
                             span: s.name.span,
+                            file: file_str.clone(),
+                        }
+                    );
+                }
+                Item::Trait(t) => {
+                    let methods: Vec<String> = t.methods.iter()
+                        .map(|m| {
+                            let params: Vec<String> = m.params.iter()
+                                .map(|p| {
+                                    if p.name.name == "self" {
+                                        // Use shorthand: &Self -> &self, &mut Self -> &mut self, Self -> self
+                                        let ty_str = p.ty.pretty_print();
+                                        if ty_str.starts_with("&mut ") {
+                                            "&mut self".to_string()
+                                        } else if ty_str.starts_with("&") {
+                                            "&self".to_string()
+                                        } else {
+                                            "self".to_string()
+                                        }
+                                    } else {
+                                        format!("{}: {}", p.name.name, p.ty.pretty_print())
+                                    }
+                                })
+                                .collect();
+                            let ret = m.return_type.as_ref()
+                                .map(|ty| format!(" -> {}", ty.pretty_print()))
+                                .unwrap_or_default();
+                            format!("    fn {}({}){}", m.name.name, params.join(", "), ret)
+                        })
+                        .collect();
+                    let definition = format!("trait {} {{\n{}\n}}", t.name.name, methods.join("\n"));
+                    traits.insert(
+                        t.name.name.clone(),
+                        TraitInfo {
+                            name: t.name.name.clone(),
+                            methods,
+                            definition,
+                            span: t.name.span,
                             file: file_str.clone(),
                         }
                     );
@@ -282,6 +421,7 @@ impl WispLanguageServer {
                         def_spans,
                         functions,
                         structs,
+                        traits,
                         variable_defs,
                         namespaces: parser_namespaces.clone(),
                     });
@@ -329,6 +469,7 @@ impl WispLanguageServer {
                         def_spans,
                         functions,
                         structs,
+                        traits,
                         variable_defs,
                         namespaces,
                     });
@@ -396,6 +537,7 @@ impl WispLanguageServer {
                 def_spans,
                 functions,
                 structs,
+                traits,
                 variable_defs,
                 namespaces,
             });
@@ -417,7 +559,7 @@ impl LanguageServer for WispLanguageServer {
                 hover_provider: Some(HoverProviderCapability::Simple(true)),
                 definition_provider: Some(OneOf::Left(true)),
                 completion_provider: Some(CompletionOptions {
-                    trigger_characters: Some(vec![".".to_string(), ":".to_string(), "{".to_string(), "/".to_string()]),
+                    trigger_characters: Some(vec![".".to_string()]),
                     ..Default::default()
                 }),
                 signature_help_provider: Some(SignatureHelpOptions {
@@ -488,6 +630,17 @@ impl LanguageServer for WispLanguageServer {
                 
                 // Check for struct
                 if let Some(info) = doc.structs.get(&word) {
+                    return Ok(Some(Hover {
+                        contents: HoverContents::Markup(MarkupContent {
+                            kind: MarkupKind::Markdown,
+                            value: format!("```wisp\n{}\n```", info.definition),
+                        }),
+                        range: None,
+                    }));
+                }
+                
+                // Check for trait
+                if let Some(info) = doc.traits.get(&word) {
                     return Ok(Some(Hover {
                         contents: HoverContents::Markup(MarkupContent {
                             kind: MarkupKind::Markdown,
@@ -661,6 +814,44 @@ impl LanguageServer for WispLanguageServer {
                     }
                 }
                 
+                // Check if we're in an impl Trait for Type block
+                // This triggers when typing anywhere in the impl block, especially after "fn "
+                if let Some(trait_name) = find_impl_trait_context(before_cursor) {
+                    // Check if we're in a position where we'd want to add a method
+                    // (after "fn" keyword or at the start of a line in the impl block)
+                    let last_line = before_cursor.lines().last().unwrap_or("");
+                    let trimmed_line = last_line.trim();
+                    
+                    // Trigger if we see "fn" at the start of the line or after whitespace
+                    if trimmed_line.starts_with("fn") || trimmed_line.is_empty() {
+                        // Suggest trait methods
+                        if let Some(trait_info) = doc.traits.get(&trait_name) {
+                            for method_sig in &trait_info.methods {
+                                // Extract method name from signature like "    fn to_string(&self) -> String"
+                                let method_name = method_sig.trim().strip_prefix("fn ")
+                                    .and_then(|s| s.split('(').next())
+                                    .unwrap_or("");
+                                
+                                // Strip "fn " prefix and add body with cursor inside
+                                let method_without_fn = method_sig.trim().strip_prefix("fn ").unwrap_or(method_sig.trim());
+                                
+                                items.push(CompletionItem {
+                                    label: method_name.to_string(),
+                                    kind: Some(CompletionItemKind::METHOD),
+                                    detail: Some(method_sig.trim().to_string()),
+                                    insert_text: Some(format!("{} {{\n    $0\n}}", method_without_fn)),
+                                    insert_text_format: Some(InsertTextFormat::SNIPPET),
+                                    sort_text: Some(format!("0{}", method_name)), // Sort first
+                                    ..Default::default()
+                                });
+                            }
+                            if !items.is_empty() {
+                                return Ok(Some(CompletionResponse::Array(items)));
+                            }
+                        }
+                    }
+                }
+                
                 if let Some(struct_context) = find_struct_literal_context(before_cursor) {
                     // We're inside a struct literal, suggest fields
                     if let Some(struct_info) = doc.structs.get(&struct_context) {
@@ -752,10 +943,17 @@ impl LanguageServer for WispLanguageServer {
                 
                 // Default: suggest all functions, structs, and keywords
                 for (name, info) in &doc.functions {
+                    let (insert_text, insert_format) = if info.params.is_empty() {
+                        (format!("{}()", name), None)
+                    } else {
+                        (format!("{}($0)", name), Some(InsertTextFormat::SNIPPET))
+                    };
                     items.push(CompletionItem {
                         label: name.clone(),
                         kind: Some(CompletionItemKind::FUNCTION),
                         detail: Some(info.signature.clone()),
+                        insert_text: Some(insert_text),
+                        insert_text_format: insert_format,
                         ..Default::default()
                     });
                 }
@@ -765,8 +963,9 @@ impl LanguageServer for WispLanguageServer {
                         label: name.clone(),
                         kind: Some(CompletionItemKind::STRUCT),
                         detail: Some(info.definition.lines().next().unwrap_or("").to_string()),
-                        // Insert struct literal template
-                        insert_text: Some(format!("{} {{ }}", name)),
+                        // Insert struct literal template with cursor inside
+                        insert_text: Some(format!("{} {{ $0 }}", name)),
+                        insert_text_format: Some(InsertTextFormat::SNIPPET),
                         ..Default::default()
                     });
                 }
@@ -842,6 +1041,53 @@ impl LanguageServer for WispLanguageServer {
 }
 
 /// Find if we're inside a struct literal and return the struct name
+/// Check if we're inside an `impl Trait for Type` block
+/// Returns the trait name if found
+fn find_impl_trait_context(text: &str) -> Option<String> {
+    // Look for pattern: impl TraitName for TypeName { ... 
+    // We need to find the most recent "impl" block we're inside
+    
+    // Count braces to make sure we're inside an impl block
+    let mut brace_depth = 0;
+    let mut impl_start: Option<usize> = None;
+    
+    for (i, ch) in text.char_indices().rev() {
+        match ch {
+            '}' => brace_depth += 1,
+            '{' => {
+                brace_depth -= 1;
+                if brace_depth < 0 {
+                    // Found the opening brace of a block, check if it's an impl block
+                    impl_start = Some(i);
+                    break;
+                }
+            }
+            _ => {}
+        }
+    }
+    
+    if let Some(start) = impl_start {
+        // Look backwards from the brace to find "impl TraitName for TypeName"
+        let before_brace = text[..start].trim_end();
+        
+        // Pattern: impl TraitName for TypeName
+        if let Some(impl_pos) = before_brace.rfind("impl ") {
+            let after_impl = &before_brace[impl_pos + 5..].trim();
+            
+            // Extract: TraitName for TypeName
+            if let Some(for_pos) = after_impl.find(" for ") {
+                let trait_name = after_impl[..for_pos].trim();
+                // Make sure it's a simple name (not generic for now)
+                if !trait_name.is_empty() && trait_name.chars().all(|c| c.is_alphanumeric() || c == '_') {
+                    return Some(trait_name.to_string());
+                }
+            }
+        }
+    }
+    
+    None
+}
+
 fn find_struct_literal_context(text: &str) -> Option<String> {
     // Look backwards for pattern: StructName {
     // But not inside a nested block
@@ -987,7 +1233,7 @@ fn find_import_context(text: &str) -> Option<String> {
     None
 }
 
-/// Get import suggestions by scanning the filesystem
+/// Get import suggestions by scanning the filesystem and parsing modules for items
 fn get_import_suggestions(uri: &Url, current_path: &str) -> Vec<(String, CompletionItemKind)> {
     let mut suggestions = Vec::new();
     
@@ -999,6 +1245,14 @@ fn get_import_suggestions(uri: &Url, current_path: &str) -> Vec<(String, Complet
         suggestions.push(("std".to_string(), CompletionItemKind::MODULE));
         suggestions.push(("@".to_string(), CompletionItemKind::MODULE));
         return suggestions;
+    }
+    
+    // Check if the path ends with a dot (e.g., "std.io.")
+    // In this case, suggest items from that module
+    if current_path.ends_with('.') {
+        if let Some(item_suggestions) = get_module_item_suggestions(file_path.as_ref(), current_path) {
+            return item_suggestions;
+        }
     }
     
     // Parse the current path to determine what to suggest
@@ -1031,6 +1285,77 @@ fn get_import_suggestions(uri: &Url, current_path: &str) -> Vec<(String, Complet
     }
     
     suggestions
+}
+
+/// Get item suggestions from a specific module
+/// e.g., "import std.io." -> suggest print, Display, etc.
+fn get_module_item_suggestions(file_path: Option<&PathBuf>, import_path: &str) -> Option<Vec<(String, CompletionItemKind)>> {
+    // Remove trailing dot
+    let path_without_dot = import_path.trim_end_matches('.');
+    
+    // Resolve the module file
+    let module_file = resolve_import_path_for_completion(file_path, path_without_dot)?;
+    
+    // Parse the module to extract public items
+    let source = fs::read_to_string(&module_file).ok()?;
+    let ast = wisp_parser::Parser::parse(&source).ok()?;
+    
+    let mut items = Vec::new();
+    
+    for item in ast.items {
+        let (name, kind, is_pub) = match item {
+            wisp_ast::Item::Function(f) => (f.name.name, CompletionItemKind::FUNCTION, f.is_pub),
+            wisp_ast::Item::Struct(s) => (s.name.name, CompletionItemKind::STRUCT, s.is_pub),
+            wisp_ast::Item::Enum(e) => (e.name.name, CompletionItemKind::ENUM, e.is_pub),
+            wisp_ast::Item::Trait(t) => (t.name.name, CompletionItemKind::INTERFACE, t.is_pub),
+            wisp_ast::Item::Impl(_) => continue, // Skip impls
+            wisp_ast::Item::Import(_) => continue, // Skip imports
+            wisp_ast::Item::ExternFunction(f) => (f.name.name, CompletionItemKind::FUNCTION, f.is_pub),
+            wisp_ast::Item::ExternStatic(s) => (s.name.name, CompletionItemKind::VARIABLE, s.is_pub),
+        };
+        
+        if is_pub {
+            items.push((name, kind));
+        }
+    }
+    
+    Some(items)
+}
+
+/// Resolve an import path string to a file path for completion purposes
+fn resolve_import_path_for_completion(file_path: Option<&PathBuf>, import_path: &str) -> Option<PathBuf> {
+    let parts: Vec<&str> = import_path.split('.').collect();
+    if parts.is_empty() {
+        return None;
+    }
+    
+    let base_path = if parts[0] == "std" {
+        get_std_path(file_path)
+    } else if parts[0] == "@" {
+        file_path.and_then(|p| find_project_root(p))?
+    } else {
+        return None;
+    };
+    
+    // Build the path
+    let mut path = base_path;
+    for part in &parts[1..] {
+        path = path.join(part);
+    }
+    
+    // Try with .ws extension
+    let with_ext = path.with_extension("ws");
+    if with_ext.exists() {
+        return Some(with_ext);
+    }
+    
+    // Try as mod.ws
+    let as_mod = path.join("mod.ws");
+    if as_mod.exists() {
+        return Some(as_mod);
+    }
+    
+    None
 }
 
 /// Get the std library path

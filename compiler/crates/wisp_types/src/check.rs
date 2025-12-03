@@ -53,6 +53,8 @@ pub struct TypeChecker {
     generic_instantiations: HashSet<GenericInstantiation>,
     /// Map from generic function DefId to its type parameters (with bounds)
     generic_functions: HashMap<DefId, Vec<TypeParamInfo>>,
+    /// Function parameter names and types: DefId -> Vec<(name, Type)>
+    function_params: HashMap<DefId, Vec<(String, Type)>>,
     /// Trait methods: trait DefId -> [(method name, method type with Self as placeholder)]
     trait_methods: HashMap<DefId, Vec<(String, Type)>>,
     /// Trait implementations: (type DefId, trait DefId) -> impl methods
@@ -80,6 +82,7 @@ impl TypeChecker {
             current_self_type: None,
             generic_instantiations: HashSet::new(),
             generic_functions: HashMap::new(),
+            function_params: HashMap::new(),
             trait_methods: HashMap::new(),
             trait_impls: HashMap::new(),
             function_param_names: HashMap::new(),
@@ -104,6 +107,39 @@ impl TypeChecker {
 
     fn error(&mut self, message: String, span: Span) {
         self.errors.push(TypeError { message, span });
+    }
+    
+    fn argument_count_error(&mut self, def_id: Option<DefId>, expected: usize, got: usize, span: Span) {
+        self.argument_count_error_skip_params(def_id, expected, got, 0, span);
+    }
+    
+    fn argument_count_error_skip_params(&mut self, def_id: Option<DefId>, expected: usize, got: usize, skip: usize, span: Span) {
+        let message = if let Some(id) = def_id {
+            if let Some(params) = self.function_params.get(&id) {
+                if got < expected {
+                    // Missing arguments (skip first N params for methods)
+                    let start_idx = skip + got;
+                    let missing: Vec<String> = params[start_idx..skip + expected].iter()
+                        .map(|(name, ty)| format!("'{}:  {}'", name, ty.display(&self.ctx)))
+                        .collect();
+                    if missing.len() == 1 {
+                        format!("missing argument {}", missing[0])
+                    } else {
+                        format!("missing arguments: {}", missing.join(", "))
+                    }
+                } else {
+                    // Too many arguments
+                    format!("too many arguments: expected {}, got {}", expected, got)
+                }
+            } else {
+                // Fallback: no param info found
+                format!("expected {} arguments, got {}", expected, got)
+            }
+        } else {
+            // No def_id available
+            format!("expected {} arguments, got {}", expected, got)
+        };
+        self.error(message, span);
     }
 
     fn check_program(&mut self, program: &ResolvedProgram) -> TypedProgram {
@@ -475,6 +511,9 @@ impl TypeChecker {
             self.ctx.record_span_definition(p.span.start, p.span.end, p.def_id);
             param_types.push((p.name.clone(), ty));
         }
+        
+        // Store parameter info for better error messages
+        self.function_params.insert(f.def_id, param_types.clone());
 
         // Set return type context
         let return_type = f.return_type.as_ref()
@@ -593,6 +632,7 @@ impl TypeChecker {
 
     /// Reorder named arguments to match parameter order
     /// Returns references to the argument expressions in the correct order
+    /// For named arguments with missing parameters, reports errors with type info
     fn reorder_named_args<'a>(
         &mut self,
         args: &'a [ResolvedCallArg],
@@ -612,6 +652,15 @@ impl TypeChecker {
             Some(names) => names.clone(),
             None => {
                 // No param names registered, use positional
+                return args.iter().map(|a| &a.value).collect();
+            }
+        };
+        
+        // Get parameter types
+        let param_types = match self.function_params.get(&func_def_id) {
+            Some(types) => types.clone(),
+            None => {
+                // No type info, can't give detailed errors
                 return args.iter().map(|a| &a.value).collect();
             }
         };
@@ -642,14 +691,22 @@ impl TypeChecker {
             }
         }
         
-        // Check all required parameters are provided
-        for (i, name) in param_names.iter().enumerate() {
-            if result[i].is_none() {
-                self.error(format!("missing argument for parameter '{}'", name), span);
-            }
+        // Check for missing arguments and report with type info
+        let missing: Vec<String> = param_names.iter().enumerate()
+            .filter(|(i, _)| result[*i].is_none())
+            .map(|(i, name)| format!("'{}:  {}'", name, param_types[i].1.display(&self.ctx)))
+            .collect();
+        
+        if !missing.is_empty() {
+            let message = if missing.len() == 1 {
+                format!("missing argument {}", missing[0])
+            } else {
+                format!("missing arguments: {}", missing.join(", "))
+            };
+            self.error(message, span);
         }
         
-        // Return the reordered args (or original if something went wrong)
+        // Return only the provided arguments in order (filter out None)
         result.into_iter().filter_map(|o| o).collect()
     }
 
@@ -704,15 +761,28 @@ impl TypeChecker {
             }
             
             // Check all required parameters are provided
-            for (i, name) in param_names.iter().enumerate() {
-                if result[i].is_none() {
-                    self.error(format!("missing argument for parameter '{}'", name), span);
-                    // Create error placeholder
-                    result[i] = Some(TypedExpr {
-                        kind: TypedExprKind::IntLiteral(0),
-                        ty: Type::Error,
-                        span,
-                    });
+            let missing: Vec<String> = param_names.iter().enumerate()
+                .filter(|(i, _)| result[*i].is_none())
+                .map(|(i, name)| format!("'{}:  {}'", name, param_types[i].display(&self.ctx)))
+                .collect();
+            
+            if !missing.is_empty() {
+                let message = if missing.len() == 1 {
+                    format!("missing argument {}", missing[0])
+                } else {
+                    format!("missing arguments: {}", missing.join(", "))
+                };
+                self.error(message, span);
+                
+                // Create error placeholders
+                for i in 0..param_names.len() {
+                    if result[i].is_none() {
+                        result[i] = Some(TypedExpr {
+                            kind: TypedExprKind::IntLiteral(0),
+                            ty: Type::Error,
+                            span,
+                        });
+                    }
                 }
             }
             
@@ -720,10 +790,22 @@ impl TypeChecker {
         } else {
             // Positional arguments - just type check in order
             if args.len() != param_types.len() {
-                self.error(
-                    format!("expected {} arguments, got {}", param_types.len(), args.len()),
-                    span
-                );
+                // Generate specific error message
+                let message = if args.len() < param_types.len() {
+                    // Missing arguments
+                    let missing: Vec<String> = param_names[args.len()..].iter().zip(&param_types[args.len()..])
+                        .map(|(name, ty)| format!("'{}:  {}'", name, ty.display(&self.ctx)))
+                        .collect();
+                    if missing.len() == 1 {
+                        format!("missing argument {}", missing[0])
+                    } else {
+                        format!("missing arguments: {}", missing.join(", "))
+                    }
+                } else {
+                    // Too many arguments
+                    format!("too many arguments: expected {}, got {}", param_types.len(), args.len())
+                };
+                self.error(message, span);
             }
             
             args.iter().enumerate().map(|(i, arg)| {
@@ -869,11 +951,8 @@ impl TypeChecker {
                                 let result_type = if let Type::Function { params, ret } = &fn_type {
                                     // Check argument count and types (no self parameter)
                                     if args_typed.len() != params.len() {
-                                        self.error(
-                                            format!("function '{}' expected {} arguments, got {}", 
-                                                method_name, params.len(), args_typed.len()),
-                                            expr.span
-                                        );
+                                        self.argument_count_error(Some(fn_def_id), params.len(), args_typed.len(), expr.span);
+                                        Type::Error
                                     } else {
                                         for (i, (arg, param)) in args_typed.iter().zip(params.iter()).enumerate() {
                                             if let Err(e) = self.ctx.unify(&arg.ty, param) {
@@ -883,8 +962,8 @@ impl TypeChecker {
                                                 );
                                             }
                                         }
+                                        (**ret).clone()
                                     }
-                                    (**ret).clone()
                                 } else {
                                     Type::Error
                                 };
@@ -959,11 +1038,8 @@ impl TypeChecker {
                                 let method_params = &params[1..]; // Skip self param
                                 
                                 if args_typed.len() != method_params.len() {
-                                    self.error(
-                                        format!("method '{}' expected {} arguments, got {}", 
-                                            method_name, method_params.len(), args_typed.len()),
-                                        expr.span
-                                    );
+                                    self.argument_count_error_skip_params(Some(method_def_id), method_params.len(), args_typed.len(), 1, expr.span);
+                                    (Type::Error, false)
                                 } else {
                                     for (i, (arg, param)) in args_typed.iter().zip(method_params.iter()).enumerate() {
                                         if let Err(e) = self.ctx.unify(&arg.ty, param) {
@@ -973,10 +1049,10 @@ impl TypeChecker {
                                             );
                                         }
                                     }
+                                    // Check if self param is &mut
+                                    let is_mut = params.first().map(|p| matches!(p, Type::Ref { is_mut: true, .. })).unwrap_or(false);
+                                    ((**ret).clone(), is_mut)
                                 }
-                                // Check if self param is &mut
-                                let is_mut = params.first().map(|p| matches!(p, Type::Ref { is_mut: true, .. })).unwrap_or(false);
-                                ((**ret).clone(), is_mut)
                             } else {
                                 (Type::Error, false)
                             };
@@ -1016,16 +1092,14 @@ impl TypeChecker {
                                 let method_params = &params[1..]; // Skip self param
                                 
                                 if args_typed.len() != method_params.len() {
-                                    self.error(
-                                        format!("method '{}' expected {} arguments, got {}", 
-                                            method_name, method_params.len(), args_typed.len()),
-                                        expr.span
-                                    );
+                                    self.argument_count_error(None, method_params.len(), args_typed.len(), expr.span);
+                                    (Type::Error, false)
+                                } else {
+                                    // Check if self param is &mut
+                                    let is_mut = params.first().map(|p| matches!(p, Type::Ref { is_mut: true, .. })).unwrap_or(false);
+                                    // Note: we don't check arg types here since they're generic
+                                    ((**ret).clone(), is_mut)
                                 }
-                                // Check if self param is &mut
-                                let is_mut = params.first().map(|p| matches!(p, Type::Ref { is_mut: true, .. })).unwrap_or(false);
-                                // Note: we don't check arg types here since they're generic
-                                ((**ret).clone(), is_mut)
                             } else {
                                 (Type::Error, false)
                             };
@@ -1079,15 +1153,13 @@ impl TypeChecker {
                                 let method_params = &params[1..]; // Skip self param
                                 
                                 if args_typed.len() != method_params.len() {
-                                    self.error(
-                                        format!("method '{}' expected {} arguments, got {}", 
-                                            method_name, method_params.len(), args_typed.len()),
-                                        expr.span
-                                    );
+                                    self.argument_count_error_skip_params(Some(method_def_id), method_params.len(), args_typed.len(), 1, expr.span);
+                                    (Type::Error, false)
+                                } else {
+                                    // Check if self param is &mut
+                                    let is_mut = params.first().map(|p| matches!(p, Type::Ref { is_mut: true, .. })).unwrap_or(false);
+                                    ((**ret).clone(), is_mut)
                                 }
-                                // Check if self param is &mut
-                                let is_mut = params.first().map(|p| matches!(p, Type::Ref { is_mut: true, .. })).unwrap_or(false);
-                                ((**ret).clone(), is_mut)
                             } else {
                                 (Type::Error, false)
                             };
@@ -1130,6 +1202,9 @@ impl TypeChecker {
                     _ => None,
                 };
                 
+                // Check if any arguments are named
+                let has_named = args.iter().any(|a| a.name.is_some());
+                
                 // Handle named arguments - reorder if needed
                 let reordered_args = if let Some(def_id) = callee_def_id {
                     self.reorder_named_args(args, def_id, expr.span)
@@ -1142,13 +1217,10 @@ impl TypeChecker {
                 
                 let (result_type, type_args) = match &callee_typed.ty {
                     Type::Function { params, ret } => {
-                        // Check argument count
-                        if args_typed.len() != params.len() {
-                            self.error(
-                                format!("expected {} arguments, got {}", params.len(), args_typed.len()),
-                                expr.span
-                            );
-                            ((**ret).clone(), None)
+                        // Check argument count (skip for named args, already checked in reorder_named_args)
+                        if !has_named && args_typed.len() != params.len() {
+                            self.argument_count_error(callee_def_id, params.len(), args_typed.len(), expr.span);
+                            (Type::Error, None)
                         } else {
                             // For generic functions, infer type arguments
                             let inferred_type_args = if let Some(def_id) = callee_def_id {

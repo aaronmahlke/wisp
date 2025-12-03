@@ -473,7 +473,8 @@ fn run_type_check(source: &str, file_path: &str) {
         Err(errors) => {
             eprintln!("Type errors:");
             for e in &errors {
-                eprintln!("  {}", e);
+                let (line, col) = offset_to_line_col(source, e.span.start);
+                eprintln!("  {} at {}:{}", e.message, line, col);
                 show_error_context(source, e.span);
             }
             std::process::exit(1);
@@ -512,7 +513,8 @@ fn run_borrow_check(source: &str, file_path: &str) {
         Err(errors) => {
             eprintln!("Type errors:");
             for e in &errors {
-                eprintln!("  {}", e);
+                let (line, col) = offset_to_line_col(source, e.span.start);
+                eprintln!("  {} at {}:{}", e.message, line, col);
                 show_error_context(source, e.span);
             }
             std::process::exit(1);
@@ -529,10 +531,12 @@ fn run_borrow_check(source: &str, file_path: &str) {
         Err(errors) => {
             eprintln!("Borrow check errors:");
             for e in &errors {
-                eprintln!("  {}", e.message);
+                let (line, col) = offset_to_line_col(source, e.span.start);
+                eprintln!("  {} at {}:{}", e.message, line, col);
                 show_error_context(source, e.span);
                 for (note, note_span) in &e.notes {
-                    eprintln!("  note: {}", note);
+                    let (note_line, note_col) = offset_to_line_col(source, note_span.start);
+                    eprintln!("  note: {} at {}:{}", note, note_line, note_col);
                     show_error_context(source, *note_span);
                 }
             }
@@ -636,7 +640,8 @@ fn run_frontend(source: &str, file_path: &str) -> Result<wisp_types::TypedProgra
         Err(errors) => {
             eprintln!("Type errors:");
             for e in &errors {
-                eprintln!("  {}", e);
+                let (line, col) = offset_to_line_col(source, e.span.start);
+                eprintln!("  {} at {}:{}", e.message, line, col);
                 show_error_context(source, e.span);
             }
             return Err(());
@@ -659,6 +664,24 @@ fn run_frontend(source: &str, file_path: &str) -> Result<wisp_types::TypedProgra
     }
     
     Ok(typed)
+}
+
+/// Convert byte offset to line:column
+fn offset_to_line_col(source: &str, offset: usize) -> (usize, usize) {
+    let lines: Vec<&str> = source.lines().collect();
+    let mut char_count = 0;
+    for (line_num, line) in lines.iter().enumerate() {
+        let line_start = char_count;
+        let line_end = char_count + line.len();
+        
+        if offset >= line_start && offset <= line_end {
+            let col = offset - line_start;
+            return (line_num + 1, col + 1); // 1-indexed
+        }
+        
+        char_count = line_end + 1; // +1 for newline
+    }
+    (1, 1) // Fallback
 }
 
 fn show_error_context(source: &str, span: wisp_lexer::Span) {

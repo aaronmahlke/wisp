@@ -9,27 +9,11 @@ extern static __stdoutp: i64
 
 // Display trait - types that can be printed and converted to String
 pub trait Display {
-    fn print(&self)
     fn to_string(&self) -> String
 }
 
 // Implement Display for i32
 impl Display for i32 {
-    fn print(&self) {
-        if *self < 0 {
-            let _ = putchar(45);  // '-'
-            let pos = 0 - *self;
-            pos.print();
-        } else {
-            if *self >= 10 {
-                let div = *self / 10;
-                div.print();
-            }
-            let digit = *self % 10;
-            let _ = putchar(48 + digit);
-        }
-    }
-    
     fn to_string(&self) -> String {
         // Convert integer to string
         // Handle negative numbers
@@ -91,10 +75,6 @@ impl Display for i32 {
 
 // Implement Display for str
 impl Display for str {
-    fn print(&self) {
-        let _ = fputs(*self, __stdoutp);
-    }
-    
     fn to_string(&self) -> String {
         String.from(*self)
     }
@@ -102,14 +82,6 @@ impl Display for str {
 
 // Implement Display for bool
 impl Display for bool {
-    fn print(&self) {
-        if *self {
-            let _ = fputs("true", __stdoutp);
-        } else {
-            let _ = fputs("false", __stdoutp);
-        }
-    }
-    
     fn to_string(&self) -> String {
         if *self {
             String.from("true")
@@ -121,10 +93,6 @@ impl Display for bool {
 
 // Implement Display for String
 impl Display for String {
-    fn print(&self) {
-        let _ = fputs(self.ptr as str, __stdoutp);
-    }
-    
     fn to_string(&self) -> String {
         // Return a copy of the string using the public clone method
         self.clone()
@@ -133,6 +101,7 @@ impl Display for String {
 
 // Generic print function - prints any type that implements Display, with newline
 pub fn print<T: Display>(value: &T) {
-    value.print();
+    let s = value.to_string();
+    let _ = fputs(s.ptr as str, __stdoutp);
     let _ = putchar(10);
 }
