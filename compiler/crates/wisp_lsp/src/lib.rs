@@ -39,6 +39,7 @@ struct StructInfo {
 struct TraitInfo {
     name: String,
     methods: Vec<String>, // Method signatures
+    type_params: Vec<(String, Option<String>)>, // (name, default_type)
     definition: String,
     span: Span,
     file: String,
@@ -74,6 +75,12 @@ struct DocumentState {
     variable_defs: HashMap<String, (usize, usize)>,
     /// Namespaces: namespace_name -> info
     namespaces: HashMap<String, NamespaceInfo>,
+    /// Available symbols from std: name -> module path
+    std_symbols: HashMap<String, String>,
+    /// Currently imported symbols (to avoid duplicate imports)
+    imported_symbols: HashSet<String>,
+    /// Diagnostics published for this document
+    diagnostics: Vec<Diagnostic>,
 }
 
 /// The Wisp LSP backend
@@ -165,6 +172,9 @@ impl WispLanguageServer {
                             traits,
                             variable_defs,
                             namespaces: previous_namespaces.clone(),
+                            std_symbols: HashMap::new(),
+                            imported_symbols: HashSet::new(),
+                            diagnostics: Vec::new(),
                         });
                     }
                 }
@@ -178,10 +188,95 @@ impl WispLanguageServer {
         
         // Collect traits from imported modules NOW (before the flat parse might fail)
         // This ensures traits are available even if the current file has parse errors
+        // Also populate std_symbols with all available std items
+        let mut std_symbols = HashMap::new();
+        let mut imported_symbols = HashSet::new();
+        
+        // Proactively load std modules to populate std_symbols for auto-import
+        // This allows us to suggest imports even if the modules aren't loaded yet
+        self.client.log_message(MessageType::INFO, format!(
+            "LSP: About to call populate_std_symbols_sync, base_dir: {}", 
+            base_dir.display()
+        )).await;
+        
+        populate_std_symbols_sync(&mut std_symbols, base_dir);
+        
+        self.client.log_message(MessageType::INFO, format!(
+            "LSP: After populate_std_symbols, found {} symbols", 
+            std_symbols.len()
+        )).await;
+        
+        // Log a few examples
+        for (symbol, path) in std_symbols.iter().take(5) {
+            self.client.log_message(MessageType::INFO, format!(
+                "LSP:   {} -> {}", 
+                symbol, path
+            )).await;
+        }
+        
         for module in &ast_with_imports.imported_modules {
+            // Determine the module path for std symbols
+            let module_path = match &module.import.path {
+                wisp_ast::ImportPath::Std(segments) => {
+                    Some(format!("std.{}", segments.join(".")))
+                }
+                _ => None,
+            };
+            
+            // Track what's being imported (to avoid duplicate import suggestions)
+            // Only track items that are actually imported by this module's import declaration
+            if !module.is_transitive {
+                // Check if this is a direct item import (e.g., import std.io.print)
+                // vs a namespace import (e.g., import std.io)
+                if let Some(ref import_items) = module.import.items {
+                    // Destructured import: only the listed items are imported
+                    for import_item in import_items {
+                        imported_symbols.insert(import_item.name.name.clone());
+                    }
+                } else if !module.import.destructure_only {
+                    // Namespace import: all public items from this module are accessible
+                    // Mark all items as imported
+                    for item in &module.items {
+                        let item_name = match item {
+                            Item::Trait(t) if t.is_pub => Some(&t.name.name),
+                            Item::Struct(s) if s.is_pub => Some(&s.name.name),
+                            Item::Function(f) if f.is_pub => Some(&f.name.name),
+                            Item::ExternFunction(f) if f.is_pub => Some(&f.name.name),
+                            _ => None,
+                        };
+                        
+                        if let Some(name) = item_name {
+                            imported_symbols.insert(name.clone());
+                        }
+                    }
+                }
+            }
+            
             for item in &module.items {
+                // For std modules, track all public items for auto-import
+                if let Some(ref path) = module_path {
+                    if let Item::Trait(t) = item {
+                        if t.is_pub {
+                            std_symbols.insert(t.name.name.clone(), path.clone());
+                        }
+                    } else if let Item::Struct(s) = item {
+                        if s.is_pub {
+                            std_symbols.insert(s.name.name.clone(), path.clone());
+                        }
+                    } else if let Item::Function(f) = item {
+                        if f.is_pub {
+                            std_symbols.insert(f.name.name.clone(), path.clone());
+                        }
+                    }
+                }
+                
                 if let Item::Trait(t) = item {
                     if t.is_pub {
+                        // Collect type parameters with their defaults
+                        let type_params: Vec<(String, Option<String>)> = t.type_params.iter()
+                            .map(|p| (p.name.name.clone(), p.default.as_ref().map(|ty| ty.pretty_print())))
+                            .collect();
+                        
                         let methods: Vec<String> = t.methods.iter()
                             .map(|m| {
                                 let params: Vec<String> = m.params.iter()
@@ -213,6 +308,7 @@ impl WispLanguageServer {
                             TraitInfo {
                                 name: t.name.name.clone(),
                                 methods,
+                                type_params,
                                 definition,
                                 span: t.name.span,
                                 file: "imported".to_string(),
@@ -269,6 +365,9 @@ impl WispLanguageServer {
                             traits: HashMap::new(),
                             variable_defs: HashMap::new(),
                             namespaces: parser_namespaces.clone(),
+                            std_symbols: HashMap::new(),
+                            imported_symbols: HashSet::new(),
+                            diagnostics: Vec::new(),
                         });
                     }
                 }
@@ -351,6 +450,7 @@ impl WispLanguageServer {
                         TraitInfo {
                             name: t.name.name.clone(),
                             methods,
+                            type_params: Vec::new(), // Not collecting type params for local traits yet
                             definition,
                             span: t.name.span,
                             file: file_str.clone(),
@@ -424,6 +524,9 @@ impl WispLanguageServer {
                         traits,
                         variable_defs,
                         namespaces: parser_namespaces.clone(),
+                        std_symbols: std_symbols.clone(),
+                        imported_symbols: imported_symbols.clone(),
+                        diagnostics: diagnostics.clone(),
                     });
                 }
                 self.client.publish_diagnostics(uri.clone(), diagnostics, None).await;
@@ -472,6 +575,9 @@ impl WispLanguageServer {
                         traits,
                         variable_defs,
                         namespaces,
+                        std_symbols: std_symbols.clone(),
+                        imported_symbols: imported_symbols.clone(),
+                        diagnostics: diagnostics.clone(),
                     });
                 }
                 self.client.publish_diagnostics(uri.clone(), diagnostics, None).await;
@@ -540,6 +646,9 @@ impl WispLanguageServer {
                 traits,
                 variable_defs,
                 namespaces,
+                std_symbols,
+                imported_symbols,
+                diagnostics: diagnostics.clone(),
             });
         }
 
@@ -567,6 +676,11 @@ impl LanguageServer for WispLanguageServer {
                     retrigger_characters: None,
                     work_done_progress_options: Default::default(),
                 }),
+                code_action_provider: Some(CodeActionProviderCapability::Options(CodeActionOptions {
+                    code_action_kinds: Some(vec![CodeActionKind::QUICKFIX]),
+                    work_done_progress_options: Default::default(),
+                    resolve_provider: None,
+                })),
                 ..Default::default()
             },
             server_info: Some(ServerInfo {
@@ -816,7 +930,7 @@ impl LanguageServer for WispLanguageServer {
                 
                 // Check if we're in an impl Trait for Type block
                 // This triggers when typing anywhere in the impl block, especially after "fn "
-                if let Some(trait_name) = find_impl_trait_context(before_cursor) {
+                if let Some((trait_name, impl_type_args)) = find_impl_trait_context(before_cursor) {
                     // Check if we're in a position where we'd want to add a method
                     // (after "fn" keyword or at the start of a line in the impl block)
                     let last_line = before_cursor.lines().last().unwrap_or("");
@@ -827,18 +941,25 @@ impl LanguageServer for WispLanguageServer {
                         // Suggest trait methods
                         if let Some(trait_info) = doc.traits.get(&trait_name) {
                             for method_sig in &trait_info.methods {
+                                // Substitute type parameters in the method signature
+                                let substituted_sig = substitute_trait_type_params(
+                                    method_sig,
+                                    &trait_info.type_params,
+                                    &impl_type_args,
+                                );
+                                
                                 // Extract method name from signature like "    fn to_string(&self) -> String"
-                                let method_name = method_sig.trim().strip_prefix("fn ")
+                                let method_name = substituted_sig.trim().strip_prefix("fn ")
                                     .and_then(|s| s.split('(').next())
                                     .unwrap_or("");
                                 
                                 // Strip "fn " prefix and add body with cursor inside
-                                let method_without_fn = method_sig.trim().strip_prefix("fn ").unwrap_or(method_sig.trim());
+                                let method_without_fn = substituted_sig.trim().strip_prefix("fn ").unwrap_or(substituted_sig.trim());
                                 
                                 items.push(CompletionItem {
                                     label: method_name.to_string(),
                                     kind: Some(CompletionItemKind::METHOD),
-                                    detail: Some(method_sig.trim().to_string()),
+                                    detail: Some(substituted_sig.trim().to_string()),
                                     insert_text: Some(format!("{} {{\n    $0\n}}", method_without_fn)),
                                     insert_text_format: Some(InsertTextFormat::SNIPPET),
                                     sort_text: Some(format!("0{}", method_name)), // Sort first
@@ -1038,12 +1159,273 @@ impl LanguageServer for WispLanguageServer {
 
         Ok(None)
     }
+
+    async fn code_action(&self, params: CodeActionParams) -> Result<Option<CodeActionResponse>> {
+        let uri = &params.text_document.uri;
+        
+        self.client.log_message(MessageType::INFO, format!(
+            "LSP: code_action called with {} diagnostics, range: {:?}", 
+            params.context.diagnostics.len(),
+            params.range
+        )).await;
+        
+        // Clone the data we need before doing any awaits to avoid holding the RwLock
+        let (source, std_symbols, imported_symbols, stored_diagnostics) = if let Ok(docs) = self.documents.read() {
+            if let Some(doc) = docs.get(uri) {
+                (doc.source.clone(), doc.std_symbols.clone(), doc.imported_symbols.clone(), doc.diagnostics.clone())
+            } else {
+                return Ok(None);
+            }
+        } else {
+            return Ok(None);
+        };
+        
+        self.client.log_message(MessageType::INFO, format!(
+            "LSP: Found document, {} std_symbols available, {} imported, {} stored diagnostics", 
+            std_symbols.len(),
+            imported_symbols.len(),
+            stored_diagnostics.len()
+        )).await;
+        
+        // Log some example std_symbols
+        for (symbol, path) in std_symbols.iter().take(3) {
+            self.client.log_message(MessageType::INFO, format!(
+                "LSP:   std_symbol: {} -> {}", 
+                symbol, path
+            )).await;
+        }
+        
+        let mut actions = Vec::new();
+        
+        // Use diagnostics from context if provided, otherwise use stored diagnostics in range
+        let diagnostics_to_check: Vec<&Diagnostic> = if !params.context.diagnostics.is_empty() {
+            params.context.diagnostics.iter().collect()
+        } else {
+            // Filter stored diagnostics that overlap with the requested range
+            stored_diagnostics.iter()
+                .filter(|d| ranges_overlap(&d.range, &params.range))
+                .collect()
+        };
+        
+        if diagnostics_to_check.is_empty() {
+            self.client.log_message(MessageType::INFO, 
+                "LSP: No diagnostics in range for code actions".to_string()
+            ).await;
+            return Ok(None);
+        }
+        
+        self.client.log_message(MessageType::INFO, format!(
+            "LSP: Checking {} diagnostics for code actions", 
+            diagnostics_to_check.len()
+        )).await;
+        
+        // First, parse existing imports to find what modules are already imported
+        let mut existing_imports: HashMap<String, (usize, usize, bool, Vec<String>)> = HashMap::new(); 
+        // module_path -> (line_idx, line_start_offset, has_destructure, items)
+        
+        let mut current_offset = 0;
+        for (line_idx, line) in source.lines().enumerate() {
+            let trimmed = line.trim();
+            if trimmed.starts_with("import ") {
+                // Parse: "import std.io.{ Display }" or "import std.io.Display"
+                if let Some(rest) = trimmed.strip_prefix("import ") {
+                    if let Some(brace_start) = rest.find(".{") {
+                        // Destructured import: import std.io.{ Display, print }
+                        let module_path = rest[..brace_start].trim().to_string();
+                        if let Some(brace_end) = rest.find('}') {
+                            let items_str = &rest[brace_start + 2..brace_end];
+                            let items: Vec<String> = items_str.split(',')
+                                .map(|s| s.trim().to_string())
+                                .filter(|s| !s.is_empty())
+                                .collect();
+                            existing_imports.insert(module_path, (line_idx, current_offset, true, items));
+                        }
+                    } else if let Some(last_dot) = rest.rfind('.') {
+                        // Direct import: import std.io.Display
+                        let module_path = rest[..last_dot].trim().to_string();
+                        let item = rest[last_dot + 1..].trim().to_string();
+                        existing_imports.entry(module_path)
+                            .or_insert((line_idx, current_offset, false, vec![]))
+                            .3.push(item);
+                    }
+                }
+            }
+            current_offset += line.len() + 1; // +1 for newline
+        }
+        
+        // Check each diagnostic in the range for unresolved symbols
+        for diagnostic in diagnostics_to_check {
+            // Parse error messages like:
+            // - "undefined trait 'Add'"
+            // - "undefined type 'String'"
+            // - "undefined variable 'print'"
+            // - "undefined struct 'Point'"
+            let message = &diagnostic.message;
+            
+            self.client.log_message(MessageType::INFO, format!(
+                "LSP: Processing diagnostic: {}", 
+                message
+            )).await;
+            
+            // Extract symbol name from error message
+            let symbol_name = if let Some(start) = message.find('\'') {
+                if let Some(end) = message[start+1..].find('\'') {
+                    Some(&message[start+1..start+1+end])
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+            
+            if let Some(symbol) = symbol_name {
+                self.client.log_message(MessageType::INFO, format!(
+                    "LSP: Extracted symbol: {}, imported: {}, in std: {}", 
+                    symbol,
+                    imported_symbols.contains(symbol),
+                    std_symbols.contains_key(symbol)
+                )).await;
+                
+                // Check if this symbol is available in std but not imported
+                if !imported_symbols.contains(symbol) {
+                    if let Some(module_path) = std_symbols.get(symbol) {
+                        self.client.log_message(MessageType::INFO, format!(
+                            "LSP: Creating code action for {} from {}", 
+                            symbol,
+                            module_path
+                        )).await;
+                        
+                        // Check if we already have an import from this module
+                        if let Some((line_idx, line_start, has_destructure, existing_items)) = existing_imports.get(module_path) {
+                            self.client.log_message(MessageType::INFO, format!(
+                                "LSP: Found existing import from {} at line {}", 
+                                module_path, line_idx
+                            )).await;
+                            
+                            // Calculate line end offset
+                            let line = source.lines().nth(*line_idx).unwrap();
+                            let line_end = line_start + line.len();
+                            
+                            let new_line = if *has_destructure {
+                                // Already has destructure syntax: import std.io.{ Display } -> import std.io.{ Display, print }
+                                let mut all_items = existing_items.clone();
+                                all_items.push(symbol.to_string());
+                                format!("import {}.{{ {} }}", module_path, all_items.join(", "))
+                            } else {
+                                // Multiple direct imports: convert to destructure
+                                // import std.io.Display + import std.io.print -> import std.io.{ Display, print }
+                                let mut all_items = existing_items.clone();
+                                all_items.push(symbol.to_string());
+                                format!("import {}.{{ {} }}", module_path, all_items.join(", "))
+                            };
+                            
+                            let mut changes = HashMap::new();
+                            changes.insert(
+                                uri.clone(),
+                                vec![TextEdit {
+                                    range: Range {
+                                        start: offset_to_position(&source, *line_start),
+                                        end: offset_to_position(&source, line_end),
+                                    },
+                                    new_text: new_line,
+                                }],
+                            );
+                            
+                            actions.push(CodeActionOrCommand::CodeAction(CodeAction {
+                                title: format!("Add {} to existing import", symbol),
+                                kind: Some(CodeActionKind::QUICKFIX),
+                                diagnostics: Some(vec![diagnostic.clone()]),
+                                edit: Some(WorkspaceEdit {
+                                    changes: Some(changes),
+                                    ..Default::default()
+                                }),
+                                ..Default::default()
+                            }));
+                        } else {
+                            // No existing import from this module, create a new one
+                            let insert_pos = find_import_insertion_point(&source);
+                            let insert_line = offset_to_position(&source, insert_pos);
+                            
+                            // Create the import statement
+                            let import_statement = format!("import {}.{}\n", module_path, symbol);
+                            
+                            // Create the code action
+                            let mut changes = HashMap::new();
+                            changes.insert(
+                                uri.clone(),
+                                vec![TextEdit {
+                                    range: Range {
+                                        start: insert_line,
+                                        end: insert_line,
+                                    },
+                                    new_text: import_statement,
+                                }],
+                            );
+                            
+                            actions.push(CodeActionOrCommand::CodeAction(CodeAction {
+                                title: format!("Import {}.{}", module_path, symbol),
+                                kind: Some(CodeActionKind::QUICKFIX),
+                                diagnostics: Some(vec![diagnostic.clone()]),
+                                edit: Some(WorkspaceEdit {
+                                    changes: Some(changes),
+                                    ..Default::default()
+                                }),
+                                ..Default::default()
+                            }));
+                        }
+                    }
+                }
+            }
+        }
+        
+        if !actions.is_empty() {
+            return Ok(Some(actions));
+        }
+        
+        Ok(None)
+    }
+}
+
+/// Substitute trait type parameters in a method signature
+/// 
+/// - If impl provides type args (e.g., `Add<i32>`), use those
+/// - Otherwise, use the trait's default type parameters
+/// - Replace `Self` in return types with the implementing type
+fn substitute_trait_type_params(
+    method_sig: &str,
+    trait_type_params: &[(String, Option<String>)],
+    impl_type_args: &[String],
+) -> String {
+    let mut result = method_sig.to_string();
+    
+    // Substitute each type parameter
+    for (i, (param_name, default_type)) in trait_type_params.iter().enumerate() {
+        let replacement = if i < impl_type_args.len() {
+            // Use the provided type arg
+            &impl_type_args[i]
+        } else if let Some(default) = default_type {
+            // Use the default
+            default
+        } else {
+            // No default, leave as-is
+            continue;
+        };
+        
+        // Replace the type parameter name with the concrete type
+        // Match whole words only (to avoid replacing parts of identifiers)
+        let pattern = format!(r"\b{}\b", regex::escape(param_name));
+        if let Ok(re) = regex::Regex::new(&pattern) {
+            result = re.replace_all(&result, replacement).to_string();
+        }
+    }
+    
+    result
 }
 
 /// Find if we're inside a struct literal and return the struct name
 /// Check if we're inside an `impl Trait for Type` block
-/// Returns the trait name if found
-fn find_impl_trait_context(text: &str) -> Option<String> {
+/// Returns the trait name and its type arguments if found
+fn find_impl_trait_context(text: &str) -> Option<(String, Vec<String>)> {
     // Look for pattern: impl TraitName for TypeName { ... 
     // We need to find the most recent "impl" block we're inside
     
@@ -1070,16 +1452,37 @@ fn find_impl_trait_context(text: &str) -> Option<String> {
         // Look backwards from the brace to find "impl TraitName for TypeName"
         let before_brace = text[..start].trim_end();
         
-        // Pattern: impl TraitName for TypeName
+        // Pattern: impl TraitName for TypeName or impl TraitName<TypeArgs> for TypeName
         if let Some(impl_pos) = before_brace.rfind("impl ") {
             let after_impl = &before_brace[impl_pos + 5..].trim();
             
-            // Extract: TraitName for TypeName
+            // Extract: TraitName for TypeName or TraitName<TypeArgs> for TypeName
             if let Some(for_pos) = after_impl.find(" for ") {
-                let trait_name = after_impl[..for_pos].trim();
-                // Make sure it's a simple name (not generic for now)
-                if !trait_name.is_empty() && trait_name.chars().all(|c| c.is_alphanumeric() || c == '_') {
-                    return Some(trait_name.to_string());
+                let trait_part = after_impl[..for_pos].trim();
+                
+                // Check if trait has type arguments: TraitName<TypeArgs>
+                if let Some(angle_start) = trait_part.find('<') {
+                    let trait_name = trait_part[..angle_start].trim();
+                    
+                    // Extract type arguments from <TypeArgs>
+                    if let Some(angle_end) = trait_part.rfind('>') {
+                        let type_args_str = &trait_part[angle_start + 1..angle_end];
+                        // Split by comma and trim each
+                        let type_args: Vec<String> = type_args_str
+                            .split(',')
+                            .map(|s| s.trim().to_string())
+                            .filter(|s| !s.is_empty())
+                            .collect();
+                        
+                        if !trait_name.is_empty() {
+                            return Some((trait_name.to_string(), type_args));
+                        }
+                    }
+                } else {
+                    // No type arguments, just the trait name
+                    if !trait_part.is_empty() && trait_part.chars().all(|c| c.is_alphanumeric() || c == '_') {
+                        return Some((trait_part.to_string(), Vec::new()));
+                    }
                 }
             }
         }
@@ -1932,6 +2335,130 @@ fn get_item_name_and_kind(item: &wisp_ast::Item) -> Option<(String, String)> {
     }
 }
 
+/// Synchronous version for populating std symbols
+fn populate_std_symbols_sync(std_symbols: &mut HashMap<String, String>, base_dir: &Path) {
+    // Find the std directory
+    // First try relative to project root
+    let mut std_dir = base_dir.join("std");
+    
+    if !std_dir.exists() {
+        // Try going up from base_dir to find std
+        let mut current = base_dir.to_path_buf();
+        for _ in 0..5 {  // Limit search depth
+            if !current.pop() {
+                break;
+            }
+            let candidate = current.join("std");
+            if candidate.exists() && candidate.is_dir() {
+                std_dir = candidate;
+                break;
+            }
+        }
+        
+        if !std_dir.exists() {
+            // std directory not found
+            return;
+        }
+    }
+    
+    populate_std_symbols_from_dir_sync(std_symbols, &std_dir, "std");
+}
+
+/// Synchronous recursive scan
+fn populate_std_symbols_from_dir_sync(std_symbols: &mut HashMap<String, String>, dir: &Path, module_prefix: &str) {
+    if let Ok(entries) = fs::read_dir(dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            
+            if path.is_file() && path.extension().map_or(false, |e| e == "ws") {
+                // Parse the file to extract public items
+                if let Ok(source) = fs::read_to_string(&path) {
+                    if let Ok(parse_result) = wisp_parser::Parser::parse_with_recovery(&source) {
+                        let file_stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("");
+                        
+                        // Skip mod.ws as it's just for re-exports
+                        if file_stem == "mod" {
+                            continue;
+                        }
+                        
+                        let module_path = format!("{}.{}", module_prefix, file_stem);
+                        
+                        for item in &parse_result.ast.items {
+                            match item {
+                                Item::Trait(t) if t.is_pub => {
+                                    std_symbols.insert(t.name.name.clone(), module_path.clone());
+                                }
+                                Item::Struct(s) if s.is_pub => {
+                                    std_symbols.insert(s.name.name.clone(), module_path.clone());
+                                }
+                                Item::Function(f) if f.is_pub => {
+                                    std_symbols.insert(f.name.name.clone(), module_path.clone());
+                                }
+                                Item::ExternFunction(f) if f.is_pub => {
+                                    std_symbols.insert(f.name.name.clone(), module_path.clone());
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+                }
+            } else if path.is_dir() {
+                // Recursively scan subdirectories
+                let dir_name = path.file_name().and_then(|s| s.to_str()).unwrap_or("");
+                let new_prefix = format!("{}.{}", module_prefix, dir_name);
+                populate_std_symbols_from_dir_sync(std_symbols, &path, &new_prefix);
+            }
+        }
+    }
+}
+
+/// Find the insertion point for a new import statement
+/// Returns the byte offset where the import should be inserted
+fn find_import_insertion_point(source: &str) -> usize {
+    let mut last_import_end = 0;
+    let mut in_import = false;
+    let mut chars = source.char_indices().peekable();
+    
+    while let Some((i, ch)) = chars.next() {
+        // Skip whitespace and comments
+        if ch.is_whitespace() {
+            continue;
+        }
+        
+        // Check for "import" keyword
+        if ch == 'i' {
+            let rest = &source[i..];
+            if rest.starts_with("import ") || rest.starts_with("import\t") || rest.starts_with("import\n") {
+                in_import = true;
+                // Skip past the entire import statement
+                while let Some((j, c)) = chars.next() {
+                    if c == '\n' {
+                        last_import_end = j + 1;
+                        in_import = false;
+                        break;
+                    }
+                }
+            } else {
+                // Not an import, we've reached the end of imports
+                break;
+            }
+        } else if !in_import {
+            // Found a non-whitespace, non-import character
+            break;
+        }
+    }
+    
+    last_import_end
+}
+
+/// Check if two ranges overlap
+fn ranges_overlap(a: &Range, b: &Range) -> bool {
+    // Ranges overlap if one starts before the other ends
+    !(a.end.line < b.start.line || (a.end.line == b.start.line && a.end.character < b.start.character) ||
+      b.end.line < a.start.line || (b.end.line == a.start.line && b.end.character < a.start.character))
+}
+
+/// Convert a byte offset to a Position
 /// Run the LSP server
 pub async fn run_server() {
     let stdin = tokio::io::stdin();

@@ -62,3 +62,28 @@ pub trait Shr<Rhs = Self> {
     fn shr(self, rhs: Rhs) -> Self
 }
 
+// Equality comparison trait (for ==)
+// Uses references to avoid consuming values during comparison
+pub trait PartialEq<Rhs = Self> {
+    fn eq(&self, rhs: &Rhs) -> bool
+}
+
+// Less-than comparison trait (for <)
+pub trait PartialLt<Rhs = Self> {
+    fn lt(&self, rhs: &Rhs) -> bool
+}
+
+// Greater-than comparison trait (for >)
+pub trait PartialGt<Rhs = Self> {
+    fn gt(&self, rhs: &Rhs) -> bool
+}
+
+// Less-or-equal comparison trait (for <=)
+pub trait PartialLe<Rhs = Self> {
+    fn le(&self, rhs: &Rhs) -> bool
+}
+
+// Greater-or-equal comparison trait (for >=)
+pub trait PartialGe<Rhs = Self> {
+    fn ge(&self, rhs: &Rhs) -> bool
+}

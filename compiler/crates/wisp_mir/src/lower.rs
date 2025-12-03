@@ -530,15 +530,82 @@ impl<'a> FunctionLowerer<'a> {
             }
 
             TypedExprKind::Binary { left, op, right } => {
+                // Check the substituted type (for monomorphization of generics)
+                let left_ty = self.subst_type(&left.ty);
+                
+                // For struct types, the + operator should call the Add::add method
+                // This happens when monomorphizing generic functions with operator trait bounds
+                if let Type::Struct(struct_def_id) = &left_ty {
+                    let method_name = match op {
+                        wisp_ast::BinOp::Add => Some("add"),
+                        wisp_ast::BinOp::Sub => Some("sub"),
+                        wisp_ast::BinOp::Mul => Some("mul"),
+                        wisp_ast::BinOp::Div => Some("div"),
+                        wisp_ast::BinOp::Mod => Some("rem"),
+                        _ => None,
+                    };
+                    
+                    if let Some(method) = method_name {
+                        // Lower left and right as values (add takes self by value)
+                        let left_op = self.lower_expr(left);
+                        let right_op = self.lower_expr(right);
+                        
+                        // Build the method name: StructName::method
+                        let struct_name = self.ctx.get_type_name(*struct_def_id).unwrap_or_default();
+                        let full_method_name = format!("{}::{}", struct_name, method);
+                        
+                        // Use the struct DefId as a placeholder - codegen will look up by name
+                        let func_op = Operand::Constant(Constant::FnPtr(*struct_def_id, full_method_name));
+                        
+                        let result_ty = self.subst_type(&expr.ty);
+                        let temp = self.new_temp(result_ty);
+                        let cont_block = self.new_block();
+                        
+                        self.terminate(Terminator::Call {
+                            func: func_op,
+                            args: vec![left_op, right_op],
+                            destination: Place::local(temp),
+                            target: cont_block,
+                        });
+                        
+                        self.switch_to_block(cont_block);
+                        return Operand::Copy(Place::local(temp));
+                    }
+                }
+                
+                // For primitives or non-overloadable ops, use built-in binary operation
                 let left_op = self.lower_expr(left);
                 let right_op = self.lower_expr(right);
                 let mir_op = convert_binop(*op);
                 
-                let temp = self.new_temp(expr.ty.clone());
+                let temp = self.new_temp(self.subst_type(&expr.ty));
                 self.assign(
                     Place::local(temp),
                     Rvalue::BinaryOp { op: mir_op, left: left_op, right: right_op }
                 );
+                Operand::Copy(Place::local(temp))
+            }
+            
+            TypedExprKind::OperatorCall { method_def_id, method_name, left, right } => {
+                // Lower left and right as values (operator methods take self by value)
+                let left_op = self.lower_expr(left);
+                let right_op = self.lower_expr(right);
+                
+                // Use the actual method DefId for the call
+                let func_op = Operand::Constant(Constant::FnPtr(*method_def_id, method_name.clone()));
+                
+                let result_ty = self.subst_type(&expr.ty);
+                let temp = self.new_temp(result_ty);
+                let cont_block = self.new_block();
+                
+                self.terminate(Terminator::Call {
+                    func: func_op,
+                    args: vec![left_op, right_op],
+                    destination: Place::local(temp),
+                    target: cont_block,
+                });
+                
+                self.switch_to_block(cont_block);
                 Operand::Copy(Place::local(temp))
             }
 

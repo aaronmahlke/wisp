@@ -614,10 +614,7 @@ impl Resolver {
             for import in &module.module_imports {
                 // This module imports another module - add its public items to this module's scope
                 let imported_ns = import.path.last_segment().unwrap_or("");
-                eprintln!("DEBUG: Looking for namespace '{}' (current_namespace: {:?})", imported_ns, self.current_namespace);
-                eprintln!("DEBUG: Available namespaces: {:?}", self.namespaces.keys().collect::<Vec<_>>());
                 if let Some(ns) = self.namespaces.get(imported_ns) {
-                    eprintln!("DEBUG: Found namespace '{}' with {} items", imported_ns, ns.names.len());
                     // Add all items from the imported namespace to this module's scope
                     for (name, &def_id) in &ns.names {
                         // Check if item is public
@@ -646,14 +643,9 @@ impl Resolver {
                         };
                         
                         if let Some(parent) = self.namespaces.get_mut(parent_ns) {
-                            eprintln!("DEBUG: Adding child '{}' to namespace '{}'", child_name, parent_ns);
                             parent.children.insert(child_name, child_ns);
-                        } else {
-                            eprintln!("DEBUG: Parent namespace '{}' not found!", parent_ns);
                         }
                     }
-                } else {
-                    eprintln!("DEBUG: Namespace '{}' NOT found in self.namespaces", imported_ns);
                 }
             }
             

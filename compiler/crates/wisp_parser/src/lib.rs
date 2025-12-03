@@ -1395,6 +1395,32 @@ impl<'src> Parser<'src> {
     fn parse_assignment(&mut self, allow_struct_lit: bool) -> ParseResult<Expr> {
         let expr = self.parse_binary_inner(0, allow_struct_lit)?;
         
+        // Check for compound assignment operators (+=, -=, *=, /=)
+        // Desugar: a += b  -->  a = a + b
+        let compound_op = match self.peek() {
+            Token::PlusEq => Some(BinOp::Add),
+            Token::MinusEq => Some(BinOp::Sub),
+            Token::StarEq => Some(BinOp::Mul),
+            Token::SlashEq => Some(BinOp::Div),
+            _ => None,
+        };
+        
+        if let Some(op) = compound_op {
+            self.advance();
+            let rhs = self.parse_assignment(allow_struct_lit)?;
+            let span = Span::new(expr.span.start, rhs.span.end);
+            
+            // Create: expr = expr op rhs
+            let binary = Expr {
+                kind: ExprKind::Binary(Box::new(expr.clone()), op, Box::new(rhs)),
+                span,
+            };
+            return Ok(Expr {
+                kind: ExprKind::Assign(Box::new(expr), Box::new(binary)),
+                span,
+            });
+        }
+        
         if self.check(&Token::Eq) {
             self.advance();
             let rhs = self.parse_assignment(allow_struct_lit)?;

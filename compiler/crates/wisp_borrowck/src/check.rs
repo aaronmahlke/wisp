@@ -135,6 +135,11 @@ impl<'a> BorrowChecker<'a> {
                 self.check_expr(left);
                 self.check_expr(right);
             }
+            
+            TypedExprKind::OperatorCall { left, right, .. } => {
+                self.check_expr(left);
+                self.check_expr(right);
+            }
 
             TypedExprKind::Unary { expr: inner, .. } => {
                 self.check_expr(inner);
@@ -142,10 +147,37 @@ impl<'a> BorrowChecker<'a> {
 
             TypedExprKind::Call { callee, args } => {
                 self.check_expr(callee);
+                
+                // Track loans created by reference arguments so we can end them after the call
+                let mut arg_loans = Vec::new();
+                
                 for arg in args {
-                    self.check_expr(arg);
-                    // Arguments may be moved
-                    self.check_move_or_copy(arg);
+                    // Special handling for reference arguments: track the loan to end it after the call
+                    if let TypedExprKind::Ref { expr: inner, is_mut } = &arg.kind {
+                        if let Some(place) = self.expr_to_place(inner) {
+                            let can_borrow = if *is_mut {
+                                self.state.can_borrow_mut(&place)
+                            } else {
+                                self.state.can_borrow(&place)
+                            };
+                            
+                            if let Err(conflict) = can_borrow {
+                                self.report_conflict(conflict, arg.span);
+                            } else {
+                                let loan_id = self.state.create_loan(place, *is_mut, arg.span);
+                                arg_loans.push(loan_id);
+                            }
+                        }
+                    } else {
+                        self.check_expr(arg);
+                        // Non-reference arguments may be moved
+                        self.check_move_or_copy(arg);
+                    }
+                }
+                
+                // End all loans created by reference arguments after the call completes
+                for loan_id in arg_loans {
+                    self.state.end_loan(loan_id);
                 }
             }
             
@@ -302,34 +334,134 @@ impl<'a> BorrowChecker<'a> {
             }
             
             TypedExprKind::GenericCall { args, .. } => {
-                // Check arguments (similar to regular call)
+                // Track loans created by reference arguments
+                let mut arg_loans = Vec::new();
+                
                 for arg in args {
-                    self.check_expr(arg);
-                    self.check_move_or_copy(arg);
+                    if let TypedExprKind::Ref { expr: inner, is_mut } = &arg.kind {
+                        if let Some(place) = self.expr_to_place(inner) {
+                            let can_borrow = if *is_mut {
+                                self.state.can_borrow_mut(&place)
+                            } else {
+                                self.state.can_borrow(&place)
+                            };
+                            
+                            if let Err(conflict) = can_borrow {
+                                self.report_conflict(conflict, arg.span);
+                            } else {
+                                let loan_id = self.state.create_loan(place, *is_mut, arg.span);
+                                arg_loans.push(loan_id);
+                            }
+                        }
+                    } else {
+                        self.check_expr(arg);
+                        self.check_move_or_copy(arg);
+                    }
+                }
+                
+                // End all loans after the call
+                for loan_id in arg_loans {
+                    self.state.end_loan(loan_id);
                 }
             }
             
             TypedExprKind::TraitMethodCall { receiver, args, .. } => {
                 self.check_expr(receiver);
+                
+                // Track loans created by reference arguments
+                let mut arg_loans = Vec::new();
+                
                 for arg in args {
-                    self.check_expr(arg);
-                    self.check_move_or_copy(arg);
+                    if let TypedExprKind::Ref { expr: inner, is_mut } = &arg.kind {
+                        if let Some(place) = self.expr_to_place(inner) {
+                            let can_borrow = if *is_mut {
+                                self.state.can_borrow_mut(&place)
+                            } else {
+                                self.state.can_borrow(&place)
+                            };
+                            
+                            if let Err(conflict) = can_borrow {
+                                self.report_conflict(conflict, arg.span);
+                            } else {
+                                let loan_id = self.state.create_loan(place, *is_mut, arg.span);
+                                arg_loans.push(loan_id);
+                            }
+                        }
+                    } else {
+                        self.check_expr(arg);
+                        self.check_move_or_copy(arg);
+                    }
+                }
+                
+                // End all loans after the call
+                for loan_id in arg_loans {
+                    self.state.end_loan(loan_id);
                 }
             }
 
             TypedExprKind::AssociatedFunctionCall { args, .. } => {
-                // Check all arguments
+                // Track loans created by reference arguments
+                let mut arg_loans = Vec::new();
+                
                 for arg in args {
-                    self.check_expr(arg);
-                    self.check_move_or_copy(arg);
+                    if let TypedExprKind::Ref { expr: inner, is_mut } = &arg.kind {
+                        if let Some(place) = self.expr_to_place(inner) {
+                            let can_borrow = if *is_mut {
+                                self.state.can_borrow_mut(&place)
+                            } else {
+                                self.state.can_borrow(&place)
+                            };
+                            
+                            if let Err(conflict) = can_borrow {
+                                self.report_conflict(conflict, arg.span);
+                            } else {
+                                let loan_id = self.state.create_loan(place, *is_mut, arg.span);
+                                arg_loans.push(loan_id);
+                            }
+                        }
+                    } else {
+                        self.check_expr(arg);
+                        self.check_move_or_copy(arg);
+                    }
+                }
+                
+                // End all loans after the call
+                for loan_id in arg_loans {
+                    self.state.end_loan(loan_id);
                 }
             }
 
             TypedExprKind::PrimitiveMethodCall { receiver, args, .. } => {
                 self.check_expr(receiver);
+                
+                // Track loans created by reference arguments
+                let mut arg_loans = Vec::new();
+                
                 for arg in args {
-                    self.check_expr(arg);
-                    self.check_move_or_copy(arg);
+                    if let TypedExprKind::Ref { expr: inner, is_mut } = &arg.kind {
+                        if let Some(place) = self.expr_to_place(inner) {
+                            let can_borrow = if *is_mut {
+                                self.state.can_borrow_mut(&place)
+                            } else {
+                                self.state.can_borrow(&place)
+                            };
+                            
+                            if let Err(conflict) = can_borrow {
+                                self.report_conflict(conflict, arg.span);
+                            } else {
+                                let loan_id = self.state.create_loan(place, *is_mut, arg.span);
+                                arg_loans.push(loan_id);
+                            }
+                        }
+                    } else {
+                        self.check_expr(arg);
+                        self.check_move_or_copy(arg);
+                    }
+                }
+                
+                // End all loans after the call
+                for loan_id in arg_loans {
+                    self.state.end_loan(loan_id);
                 }
             }
 

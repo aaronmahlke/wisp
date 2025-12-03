@@ -876,45 +876,219 @@ impl TypeChecker {
                 let left_typed = self.check_expr(left);
                 let right_typed = self.check_expr(right);
                 
-                // Check if this is an overloadable operator on a non-primitive type
-                if let Some((trait_name, method_name)) = Self::op_to_trait(*op) {
-                    if !left_typed.ty.is_primitive() {
-                        // Try to find an operator trait implementation
-                        if let Some((method_def_id, method_type)) = self.find_op_trait_method(&left_typed.ty, trait_name, method_name) {
-                            // Desugar to a method call: left.add(right)
-                            let (result_type, is_mut_self) = if let Type::Function { ret, params, .. } = &method_type {
-                                // Check that right matches the expected parameter type
-                                if params.len() >= 2 {
-                                    // params[0] is self, params[1] is rhs
-                                    if let Err(e) = self.ctx.unify(&right_typed.ty, &params[1]) {
-                                        self.error(format!("operator {} rhs type mismatch: {}", method_name, e), expr.span);
-                                    }
-                                }
-                                // Check if self param is &mut
-                                let is_mut = params.first().map(|p| matches!(p, Type::Ref { is_mut: true, .. })).unwrap_or(false);
-                                ((**ret).clone(), is_mut)
+                // Check if this is a comparison operator (uses references)
+                let is_comparison_op = matches!(*op, 
+                    wisp_ast::BinOp::Eq | wisp_ast::BinOp::NotEq |
+                    wisp_ast::BinOp::Lt | wisp_ast::BinOp::Gt |
+                    wisp_ast::BinOp::LtEq | wisp_ast::BinOp::GtEq
+                );
+                
+                // Auto-deref support: if operands are references, extract inner types
+                // and prepare deref expressions
+                let (effective_left_ty, left_for_op, needs_left_deref) = if let Type::Ref { inner, .. } = &left_typed.ty {
+                    ((**inner).clone(), left_typed.clone(), true)
+                } else {
+                    (left_typed.ty.clone(), left_typed.clone(), false)
+                };
+                
+                let (effective_right_ty, right_for_op, needs_right_deref) = if let Type::Ref { inner, .. } = &right_typed.ty {
+                    ((**inner).clone(), right_typed.clone(), true)
+                } else {
+                    (right_typed.ty.clone(), right_typed.clone(), false)
+                };
+                
+                // Get the type name for mangling (using effective type, after auto-deref)
+                let left_type_name: Option<String> = match &effective_left_ty {
+                    Type::Struct(def_id) | Type::Enum(def_id) => self.ctx.get_type_name(*def_id),
+                    Type::I8 => Some("i8".to_string()),
+                    Type::I16 => Some("i16".to_string()),
+                    Type::I32 => Some("i32".to_string()),
+                    Type::I64 => Some("i64".to_string()),
+                    Type::U8 => Some("u8".to_string()),
+                    Type::U16 => Some("u16".to_string()),
+                    Type::U32 => Some("u32".to_string()),
+                    Type::U64 => Some("u64".to_string()),
+                    Type::F32 => Some("f32".to_string()),
+                    Type::F64 => Some("f64".to_string()),
+                    Type::Bool => Some("bool".to_string()),
+                    Type::Str => Some("str".to_string()),
+                    _ => None,
+                };
+                
+                // Special handling for != : desugar to !(left == right)
+                if *op == wisp_ast::BinOp::NotEq {
+                    // Skip type parameters - they'll be handled during monomorphization
+                    // Use effective_left_ty to support auto-deref
+                    if !matches!(&effective_left_ty, Type::TypeParam(_, _)) && !effective_left_ty.is_primitive() {
+                        // Try to find PartialEq::eq implementation on the effective (dereferenced) type
+                        if let Some((method_def_id, _method_type)) = self.find_op_trait_method(&effective_left_ty, "PartialEq", "eq") {
+                            // Construct full method name: TypeName::eq
+                            let method_name = left_type_name.as_ref()
+                                .map(|name| format!("{}::eq", name))
+                                .unwrap_or_else(|| "eq".to_string());
+                            
+                            // For comparison, operands should be references to the effective types
+                            // If already references, use them directly; otherwise wrap in Ref
+                            let left_ref = if needs_left_deref {
+                                // Already a reference, use as-is
+                                left_for_op.clone()
                             } else {
-                                self.error(format!("operator {} method has wrong type", method_name), expr.span);
-                                (Type::Error, false)
+                                TypedExpr {
+                                    ty: Type::Ref { is_mut: false, inner: Box::new(effective_left_ty.clone()) },
+                                    kind: TypedExprKind::Ref { is_mut: false, expr: Box::new(left_typed.clone()) },
+                                    span: left_typed.span,
+                                }
+                            };
+                            let right_ref = if needs_right_deref {
+                                right_for_op.clone()
+                            } else {
+                                TypedExpr {
+                                    ty: Type::Ref { is_mut: false, inner: Box::new(effective_right_ty.clone()) },
+                                    kind: TypedExprKind::Ref { is_mut: false, expr: Box::new(right_typed.clone()) },
+                                    span: right_typed.span,
+                                }
                             };
                             
-                            return TypedExpr {
-                                kind: TypedExprKind::MethodCall {
-                                    receiver: Box::new(left_typed),
-                                    method: method_name.to_string(),
+                            // Create the eq call
+                            let eq_call = TypedExpr {
+                                kind: TypedExprKind::OperatorCall {
                                     method_def_id,
-                                    method_span: expr.span,
-                                    is_mut_self,
-                                    args: vec![right_typed],
+                                    method_name,
+                                    left: Box::new(left_ref),
+                                    right: Box::new(right_ref),
                                 },
-                                ty: result_type,
+                                ty: Type::Bool,
+                                span: expr.span,
+                            };
+                            
+                            // Wrap in unary not
+                            return TypedExpr {
+                                kind: TypedExprKind::Unary {
+                                    op: wisp_ast::UnaryOp::Not,
+                                    expr: Box::new(eq_call),
+                                },
+                                ty: Type::Bool,
                                 span: expr.span,
                             };
                         }
                     }
                 }
                 
-                // Fall back to built-in operator handling
+                // Check if this is an overloadable operator on a non-primitive type
+                // For type parameters, we keep it as Binary and let monomorphization handle it
+                // Use effective types to support auto-deref
+                if let Some((trait_name, method_name)) = Self::op_to_trait(*op) {
+                    // Skip type parameters - they'll be handled during monomorphization
+                    if !matches!(&effective_left_ty, Type::TypeParam(_, _)) && !effective_left_ty.is_primitive() {
+                        // Try to find an operator trait implementation for the effective (dereferenced) type
+                        if let Some((method_def_id, method_type)) = self.find_op_trait_method(&effective_left_ty, trait_name, method_name) {
+                            // Desugar to an operator call: left.method(right)
+                            let result_type = if let Type::Function { ret, .. } = &method_type {
+                                (**ret).clone()
+                            } else {
+                                self.error(format!("operator {} method has wrong type", method_name), expr.span);
+                                Type::Error
+                            };
+                            
+                            // Prepare operands with auto-deref and reference wrapping as needed
+                            let (left_arg, right_arg) = if is_comparison_op {
+                                // Comparison operators take references
+                                // If already a reference, use as-is; otherwise wrap in Ref
+                                let left_ref = if needs_left_deref {
+                                    left_for_op.clone()
+                                } else {
+                                    TypedExpr {
+                                        ty: Type::Ref { is_mut: false, inner: Box::new(effective_left_ty.clone()) },
+                                        kind: TypedExprKind::Ref { is_mut: false, expr: Box::new(left_typed.clone()) },
+                                        span: left_typed.span,
+                                    }
+                                };
+                                let right_ref = if needs_right_deref {
+                                    right_for_op.clone()
+                                } else {
+                                    TypedExpr {
+                                        ty: Type::Ref { is_mut: false, inner: Box::new(effective_right_ty.clone()) },
+                                        kind: TypedExprKind::Ref { is_mut: false, expr: Box::new(right_typed.clone()) },
+                                        span: right_typed.span,
+                                    }
+                                };
+                                (left_ref, right_ref)
+                            } else {
+                                // Arithmetic operators take by value - auto-deref if needed
+                                let left_val = if needs_left_deref {
+                                    TypedExpr {
+                                        ty: effective_left_ty.clone(),
+                                        kind: TypedExprKind::Deref(Box::new(left_for_op.clone())),
+                                        span: left_typed.span,
+                                    }
+                                } else {
+                                    left_typed.clone()
+                                };
+                                let right_val = if needs_right_deref {
+                                    TypedExpr {
+                                        ty: effective_right_ty.clone(),
+                                        kind: TypedExprKind::Deref(Box::new(right_for_op.clone())),
+                                        span: right_typed.span,
+                                    }
+                                } else {
+                                    right_typed.clone()
+                                };
+                                (left_val, right_val)
+                            };
+                            
+                            // Construct full method name: TypeName::method
+                            let full_method_name = left_type_name.as_ref()
+                                .map(|name| format!("{}::{}", name, method_name))
+                                .unwrap_or_else(|| method_name.to_string());
+                            
+                            return TypedExpr {
+                                kind: TypedExprKind::OperatorCall {
+                                    method_def_id,
+                                    method_name: full_method_name,
+                                    left: Box::new(left_arg),
+                                    right: Box::new(right_arg),
+                                },
+                                ty: result_type,
+                                span: expr.span,
+                            };
+                        } else {
+                            // Non-primitive type doesn't implement the required operator trait
+                            let type_name = left_type_name.as_ref()
+                                .map(|s| s.as_str())
+                                .unwrap_or("unknown type");
+                            let op_symbol = match *op {
+                                wisp_ast::BinOp::Add => "+",
+                                wisp_ast::BinOp::Sub => "-",
+                                wisp_ast::BinOp::Mul => "*",
+                                wisp_ast::BinOp::Div => "/",
+                                wisp_ast::BinOp::Mod => "%",
+                                wisp_ast::BinOp::Eq => "==",
+                                wisp_ast::BinOp::NotEq => "!=",
+                                wisp_ast::BinOp::Lt => "<",
+                                wisp_ast::BinOp::Gt => ">",
+                                wisp_ast::BinOp::LtEq => "<=",
+                                wisp_ast::BinOp::GtEq => ">=",
+                                _ => "?",
+                            };
+                            self.error(
+                                format!("cannot apply `{}` to type `{}`: `{}` does not implement `{}`",
+                                    op_symbol, type_name, type_name, trait_name),
+                                expr.span
+                            );
+                            return TypedExpr {
+                                kind: TypedExprKind::Binary {
+                                    left: Box::new(left_typed),
+                                    op: *op,
+                                    right: Box::new(right_typed),
+                                },
+                                ty: Type::Error,
+                                span: expr.span,
+                            };
+                        }
+                    }
+                }
+                
+                // Fall back to built-in operator handling (for primitives)
                 let result_type = self.check_binary_op(*op, &left_typed.ty, &right_typed.ty, expr.span);
                 
                 (TypedExprKind::Binary {
@@ -1863,12 +2037,20 @@ impl TypeChecker {
     fn op_to_trait(op: wisp_ast::BinOp) -> Option<(&'static str, &'static str)> {
         use wisp_ast::BinOp;
         match op {
+            // Arithmetic operators
             BinOp::Add => Some(("Add", "add")),
             BinOp::Sub => Some(("Sub", "sub")),
             BinOp::Mul => Some(("Mul", "mul")),
             BinOp::Div => Some(("Div", "div")),
             BinOp::Mod => Some(("Rem", "rem")),
-            // Comparison and logical ops don't use trait overloading (for now)
+            // Comparison operators
+            BinOp::Eq => Some(("PartialEq", "eq")),
+            BinOp::Lt => Some(("PartialLt", "lt")),
+            BinOp::Gt => Some(("PartialGt", "gt")),
+            BinOp::LtEq => Some(("PartialLe", "le")),
+            BinOp::GtEq => Some(("PartialGe", "ge")),
+            // NotEq is handled specially (negate eq result)
+            // Logical ops don't use trait overloading
             _ => None,
         }
     }
@@ -1878,7 +2060,28 @@ impl TypeChecker {
         // Get the trait DefId
         let trait_def_id = self.trait_by_name.get(trait_name)?;
         
-        // Get the type's DefId
+        // Special handling for type parameters: look up method from trait definition
+        if let Type::TypeParam(param_def_id, _) = ty {
+            // Get the trait bounds for this type parameter
+            if let Some(bounds) = self.find_type_param_bounds(*param_def_id) {
+                // Check if this trait is in the bounds
+                if bounds.contains(trait_def_id) {
+                    // Look up the method from the trait definition
+                    if let Some(method_sigs) = self.trait_methods.get(trait_def_id) {
+                        for (name, method_type) in method_sigs {
+                            if name == method_name {
+                                // Return a dummy DefId (we don't have a concrete impl yet)
+                                // and the method type with Self substituted for the type parameter
+                                return Some((*trait_def_id, method_type.clone()));
+                            }
+                        }
+                    }
+                }
+            }
+            return None;
+        }
+        
+        // Get the type's DefId for concrete types
         let type_def_id = match ty {
             Type::Struct(id) => Some(*id),
             Type::Enum(id) => Some(*id),
@@ -1941,7 +2144,8 @@ impl TypeChecker {
                     self.error(format!("arithmetic type mismatch: {}", e), span);
                     return Type::Error;
                 }
-                if !left.is_numeric() && !matches!(left, Type::Var(_) | Type::Error) {
+                // Allow numeric types, type variables, type parameters (which will be checked via trait bounds), and error types
+                if !left.is_numeric() && !matches!(left, Type::Var(_) | Type::TypeParam(_, _) | Type::Error) {
                     self.error("arithmetic requires numeric types".to_string(), span);
                     return Type::Error;
                 }
@@ -2122,18 +2326,33 @@ impl TypeChecker {
             Type::Enum(enum_def_id) => {
                 self.trait_impls.contains_key(&(*enum_def_id, trait_def_id))
             }
-            // Check primitive trait impls
-            Type::I8 => self.primitive_trait_impls.contains(&("i8".to_string(), trait_def_id)),
-            Type::I16 => self.primitive_trait_impls.contains(&("i16".to_string(), trait_def_id)),
-            Type::I32 => self.primitive_trait_impls.contains(&("i32".to_string(), trait_def_id)),
-            Type::I64 => self.primitive_trait_impls.contains(&("i64".to_string(), trait_def_id)),
-            Type::U8 => self.primitive_trait_impls.contains(&("u8".to_string(), trait_def_id)),
-            Type::U16 => self.primitive_trait_impls.contains(&("u16".to_string(), trait_def_id)),
-            Type::U32 => self.primitive_trait_impls.contains(&("u32".to_string(), trait_def_id)),
-            Type::U64 => self.primitive_trait_impls.contains(&("u64".to_string(), trait_def_id)),
-            Type::F32 => self.primitive_trait_impls.contains(&("f32".to_string(), trait_def_id)),
-            Type::F64 => self.primitive_trait_impls.contains(&("f64".to_string(), trait_def_id)),
-            Type::Bool => self.primitive_trait_impls.contains(&("bool".to_string(), trait_def_id)),
+            // Numeric primitives implicitly implement operator traits
+            Type::I8 | Type::I16 | Type::I32 | Type::I64 | Type::I128 |
+            Type::U8 | Type::U16 | Type::U32 | Type::U64 | Type::U128 |
+            Type::F32 | Type::F64 => {
+                // Check if this is an operator trait
+                if let Some(trait_name) = self.ctx.get_type_name(trait_def_id) {
+                    match trait_name.as_str() {
+                        "Add" | "Sub" | "Mul" | "Div" | "Rem" | 
+                        "BitAnd" | "BitOr" | "BitXor" | "Shl" | "Shr" |
+                        "Neg" | "Not" => return true,
+                        _ => {}
+                    }
+                }
+                // Otherwise check explicit impls
+                let type_name = ty.display(&self.ctx);
+                self.primitive_trait_impls.contains(&(type_name, trait_def_id))
+            }
+            // Bool implicitly implements BitAnd, BitOr, BitXor, Not
+            Type::Bool => {
+                if let Some(trait_name) = self.ctx.get_type_name(trait_def_id) {
+                    match trait_name.as_str() {
+                        "BitAnd" | "BitOr" | "BitXor" | "Not" => return true,
+                        _ => {}
+                    }
+                }
+                self.primitive_trait_impls.contains(&("bool".to_string(), trait_def_id))
+            }
             Type::Str => self.primitive_trait_impls.contains(&("str".to_string(), trait_def_id)),
             Type::Ref { inner, .. } => self.type_implements_trait(inner, trait_def_id),
             _ => false,
@@ -2440,6 +2659,8 @@ pub enum TypedExprKind {
     StringLiteral(String),
     Var { name: String, def_id: DefId },
     Binary { left: Box<TypedExpr>, op: wisp_ast::BinOp, right: Box<TypedExpr> },
+    /// Operator call desugared from binary expression (e.g., `a + b` -> `a.add(b)`)
+    OperatorCall { method_def_id: DefId, method_name: String, left: Box<TypedExpr>, right: Box<TypedExpr> },
     Unary { op: wisp_ast::UnaryOp, expr: Box<TypedExpr> },
     Call { callee: Box<TypedExpr>, args: Vec<TypedExpr> },
     /// Call to a generic function with inferred type arguments

@@ -143,10 +143,11 @@ impl Codegen {
             self.collect_strings(func)?;
         }
         
-        // Build map of function return types
-        let mut func_return_types: HashMap<DefId, Type> = HashMap::new();
+        // Build map of function return types by NAME (not DefId)
+        // This is critical because monomorphized functions share DefId but have different return types
+        let mut func_return_types: HashMap<String, Type> = HashMap::new();
         for func in &program.functions {
-            func_return_types.insert(func.def_id, func.return_type.clone());
+            func_return_types.insert(func.name.clone(), func.return_type.clone());
         }
 
         // Fourth pass: define all functions
@@ -249,9 +250,14 @@ impl Codegen {
 
         // Add return type (only if not a struct - struct returns via sret)
         if !returns_struct {
-            let ret_ty = self.convert_type(&func.return_type);
-            if ret_ty != types::INVALID {
-                sig.returns.push(AbiParam::new(ret_ty));
+            // main() always returns i32 for OS exit code, even if declared as () -> ()
+            if func.name == "main" && matches!(func.return_type, Type::Unit) {
+                sig.returns.push(AbiParam::new(types::I32));
+            } else {
+                let ret_ty = self.convert_type(&func.return_type);
+                if ret_ty != types::INVALID {
+                    sig.returns.push(AbiParam::new(ret_ty));
+                }
             }
         }
 
@@ -267,14 +273,20 @@ impl Codegen {
                 message: format!("Failed to declare function '{}': {}", func.name, e),
             })?;
 
-        self.func_ids.insert(func.def_id, func_id);
+        // Note: We don't insert into func_ids for monomorphized functions because
+        // they share the same DefId but have different names. The name-based lookup
+        // in func_by_name is the correct way to find them.
+        // Only insert into func_ids if this is NOT a monomorphized function (no < in name)
+        if !func.name.contains('<') {
+            self.func_ids.insert(func.def_id, func_id);
+            self.func_sigs.insert(func.def_id, sig.clone());
+        }
         self.func_by_name.insert(func.name.clone(), (func.def_id, func_id));
-        self.func_sigs.insert(func.def_id, sig);
 
         Ok(())
     }
 
-    fn define_function(&mut self, func: &MirFunction, structs: &HashMap<DefId, MirStruct>, func_return_types: &HashMap<DefId, Type>) -> Result<(), CodegenError> {
+    fn define_function(&mut self, func: &MirFunction, structs: &HashMap<DefId, MirStruct>, func_return_types: &HashMap<String, Type>) -> Result<(), CodegenError> {
         // Look up by name to handle monomorphized functions (which share the same def_id)
         let func_id = self.func_by_name.get(&func.name)
             .map(|(_, id)| *id)
@@ -300,9 +312,14 @@ impl Codegen {
         
         // Only add return type if not a struct (struct returns via sret)
         if !returns_struct {
-            let ret_ty = self.convert_type(&func.return_type);
-            if ret_ty != types::INVALID {
-                sig.returns.push(AbiParam::new(ret_ty));
+            // main() always returns i32 for OS exit code, even if declared as () -> ()
+            if func.name == "main" && matches!(func.return_type, Type::Unit) {
+                sig.returns.push(AbiParam::new(types::I32));
+            } else {
+                let ret_ty = self.convert_type(&func.return_type);
+                if ret_ty != types::INVALID {
+                    sig.returns.push(AbiParam::new(ret_ty));
+                }
             }
         }
 
@@ -430,8 +447,8 @@ struct FunctionCompiler<'a, 'b> {
     extern_static_gvs: &'a HashMap<DefId, cranelift_codegen::ir::GlobalValue>,
     structs: &'a HashMap<DefId, MirStruct>,
     struct_names: &'a HashMap<DefId, String>,
-    /// Map from function DefId to return type
-    func_return_types: &'a HashMap<DefId, Type>,
+    /// Map from function NAME to return type (name-keyed because monomorphized functions share DefId)
+    func_return_types: &'a HashMap<String, Type>,
     mir_func: &'a MirFunction,
     
     /// Map from MIR local to Cranelift Variable (for scalar types)
@@ -448,6 +465,8 @@ struct FunctionCompiler<'a, 'b> {
     sret_ptr: Option<Variable>,
     /// If function returns struct, this holds the struct DefId
     sret_def_id: Option<DefId>,
+    /// Whether this is the main function
+    is_main: bool,
 }
 
 impl<'a, 'b> FunctionCompiler<'a, 'b> {
@@ -460,7 +479,7 @@ impl<'a, 'b> FunctionCompiler<'a, 'b> {
         extern_static_gvs: &'a HashMap<DefId, cranelift_codegen::ir::GlobalValue>,
         structs: &'a HashMap<DefId, MirStruct>,
         struct_names: &'a HashMap<DefId, String>,
-        func_return_types: &'a HashMap<DefId, Type>,
+        func_return_types: &'a HashMap<String, Type>,
         mir_func: &'a MirFunction,
         returns_struct: bool,
     ) -> Self {
@@ -473,6 +492,9 @@ impl<'a, 'b> FunctionCompiler<'a, 'b> {
         } else {
             None
         };
+        
+        // Check if this is the main function
+        let is_main = mir_func.name == "main";
         
         Self {
             builder,
@@ -492,6 +514,7 @@ impl<'a, 'b> FunctionCompiler<'a, 'b> {
             sret_ptr: None,
             sret_def_id,
             next_var: 0,
+            is_main,
         }
     }
 
@@ -834,7 +857,12 @@ impl<'a, 'b> FunctionCompiler<'a, 'b> {
 
                 let result = match op {
                     UnaryOp::Neg => self.builder.ins().ineg(val),
-                    UnaryOp::Not => self.builder.ins().bnot(val),
+                    // Boolean NOT: !x = (x == 0) - returns 1 if x is 0, 0 otherwise
+                    UnaryOp::Not => self.builder.ins().icmp_imm(
+                        cranelift_codegen::ir::condcodes::IntCC::Equal,
+                        val,
+                        0,
+                    ),
                 };
 
                 Ok(Some(result))
@@ -1299,6 +1327,10 @@ impl<'a, 'b> FunctionCompiler<'a, 'b> {
                     }
                     // Return void
                     self.builder.ins().return_(&[]);
+                } else if self.is_main && matches!(self.mir_func.return_type, Type::Unit) {
+                    // main() with Unit return type should return 0 (success)
+                    let zero = self.builder.ins().iconst(types::I32, 0);
+                    self.builder.ins().return_(&[zero]);
                 } else if let Some(&var) = self.locals.get(&0) {
                     // Scalar return
                     let ret_val = self.builder.use_var(var);
@@ -1350,9 +1382,9 @@ impl<'a, 'b> FunctionCompiler<'a, 'b> {
                     _ => (None, None),
                 };
                 
-                // Check if the callee returns a struct
-                let mut callee_returns_struct = callee_def_id
-                    .and_then(|id| self.func_return_types.get(&id))
+                // Check if the callee returns a struct (using name, not DefId, for monomorphized fns)
+                let mut callee_returns_struct = callee_name.as_ref()
+                    .and_then(|name| self.func_return_types.get(name))
                     .map(|ty| matches!(ty, Type::Struct(_)))
                     .unwrap_or(false);
                 

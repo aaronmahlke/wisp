@@ -1,6 +1,6 @@
-import std.string.String
-import std.ops.Add
 import std.io.{ Display, print }
+import std.ops.Add
+import std.string.String
 
 struct Point {
     x: i32,
@@ -19,17 +19,13 @@ impl Display for Point {
     }
 }
 
-fn add<T>(a: T, b: T) -> T {
+fn add<T: Add>(a: T, b: T) -> T {
     a + b
 }
-
 
 fn main() {
     let a_point = Point { x: 3, y: 8 }
     let b_point = Point { x: 5, y: 7 }
     let point = add(a_point, b_point)
     print(&point)
-
-    let x = add(23, 19)
-    print(&x)
 }
