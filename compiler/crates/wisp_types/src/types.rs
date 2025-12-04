@@ -45,7 +45,10 @@ pub enum Type {
     /// Type variable (for inference)
     Var(u32),
     /// Type parameter (generic)
-    TypeParam(DefId, String),
+    /// - index: position in generics list (for substitution - like Rust's ParamTy.index)
+    /// - name: for display
+    /// - def_id: for looking up type param info (bounds, etc.)
+    TypeParam { index: u32, name: String, def_id: DefId },
     /// Error type (for recovery)
     Error,
 }
@@ -159,7 +162,7 @@ impl Type {
                 format!("fn({}) -> {}", params_str.join(", "), ret.display(ctx))
             }
             Type::Var(id) => format!("?{}", id),
-            Type::TypeParam(_, name) => name.clone(),
+            Type::TypeParam { name, .. } => name.clone(),
             Type::Error => "<error>".to_string(),
         }
     }
@@ -178,6 +181,8 @@ pub struct TypeContext {
     enum_variants: HashMap<DefId, Vec<(String, DefId, Vec<Type>)>>,
     /// Set of DefIds that are type parameters
     type_params: std::collections::HashSet<DefId>,
+    /// Map from type param DefId to its index (position in generics list)
+    type_param_indices: HashMap<DefId, u32>,
     /// Next type variable ID
     next_var: u32,
     /// Type variable substitutions
@@ -198,6 +203,7 @@ impl TypeContext {
             struct_fields: HashMap::new(),
             enum_variants: HashMap::new(),
             type_params: std::collections::HashSet::new(),
+            type_param_indices: HashMap::new(),
             next_var: 0,
             substitutions: HashMap::new(),
             span_types: HashMap::new(),
@@ -265,15 +271,21 @@ impl TypeContext {
         &self.span_definitions
     }
 
-    /// Register a type parameter
-    pub fn register_type_param(&mut self, def_id: DefId, name: String) {
+    /// Register a type parameter with its index
+    pub fn register_type_param(&mut self, def_id: DefId, index: u32, name: String) {
         self.type_params.insert(def_id);
+        self.type_param_indices.insert(def_id, index);
         self.type_names.insert(def_id, name);
     }
     
     /// Check if a DefId is a type parameter
     pub fn is_type_param(&self, def_id: DefId) -> bool {
         self.type_params.contains(&def_id)
+    }
+    
+    /// Get the index of a type parameter
+    pub fn get_type_param_index(&self, def_id: DefId) -> Option<u32> {
+        self.type_param_indices.get(&def_id).copied()
     }
 
     /// Register a type name
@@ -402,7 +414,7 @@ impl TypeContext {
             
             // Type parameter - treat like a type variable for now
             // In a full implementation, we'd track these substitutions separately
-            (Type::TypeParam(_, _), _) | (_, Type::TypeParam(_, _)) => {
+            (Type::TypeParam { .. }, _) | (_, Type::TypeParam { .. }) => {
                 // For now, accept any type for a type parameter
                 // A proper implementation would track and verify consistency
                 Ok(())

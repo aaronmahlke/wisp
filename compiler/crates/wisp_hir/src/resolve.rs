@@ -1021,7 +1021,7 @@ impl Resolver {
         
         // Register enum type parameters in scope
         let mut type_params = Vec::new();
-        for param in &e.type_params {
+        for (index, param) in e.type_params.iter().enumerate() {
             let param_id = self.fresh_id();
             let param_info = DefInfo {
                 id: param_id,
@@ -1042,6 +1042,7 @@ impl Resolver {
             
             type_params.push(ResolvedTypeParam {
                 def_id: param_id,
+                index: index as u32,
                 name: param.name.name.clone(),
                 bounds,
                 default: None,
@@ -1168,7 +1169,7 @@ impl Resolver {
         
         // Register impl type parameters in scope and collect as ResolvedTypeParam
         let mut type_params = Vec::new();
-        for param in &i.type_params {
+        for (index, param) in i.type_params.iter().enumerate() {
             let param_id = self.fresh_id();
             let param_info = DefInfo {
                 id: param_id,
@@ -1189,6 +1190,7 @@ impl Resolver {
             
             type_params.push(ResolvedTypeParam {
                 def_id: param_id,
+                index: index as u32,
                 name: param.name.name.clone(),
                 bounds,
                 default: None,
@@ -1300,7 +1302,7 @@ impl Resolver {
         
         // Add type parameters to scope and collect them
         let mut type_params = Vec::new();
-        for type_param in &f.type_params {
+        for (index, type_param) in f.type_params.iter().enumerate() {
             let param_id = self.fresh_id();
             let param_info = DefInfo {
                 id: param_id,
@@ -1325,6 +1327,7 @@ impl Resolver {
             
             type_params.push(ResolvedTypeParam {
                 def_id: param_id,
+                index: index as u32,
                 name: type_param.name.name.clone(),
                 bounds,
                 default,
@@ -1405,7 +1408,7 @@ impl Resolver {
         
         // Add type parameters to scope and collect them
         let mut type_params = Vec::new();
-        for type_param in &f.type_params {
+        for (index, type_param) in f.type_params.iter().enumerate() {
             let param_id = self.fresh_id();
             let param_info = DefInfo {
                 id: param_id,
@@ -1428,6 +1431,7 @@ impl Resolver {
             
             type_params.push(ResolvedTypeParam {
                 def_id: param_id,
+                index: index as u32,
                 name: type_param.name.name.clone(),
                 bounds,
                 default,

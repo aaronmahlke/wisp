@@ -14,7 +14,7 @@ fn mangle_generic_name(base_name: &str, type_args: &[Type]) -> String {
 /// Check if a type contains any type parameters
 fn has_type_param(ty: &Type) -> bool {
     match ty {
-        Type::TypeParam(_, _) => true,
+        Type::TypeParam { .. } => true,
         Type::Ref { inner, .. } => has_type_param(inner),
         Type::Slice(elem) => has_type_param(elem),
         Type::Array(elem, _) => has_type_param(elem),
@@ -27,45 +27,38 @@ fn has_type_param(ty: &Type) -> bool {
 }
 
 /// Substitute type parameters with concrete types
-fn substitute_type(ty: &Type, type_args: &[Type], type_param_ids: &[DefId]) -> Type {
+/// Uses index-based matching like Rust's ParamTy - the index is the position
+/// in the generics list, so T at index 0 in `Option<T>` matches T at index 0
+/// in `impl<T> Option<T>`, regardless of DefId.
+fn substitute_type(ty: &Type, type_args: &[Type]) -> Type {
     match ty {
-        Type::TypeParam(def_id, name) => {
-            // First try exact DefId match
-            for (i, tp_id) in type_param_ids.iter().enumerate() {
-                if tp_id == def_id {
-                    return type_args.get(i).cloned().unwrap_or(ty.clone());
-                }
-            }
-            // If there's only one type param and one type arg, assume they match
-            // This handles cases where the body uses different DefIds than the signature
-            if type_param_ids.len() == 1 && type_args.len() == 1 {
-                return type_args[0].clone();
-            }
-            ty.clone()
+        Type::TypeParam { index, .. } => {
+            // Use index-based substitution - the index tells us which type arg to use
+            type_args.get(*index as usize).cloned().unwrap_or(ty.clone())
         }
         Type::Ref { is_mut, inner } => Type::Ref {
             is_mut: *is_mut,
-            inner: Box::new(substitute_type(inner, type_args, type_param_ids)),
+            inner: Box::new(substitute_type(inner, type_args)),
         },
-        Type::Slice(elem) => Type::Slice(Box::new(substitute_type(elem, type_args, type_param_ids))),
+        Type::Slice(elem) => Type::Slice(Box::new(substitute_type(elem, type_args))),
         Type::Array(elem, size) => Type::Array(
-            Box::new(substitute_type(elem, type_args, type_param_ids)),
+            Box::new(substitute_type(elem, type_args)),
             *size,
         ),
         Type::Tuple(elems) => Type::Tuple(
-            elems.iter().map(|e| substitute_type(e, type_args, type_param_ids)).collect()
+            elems.iter().map(|e| substitute_type(e, type_args)).collect()
         ),
         Type::Function { params, ret } => Type::Function {
-            params: params.iter().map(|p| substitute_type(p, type_args, type_param_ids)).collect(),
-            ret: Box::new(substitute_type(ret, type_args, type_param_ids)),
+            params: params.iter().map(|p| substitute_type(p, type_args)).collect(),
+            ret: Box::new(substitute_type(ret, type_args)),
         },
         Type::Enum { def_id, type_args: enum_type_args } => Type::Enum {
             def_id: *def_id,
-            type_args: enum_type_args.iter().map(|t| substitute_type(t, type_args, type_param_ids)).collect(),
+            type_args: enum_type_args.iter().map(|t| substitute_type(t, type_args)).collect(),
         },
         Type::Struct { def_id, type_args: struct_type_args } => Type::Struct {
             def_id: *def_id,
-            type_args: struct_type_args.iter().map(|t| substitute_type(t, type_args, type_param_ids)).collect(),
+            type_args: struct_type_args.iter().map(|t| substitute_type(t, type_args)).collect(),
         },
         _ => ty.clone(),
     }
@@ -122,7 +115,7 @@ fn mangle_type(ty: &Type) -> String {
             format!("F{}_{}", params_str.join("_"), mangle_type(ret))
         }
         Type::Var(id) => format!("V{}", id),
-        Type::TypeParam(def_id, _) => format!("P{}", def_id.0),
+        Type::TypeParam { index, name, .. } => format!("{}_{}", name, index),
         Type::Error => "error".to_string(),
     }
 }
@@ -331,12 +324,9 @@ fn lower_monomorphized_function(
 ) -> Option<LowerResult> {
     let body = func.body.as_ref()?;
 
-    // Create substitution info
+    // Create substitution info (just the concrete type args - index-based matching handles the rest)
     let subst = TypeSubstitution {
         type_args: type_args.to_vec(),
-        // We need to get the type param DefIds from the function
-        // For now, we'll extract them from the parameter types
-        type_param_ids: extract_type_param_ids(func),
     };
 
     let mut lowerer = FunctionLowerer::new(func, ctx, extern_statics, None, Some(subst));
@@ -359,10 +349,9 @@ fn lower_monomorphized_impl_method(
 ) -> Option<LowerResult> {
     let body = method.body.as_ref()?;
 
-    // Create substitution info
+    // Create substitution info (just the concrete type args - index-based matching handles the rest)
     let subst = TypeSubstitution {
         type_args: type_args.to_vec(),
-        type_param_ids: extract_type_param_ids(method),
     };
 
     let mut lowerer = FunctionLowerer::new(method, ctx, extern_statics, Some(impl_type_name), Some(subst));
@@ -375,51 +364,11 @@ fn lower_monomorphized_impl_method(
     })
 }
 
-/// Extract type parameter DefIds from a function's signature
-fn extract_type_param_ids(func: &TypedFunction) -> Vec<DefId> {
-    let mut ids = Vec::new();
-    for param in &func.params {
-        collect_type_param_ids(&param.ty, &mut ids);
-    }
-    collect_type_param_ids(&func.return_type, &mut ids);
-    ids
-}
-
-fn collect_type_param_ids(ty: &Type, ids: &mut Vec<DefId>) {
-    match ty {
-        Type::TypeParam(def_id, _) => {
-            if !ids.contains(def_id) {
-                ids.push(*def_id);
-            }
-        }
-        Type::Ref { inner, .. } => collect_type_param_ids(inner, ids),
-        Type::Slice(elem) => collect_type_param_ids(elem, ids),
-        Type::Array(elem, _) => collect_type_param_ids(elem, ids),
-        Type::Tuple(elems) => {
-            for e in elems {
-                collect_type_param_ids(e, ids);
-            }
-        }
-        Type::Function { params, ret } => {
-            for p in params {
-                collect_type_param_ids(p, ids);
-            }
-            collect_type_param_ids(ret, ids);
-        }
-        Type::Enum { type_args, .. } | Type::Struct { type_args, .. } => {
-            for t in type_args {
-                collect_type_param_ids(t, ids);
-            }
-        }
-        _ => {}
-    }
-}
-
 /// Type substitution info for monomorphization
+/// Only stores the concrete type arguments - index-based matching handles substitution
 #[derive(Clone)]
 struct TypeSubstitution {
     type_args: Vec<Type>,
-    type_param_ids: Vec<DefId>,
 }
 
 /// State for lowering a single function
@@ -466,7 +415,7 @@ impl<'a> FunctionLowerer<'a> {
     ) -> Self {
         // Substitute types if we're monomorphizing
         let return_type = if let Some(ref subst) = type_subst {
-            substitute_type(&func.return_type, &subst.type_args, &subst.type_param_ids)
+            substitute_type(&func.return_type, &subst.type_args)
         } else {
             func.return_type.clone()
         };
@@ -519,7 +468,7 @@ impl<'a> FunctionLowerer<'a> {
     /// Substitute type parameters with concrete types if monomorphizing
     fn subst_type(&self, ty: &Type) -> Type {
         if let Some(ref subst) = self.type_subst {
-            substitute_type(ty, &subst.type_args, &subst.type_param_ids)
+            substitute_type(ty, &subst.type_args)
         } else {
             ty.clone()
         }

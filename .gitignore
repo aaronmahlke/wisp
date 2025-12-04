@@ -8,3 +8,4 @@ compiler/target/
 *.o
 
 editors/zed-wisp/target/
+tmp/

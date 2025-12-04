@@ -107,6 +107,14 @@ impl TypeChecker {
             Err(checker.errors)
         }
     }
+    
+    /// Type check with recovery - returns partial TypedProgram even with errors
+    /// This is useful for LSP where we want hover/completion to work even with errors
+    pub fn check_with_recovery(program: &ResolvedProgram) -> (TypedProgram, Vec<TypeError>) {
+        let mut checker = TypeChecker::new();
+        let result = checker.check_program(program);
+        (result, checker.errors)
+    }
 
     fn error(&mut self, message: String, span: Span) {
         self.errors.push(TypeError { message, span });
@@ -177,10 +185,10 @@ impl TypeChecker {
             let mut enum_type_params = Vec::new();
             let mut enum_type_args = Vec::new();
             for tp in &e.type_params {
-                self.ctx.register_type_param(tp.def_id, tp.name.clone());
+                self.ctx.register_type_param(tp.def_id, tp.index, tp.name.clone());
                 enum_type_params.push((tp.def_id, tp.name.clone()));
-                // Create TypeParam as placeholder for the return type
-                enum_type_args.push(Type::TypeParam(tp.def_id, tp.name.clone()));
+                // Create TypeParam as placeholder for the return type - use index and def_id
+                enum_type_args.push(Type::TypeParam { index: tp.index, name: tp.name.clone(), def_id: tp.def_id });
             }
             // Store type params for this enum
             if !enum_type_params.is_empty() {
@@ -228,7 +236,7 @@ impl TypeChecker {
             for m in &t.methods {
                 // Register type params for method
                 for tp in &m.type_params {
-                    self.ctx.register_type_param(tp.def_id, tp.name.clone());
+                    self.ctx.register_type_param(tp.def_id, tp.index, tp.name.clone());
                 }
                 let method_type = self.function_type(m);
                 methods.push((m.name.clone(), method_type));
@@ -240,7 +248,7 @@ impl TypeChecker {
         for f in &program.functions {
             // Register type parameters first so resolve_type can find them
             for tp in &f.type_params {
-                self.ctx.register_type_param(tp.def_id, tp.name.clone());
+                self.ctx.register_type_param(tp.def_id, tp.index, tp.name.clone());
             }
             let fn_type = self.function_type(f);
             self.ctx.register_def_type(f.def_id, fn_type);
@@ -279,7 +287,7 @@ impl TypeChecker {
             // Register impl type parameters first (e.g., the T in impl<T> Option<T>)
             let impl_type_params: Vec<(DefId, String)> = imp.type_params.iter()
                 .map(|tp| {
-                    self.ctx.register_type_param(tp.def_id, tp.name.clone());
+                    self.ctx.register_type_param(tp.def_id, tp.index, tp.name.clone());
                     (tp.def_id, tp.name.clone())
                 })
                 .collect();
@@ -477,7 +485,9 @@ impl TypeChecker {
                 } else if let Some(id) = def_id {
                     // Check if it's a type parameter
                     if self.ctx.is_type_param(*id) {
-                        Type::TypeParam(*id, name.clone())
+                        let index = self.ctx.get_type_param_index(*id)
+                            .expect(&format!("type param '{}' (DefId {:?}) registered but has no index", name, id));
+                        Type::TypeParam { index, name: name.clone(), def_id: *id }
                     } else if let Some(existing) = self.ctx.get_def_type(*id) {
                         // Apply type arguments to generic types
                         match existing {
@@ -559,7 +569,7 @@ impl TypeChecker {
     fn check_function(&mut self, f: &ResolvedFunction) -> TypedFunction {
         // Register type parameters
         for tp in &f.type_params {
-            self.ctx.register_type_param(tp.def_id, tp.name.clone());
+            self.ctx.register_type_param(tp.def_id, tp.index, tp.name.clone());
         }
         
         // Register parameter types and record span→type for LSP
@@ -631,8 +641,21 @@ impl TypeChecker {
 
         // Check that block type matches expected
         if let Some(expected) = expected {
-            if let Err(e) = self.ctx.unify(&last_type, expected) {
-                self.error(format!("block type mismatch: {}", e), block.span);
+            if let Err(_) = self.ctx.unify(&last_type, expected) {
+                let expected_str = expected.display(&self.ctx);
+                let found_str = last_type.display(&self.ctx);
+                
+                // Provide helpful hint if function has no return type
+                let hint = if matches!(expected, Type::Unit) && !matches!(last_type, Type::Unit) {
+                    format!("\nhint: add `-> {}` to the function signature if you want to return a value", found_str)
+                } else {
+                    String::new()
+                };
+                
+                self.error(
+                    format!("expected `{}`, found `{}`{}", expected_str, found_str, hint),
+                    block.span
+                );
             }
         }
 
@@ -981,7 +1004,7 @@ impl TypeChecker {
                 if *op == wisp_ast::BinOp::NotEq {
                     // Skip type parameters - they'll be handled during monomorphization
                     // Use effective_left_ty to support auto-deref
-                    if !matches!(&effective_left_ty, Type::TypeParam(_, _)) && !effective_left_ty.is_primitive() {
+                    if !matches!(&effective_left_ty, Type::TypeParam { .. }) && !effective_left_ty.is_primitive() {
                         // Try to find PartialEq::eq implementation on the effective (dereferenced) type
                         if let Some((method_def_id, _method_type)) = self.find_op_trait_method(&effective_left_ty, "PartialEq", "eq") {
                             // Construct full method name: TypeName::eq
@@ -1041,7 +1064,7 @@ impl TypeChecker {
                 // Use effective types to support auto-deref
                 if let Some((trait_name, method_name)) = Self::op_to_trait(*op) {
                     // Skip type parameters - they'll be handled during monomorphization
-                    if !matches!(&effective_left_ty, Type::TypeParam(_, _)) && !effective_left_ty.is_primitive() {
+                    if !matches!(&effective_left_ty, Type::TypeParam { .. }) && !effective_left_ty.is_primitive() {
                         // Try to find an operator trait implementation for the effective (dereferenced) type
                         if let Some((method_def_id, method_type)) = self.find_op_trait_method(&effective_left_ty, trait_name, method_name) {
                             // Desugar to an operator call: left.method(right)
@@ -1248,12 +1271,12 @@ impl TypeChecker {
                     
                     // Check if receiver is a type parameter with trait bounds
                     let type_param_info = match &receiver_typed.ty {
-                        Type::TypeParam(def_id, _) => {
+                        Type::TypeParam { def_id, .. } => {
                             // Find the bounds for this type param
                             self.find_type_param_bounds(*def_id)
                         }
                         Type::Ref { inner, .. } => {
-                            if let Type::TypeParam(def_id, _) = inner.as_ref() {
+                            if let Type::TypeParam { def_id, .. } = inner.as_ref() {
                                 self.find_type_param_bounds(*def_id)
                             } else {
                                 None
@@ -1305,10 +1328,21 @@ impl TypeChecker {
                                 (Type::Error, false)
                             };
                             
-                            // Record method signature at method span for hover
-                            if let Type::Function { params, ret } = &method_type {
-                                let params_str: Vec<String> = params.iter()
-                                    .map(|p| p.display(&self.ctx))
+                            // Record method signature at method span for hover (use substituted type for concrete signature)
+                            if let Type::Function { params, ret } = &substituted_method_type {
+                                let params_str: Vec<String> = params.iter().enumerate()
+                                    .map(|(i, p)| {
+                                        if i == 0 {
+                                            // First param is self - format nicely
+                                            match p {
+                                                Type::Ref { is_mut: true, .. } => "&mut self".to_string(),
+                                                Type::Ref { is_mut: false, .. } => "&self".to_string(),
+                                                _ => "self".to_string(),
+                                            }
+                                        } else {
+                                            p.display(&self.ctx)
+                                        }
+                                    })
                                     .collect();
                                 let sig = format!("fn {}({}) -> {}", method_name, params_str.join(", "), ret.display(&self.ctx));
                                 self.ctx.record_span_type(method_span.start, method_span.end, sig);
@@ -1422,8 +1456,19 @@ impl TypeChecker {
                             
                             // Record method signature at method span for hover
                             if let Type::Function { params, ret } = &method_type {
-                                let params_str: Vec<String> = params.iter()
-                                    .map(|p| p.display(&self.ctx))
+                                let params_str: Vec<String> = params.iter().enumerate()
+                                    .map(|(i, p)| {
+                                        if i == 0 {
+                                            // First param is self - format nicely
+                                            match p {
+                                                Type::Ref { is_mut: true, .. } => "&mut self".to_string(),
+                                                Type::Ref { is_mut: false, .. } => "&self".to_string(),
+                                                _ => "self".to_string(),
+                                            }
+                                        } else {
+                                            p.display(&self.ctx)
+                                        }
+                                    })
                                     .collect();
                                 let sig = format!("fn {}({}) -> {}", method_name, params_str.join(", "), ret.display(&self.ctx));
                                 self.ctx.record_span_type(method_span.start, method_span.end, sig);
@@ -2150,7 +2195,7 @@ impl TypeChecker {
         let trait_def_id = self.trait_by_name.get(trait_name)?;
         
         // Special handling for type parameters: look up method from trait definition
-        if let Type::TypeParam(param_def_id, _) = ty {
+        if let Type::TypeParam { def_id: param_def_id, .. } = ty {
             // Get the trait bounds for this type parameter
             if let Some(bounds) = self.find_type_param_bounds(*param_def_id) {
                 // Check if this trait is in the bounds
@@ -2234,7 +2279,7 @@ impl TypeChecker {
                     return Type::Error;
                 }
                 // Allow numeric types, type variables, type parameters (which will be checked via trait bounds), and error types
-                if !left.is_numeric() && !matches!(left, Type::Var(_) | Type::TypeParam(_, _) | Type::Error) {
+                if !left.is_numeric() && !matches!(left, Type::Var(_) | Type::TypeParam { .. } | Type::Error) {
                     self.error("arithmetic requires numeric types".to_string(), span);
                     return Type::Error;
                 }
@@ -2356,7 +2401,7 @@ impl TypeChecker {
     /// Infer type arguments by matching a parameter type with an argument type
     fn infer_type_args(&self, param_type: &Type, arg_type: &Type, map: &mut HashMap<DefId, Type>) {
         match param_type {
-            Type::TypeParam(def_id, _) => {
+            Type::TypeParam { def_id, .. } => {
                 // If this type param isn't already inferred, bind it to the arg type
                 if !map.contains_key(def_id) {
                     map.insert(*def_id, arg_type.clone());
@@ -2399,7 +2444,7 @@ impl TypeChecker {
     /// Substitute type parameters with concrete types
     fn substitute_type_params(&self, ty: &Type, type_params: &[(DefId, String)], type_args: &[Type]) -> Type {
         match ty {
-            Type::TypeParam(def_id, _) => {
+            Type::TypeParam { def_id, .. } => {
                 // Find the index of this type param
                 for (i, (tp_def_id, _)) in type_params.iter().enumerate() {
                     if tp_def_id == def_id {

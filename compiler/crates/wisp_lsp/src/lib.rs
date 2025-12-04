@@ -73,6 +73,10 @@ struct DocumentState {
     traits: HashMap<String, TraitInfo>,
     /// Variable definitions: name -> (definition span start, definition span end)
     variable_defs: HashMap<String, (usize, usize)>,
+    /// Variable types: variable name -> type name (for method completion)
+    variable_types: HashMap<String, String>,
+    /// Methods by type: type name -> [(method name, signature)]
+    type_methods: HashMap<String, Vec<(String, String)>>,
     /// Namespaces: namespace_name -> info
     namespaces: HashMap<String, NamespaceInfo>,
     /// Available symbols from std: name -> module path
@@ -107,6 +111,8 @@ impl WispLanguageServer {
         let mut structs = HashMap::new();
         let mut traits = HashMap::new();
         let mut variable_defs = HashMap::new();
+        let mut variable_types: HashMap<String, String> = HashMap::new();
+        let mut type_methods: HashMap<String, Vec<(String, String)>> = HashMap::new();
         
         // Preserve namespaces from previous successful analysis
         let previous_namespaces = if let Ok(docs) = self.documents.read() {
@@ -121,13 +127,6 @@ impl WispLanguageServer {
 
         // Run parser with import resolution (structured for proper namespace handling)
         let base_dir = file_path.parent().unwrap_or(Path::new("."));
-        
-        // Debug: log the paths being used
-        self.client.log_message(MessageType::INFO, format!(
-            "LSP: Analyzing {} (base_dir: {})", 
-            file_str, 
-            base_dir.display()
-        )).await;
         
         // First, try to parse with error recovery to collect all parse errors
         if let Ok(parse_result) = Parser::parse_with_recovery(text) {
@@ -171,6 +170,8 @@ impl WispLanguageServer {
                             structs,
                             traits,
                             variable_defs,
+                            variable_types: HashMap::new(),
+                            type_methods: HashMap::new(),
                             namespaces: previous_namespaces.clone(),
                             std_symbols: HashMap::new(),
                             imported_symbols: HashSet::new(),
@@ -193,26 +194,7 @@ impl WispLanguageServer {
         let mut imported_symbols = HashSet::new();
         
         // Proactively load std modules to populate std_symbols for auto-import
-        // This allows us to suggest imports even if the modules aren't loaded yet
-        self.client.log_message(MessageType::INFO, format!(
-            "LSP: About to call populate_std_symbols_sync, base_dir: {}", 
-            base_dir.display()
-        )).await;
-        
         populate_std_symbols_sync(&mut std_symbols, base_dir);
-        
-        self.client.log_message(MessageType::INFO, format!(
-            "LSP: After populate_std_symbols, found {} symbols", 
-            std_symbols.len()
-        )).await;
-        
-        // Log a few examples
-        for (symbol, path) in std_symbols.iter().take(5) {
-            self.client.log_message(MessageType::INFO, format!(
-                "LSP:   {} -> {}", 
-                symbol, path
-            )).await;
-        }
         
         for module in &ast_with_imports.imported_modules {
             // Determine the module path for std symbols
@@ -262,6 +244,13 @@ impl WispLanguageServer {
                     } else if let Item::Struct(s) = item {
                         if s.is_pub {
                             std_symbols.insert(s.name.name.clone(), path.clone());
+                        }
+                    } else if let Item::Enum(e) = item {
+                        if e.is_pub {
+                            std_symbols.insert(e.name.name.clone(), path.clone());
+                            for variant in &e.variants {
+                                std_symbols.insert(variant.name.name.clone(), path.clone());
+                            }
                         }
                     } else if let Item::Function(f) = item {
                         if f.is_pub {
@@ -319,29 +308,6 @@ impl WispLanguageServer {
             }
         }
         
-        // Debug: log imported modules
-        self.client.log_message(MessageType::INFO, format!(
-            "LSP: Found {} imported modules, {} local items", 
-            ast_with_imports.imported_modules.len(),
-            ast_with_imports.local_items.len()
-        )).await;
-        for (i, module) in ast_with_imports.imported_modules.iter().enumerate() {
-            self.client.log_message(MessageType::INFO, format!(
-                "  Module {}: {:?} (transitive: {}, {} module_imports)", 
-                i,
-                module.import.path,
-                module.is_transitive,
-                module.module_imports.len()
-            )).await;
-            for imp in &module.module_imports {
-                self.client.log_message(MessageType::INFO, format!(
-                    "    - module_import: {:?} (alias: {:?})", 
-                    imp.path,
-                    imp.alias.as_ref().map(|a| &a.name)
-                )).await;
-            }
-        }
-        
         // Also get flat AST for collecting function/struct/trait info
         // If parsing fails, preserve previous document state but still show diagnostics
         let ast = match parse_with_imports(text, &file_path) {
@@ -364,6 +330,8 @@ impl WispLanguageServer {
                             structs: HashMap::new(),
                             traits: HashMap::new(),
                             variable_defs: HashMap::new(),
+                            variable_types: HashMap::new(),
+                            type_methods: HashMap::new(),
                             namespaces: parser_namespaces.clone(),
                             std_symbols: HashMap::new(),
                             imported_symbols: HashSet::new(),
@@ -479,27 +447,49 @@ impl WispLanguageServer {
                 }
                 Item::Impl(imp) => {
                     // Collect methods from impl blocks
+                    let type_name = imp.target_type.pretty_print();
                     for method in &imp.methods {
-                        let type_name = imp.target_type.pretty_print();
                         let params: Vec<(String, String)> = method.params.iter()
                             .map(|p| (p.name.name.clone(), p.ty.pretty_print()))
                             .collect();
+                        // Format params with special handling for self
                         let params_str: Vec<String> = params.iter()
-                            .map(|(n, t)| format!("{}: {}", n, t))
+                            .map(|(n, t)| {
+                                if n == "self" {
+                                    // Format self nicely based on type
+                                    if t.starts_with("&mut ") {
+                                        "&mut self".to_string()
+                                    } else if t.starts_with("&") {
+                                        "&self".to_string()
+                                    } else {
+                                        "self".to_string()
+                                    }
+                                } else {
+                                    format!("{}: {}", n, t)
+                                }
+                            })
                             .collect();
                         let ret = method.return_type.as_ref()
                             .map(|t| format!(" -> {}", t.pretty_print()))
                             .unwrap_or_default();
-                        let method_name = format!("{}::{}", type_name, method.name.name);
+                        let full_method_name = format!("{}.{}", type_name, method.name.name);
+                        let signature = format!("fn {}({}){}", method.name.name, params_str.join(", "), ret);
+                        
+                        // Store in functions map (for global lookup)
                         functions.insert(
-                            method_name.clone(),
+                            full_method_name.clone(),
                             FunctionInfo {
-                                signature: format!("fn {}({}){}", method_name, params_str.join(", "), ret),
+                                signature: signature.clone(),
                                 params,
                                 span: method.name.span,
                                 file: file_str.clone(),
                             }
                         );
+                        
+                        // Store in type_methods (for method completion)
+                        type_methods.entry(type_name.clone())
+                            .or_insert_with(Vec::new)
+                            .push((method.name.name.clone(), signature));
                     }
                 }
                 _ => {}
@@ -514,6 +504,12 @@ impl WispLanguageServer {
                     diagnostics.push(span_to_diagnostic(text, err.span, &err.message, DiagnosticSeverity::ERROR));
                 }
                 if let Ok(mut docs) = self.documents.write() {
+                    // Preserve variables from previous successful analysis
+                    let (prev_vars, prev_defs, prev_methods) = if let Some(old_doc) = docs.get(uri) {
+                        (old_doc.variable_types.clone(), old_doc.variable_defs.clone(), old_doc.type_methods.clone())
+                    } else {
+                        (HashMap::new(), HashMap::new(), HashMap::new())
+                    };
                     docs.insert(uri.clone(), DocumentState {
                         source: text.to_string(),
                         type_info,
@@ -522,7 +518,9 @@ impl WispLanguageServer {
                         functions,
                         structs,
                         traits,
-                        variable_defs,
+                        variable_defs: prev_defs,
+                        variable_types: prev_vars,
+                        type_methods: prev_methods,
                         namespaces: parser_namespaces.clone(),
                         std_symbols: std_symbols.clone(),
                         imported_symbols: imported_symbols.clone(),
@@ -533,57 +531,17 @@ impl WispLanguageServer {
                 return;
             }
         };
-        
-        // Debug: log namespaces from resolved program
-        self.client.log_message(MessageType::INFO, format!(
-            "LSP: Resolved program has {} namespaces: {:?}", 
-            resolved.namespaces.len(),
-            resolved.namespaces.keys().collect::<Vec<_>>()
-        )).await;
-        
-        // Debug: log namespace children
-        for (ns_name, ns_data) in &resolved.namespaces {
-            self.client.log_message(MessageType::INFO, format!(
-                "LSP: Namespace '{}' has {} items, {} children: {:?}", 
-                ns_name,
-                ns_data.items.len(),
-                ns_data.children.len(),
-                ns_data.children.keys().collect::<Vec<_>>()
-            )).await;
-        }
 
-        // Run type checker
-        let typed = match wisp_types::TypeChecker::check(&resolved) {
-            Ok(typed) => typed,
-            Err(errors) => {
-                for err in errors {
-                    diagnostics.push(span_to_diagnostic(text, err.span, &err.message, DiagnosticSeverity::ERROR));
-                }
-                // Collect namespace info even on type error
-                let mut namespaces = HashMap::new();
-                for (ns_name, ns_data) in &resolved.namespaces {
-                    namespaces.insert(ns_name.clone(), convert_namespace_data(ns_data, &resolved));
-                }
-                if let Ok(mut docs) = self.documents.write() {
-                    docs.insert(uri.clone(), DocumentState {
-                        source: text.to_string(),
-                        type_info,
-                        span_definitions,
-                        def_spans,
-                        functions,
-                        structs,
-                        traits,
-                        variable_defs,
-                        namespaces,
-                        std_symbols: std_symbols.clone(),
-                        imported_symbols: imported_symbols.clone(),
-                        diagnostics: diagnostics.clone(),
-                    });
-                }
-                self.client.publish_diagnostics(uri.clone(), diagnostics, None).await;
-                return;
-            }
-        };
+        // Run type checker with recovery - get partial results even with errors
+        let (typed, type_errors) = wisp_types::TypeChecker::check_with_recovery(&resolved);
+        
+        // Add type errors to diagnostics
+        for err in type_errors {
+            diagnostics.push(span_to_diagnostic(text, err.span, &err.message, DiagnosticSeverity::ERROR));
+        }
+        
+        // Continue processing - use the partial TypedProgram for hover/completion
+        // even if there are type errors
 
         // Use compiler's type info directly (recorded during type checking)
         // Filter to only include spans from the current file
@@ -617,8 +575,8 @@ impl WispLanguageServer {
         // Collect named argument info from AST (named arg labels are not in typed AST)
         collect_named_args_from_ast(&ast, &functions, &mut type_info, source_len);
         
-        // Collect variable definitions for go-to-definition
-        collect_variable_defs(&typed, &mut variable_defs, source_len);
+        // Collect variable definitions and types for go-to-definition and method completion
+        collect_variable_defs(&typed, &mut variable_defs, &mut variable_types, &typed.ctx, source_len);
         
         // Collect namespace info from resolved program
         let mut namespaces = HashMap::new();
@@ -634,8 +592,21 @@ impl WispLanguageServer {
             }
         }
 
-        // Store document state
+        // Store document state - MERGE variables with previous state to preserve them during edits
         if let Ok(mut docs) = self.documents.write() {
+            // Merge with previous variable info (in case current analysis is incomplete)
+            if let Some(old_doc) = docs.get(uri) {
+                for (name, ty) in &old_doc.variable_types {
+                    variable_types.entry(name.clone()).or_insert(ty.clone());
+                }
+                for (name, span) in &old_doc.variable_defs {
+                    variable_defs.entry(name.clone()).or_insert(*span);
+                }
+                for (ty, methods) in &old_doc.type_methods {
+                    type_methods.entry(ty.clone()).or_insert(methods.clone());
+                }
+            }
+            
             docs.insert(uri.clone(), DocumentState {
                 source: text.to_string(),
                 type_info,
@@ -645,6 +616,8 @@ impl WispLanguageServer {
                 structs,
                 traits,
                 variable_defs,
+                variable_types,
+                type_methods,
                 namespaces,
                 std_symbols,
                 imported_symbols,
@@ -897,22 +870,17 @@ impl LanguageServer for WispLanguageServer {
         let position = params.text_document_position.position;
         
         if let Ok(docs) = self.documents.read() {
+            eprintln!("Completion: looking for uri={}, have keys={:?}", uri, docs.keys().map(|u| u.path()).collect::<Vec<_>>());
             if let Some(doc) = docs.get(uri) {
+                eprintln!("Completion: found doc with {} vars", doc.variable_types.len());
                 let mut items = Vec::new();
                 let offset = position_to_offset(&doc.source, position);
                 
                 // Check if we're inside a struct literal (look for StructName { before cursor)
                 let before_cursor = &doc.source[..offset];
                 
-                // Debug: log completion context
-                eprintln!("LSP Completion: offset={}, before_cursor ends with: {:?}", 
-                    offset, 
-                    before_cursor.chars().rev().take(20).collect::<String>().chars().rev().collect::<String>());
-                eprintln!("LSP Completion: namespaces available: {:?}", doc.namespaces.keys().collect::<Vec<_>>());
-                
                 // Check if we're in an import statement
                 if let Some(import_path) = find_import_context(before_cursor) {
-                    eprintln!("LSP Completion: import path: {:?}", import_path);
                     let suggestions = get_import_suggestions(uri, &import_path);
                     for (idx, (name, kind)) in suggestions.iter().enumerate() {
                         items.push(CompletionItem {
@@ -989,16 +957,101 @@ impl LanguageServer for WispLanguageServer {
                     }
                 }
                 
+                // Check if we're completing after a variable dot (e.g., "point." -> show Point methods)
+                // Also handles chained calls like "point.force()." by checking type_info
+                // This should be checked BEFORE namespace lookups
+                let expr_type = if let Some(var_name) = get_variable_before_dot(before_cursor) {
+                    eprintln!("Completion: var='{}' in {:?}", var_name, doc.variable_types);
+                    doc.variable_types.get(&var_name).cloned()
+                } else if before_cursor.trim_end().ends_with(").") || before_cursor.trim_end().ends_with(')') {
+                    // Chained method call like "point.force()." - find type from type_info
+                    // Note: offset is the absolute position in the file, type_info uses absolute spans
+                    let trimmed = before_cursor.trim_end();
+                    let dot_offset = if trimmed.ends_with('.') {
+                        offset - 1 // absolute position of the dot
+                    } else {
+                        offset
+                    };
+                    eprintln!("Completion: chained call check, offset={}, dot_offset={}", offset, dot_offset);
+                    // Find the type info for the expression ending just before the dot
+                    let mut best_match: Option<&String> = None;
+                    let mut best_size = usize::MAX;
+                    for ((start, end), type_str) in &doc.type_info {
+                        // Look for spans that end at or near the closing paren (just before dot)
+                        if *end <= dot_offset && *end > dot_offset.saturating_sub(3) {
+                            let size = end - start;
+                            if size < best_size {
+                                best_match = Some(type_str);
+                                best_size = size;
+                                eprintln!("Completion: candidate span ({}, {}) = '{}'", start, end, type_str);
+                            }
+                        }
+                    }
+                    eprintln!("Completion: chained call, found type={:?}", best_match);
+                    // Extract just the type name from signatures like "fn force(...) -> Point"
+                    best_match.and_then(|s| {
+                        if s.contains("->") {
+                            s.split("->").last().map(|t| t.trim().to_string())
+                        } else {
+                            Some(s.clone())
+                        }
+                    })
+                } else {
+                    None
+                };
+                
+                if let Some(type_name) = expr_type {
+                        let type_name_str = type_name.as_str();
+                        let base = type_name_str.split('<').next().unwrap_or(type_name_str);
+                        let generic_key = format!("{}<T>", base);
+                        eprintln!("Completion: type='{}', base='{}', generic_key='{}', methods={:?}", 
+                            type_name, base, generic_key, doc.type_methods.get(&generic_key));
+                        // Look up methods for this type
+                        if let Some(methods) = doc.type_methods.get(&type_name) {
+                            for (method_name, signature) in methods {
+                                items.push(CompletionItem {
+                                    label: method_name.clone(),
+                                    kind: Some(CompletionItemKind::METHOD),
+                                    detail: Some(signature.clone()),
+                                    insert_text: Some(format!("{}($0)", method_name)),
+                                    insert_text_format: Some(InsertTextFormat::SNIPPET),
+                                    sort_text: Some(format!("0{}", method_name)),
+                                    ..Default::default()
+                                });
+                            }
+                        }
+                        // Also check type_methods for the generic version (Option<Point> -> Option<T>)
+                        let base_type = type_name_str.split('<').next().unwrap_or(type_name_str);
+                        let generic_type = format!("{}<T>", base_type);
+                        if base_type != type_name_str {
+                            if let Some(methods) = doc.type_methods.get(&generic_type) {
+                                for (method_name, signature) in methods {
+                                    // Avoid duplicates
+                                    if !items.iter().any(|i| i.label == *method_name) {
+                                        items.push(CompletionItem {
+                                            label: method_name.clone(),
+                                            kind: Some(CompletionItemKind::METHOD),
+                                            detail: Some(signature.clone()),
+                                            insert_text: Some(format!("{}($0)", method_name)),
+                                            insert_text_format: Some(InsertTextFormat::SNIPPET),
+                                            sort_text: Some(format!("0{}", method_name)),
+                                            ..Default::default()
+                                        });
+                                    }
+                                }
+                            }
+                        }
+                        // After a dot, only show methods - don't fall through to show other completions
+                        return Ok(Some(CompletionResponse::Array(items)));
+                }
+                
                 // Check if we're accessing a namespace (e.g., std. or io.)
                 let ns_context = find_namespace_context(before_cursor);
-                eprintln!("LSP Completion: find_namespace_context returned: {:?}", ns_context);
+                eprintln!("Completion: ns_context={:?}", ns_context);
                 
                 if let Some(ns_path) = ns_context {
-                    eprintln!("LSP Completion: Looking up namespace path {:?}", ns_path);
                     // Look up the namespace
                     if let Some(ns_info) = lookup_namespace_path(&doc.namespaces, &ns_path) {
-                        eprintln!("LSP Completion: Found namespace with {} items, {} children", 
-                            ns_info.items.len(), ns_info.children.len());
                         // Suggest items from this namespace
                         for (name, (kind, _detail)) in &ns_info.items {
                             let completion_kind = match kind.as_str() {
@@ -1033,21 +1086,23 @@ impl LanguageServer for WispLanguageServer {
                 }
                 
                 // Check if we're in a function call (look for function_name( before cursor)
-                if let Some(func_context) = find_function_call_context(before_cursor) {
-                    if let Some(func_info) = doc.functions.get(&func_context) {
-                        // Show named argument suggestions
-                        for (param_name, param_type) in &func_info.params {
-                            items.push(CompletionItem {
-                                label: format!("{}: ", param_name),
-                                kind: Some(CompletionItemKind::VARIABLE),
-                                detail: Some(param_type.clone()),
-                                insert_text: Some(format!("{}: ", param_name)),
-                                sort_text: Some(format!("0{}", param_name)), // Sort before other completions
-                                ..Default::default()
-                            });
-                        }
-                        if !items.is_empty() {
-                            return Ok(Some(CompletionResponse::Array(items)));
+                // But NOT if we're after a dot (method call context)
+                let is_after_dot = before_cursor.trim_end().ends_with('.');
+                if !is_after_dot {
+                    if let Some(func_context) = find_function_call_context(before_cursor) {
+                        if let Some(func_info) = doc.functions.get(&func_context) {
+                            // Show named argument suggestions (but don't return - also show variables)
+                            for (param_name, param_type) in &func_info.params {
+                                items.push(CompletionItem {
+                                    label: format!("{}: ", param_name),
+                                    kind: Some(CompletionItemKind::FIELD),
+                                    detail: Some(param_type.clone()),
+                                    insert_text: Some(format!("{}: ", param_name)),
+                                    sort_text: Some(format!("1{}", param_name)), // After variables (0)
+                                    ..Default::default()
+                                });
+                            }
+                            // Don't return - continue to add local variables
                         }
                     }
                 }
@@ -1063,7 +1118,11 @@ impl LanguageServer for WispLanguageServer {
                 }
                 
                 // Default: suggest all functions, structs, and keywords
+                // Skip methods (contain ".") - they're only shown after a dot on a variable
                 for (name, info) in &doc.functions {
+                    if name.contains('.') {
+                        continue; // Skip methods like "Point.add"
+                    }
                     let (insert_text, insert_format) = if info.params.is_empty() {
                         (format!("{}()", name), None)
                     } else {
@@ -1075,6 +1134,7 @@ impl LanguageServer for WispLanguageServer {
                         detail: Some(info.signature.clone()),
                         insert_text: Some(insert_text),
                         insert_text_format: insert_format,
+                        sort_text: Some(format!("1{}", name)), // After variables (0)
                         ..Default::default()
                     });
                 }
@@ -1087,8 +1147,23 @@ impl LanguageServer for WispLanguageServer {
                         // Insert struct literal template with cursor inside
                         insert_text: Some(format!("{} {{ $0 }}", name)),
                         insert_text_format: Some(InsertTextFormat::SNIPPET),
+                        sort_text: Some(format!("2{}", name)), // After variables (0) and functions (1)
                         ..Default::default()
                     });
+                }
+                
+                // Local variables (if not after a dot)
+                eprintln!("Completion: is_after_dot={}, variable_types.len()={}", is_after_dot, doc.variable_types.len());
+                if !is_after_dot {
+                    for (var_name, var_type) in &doc.variable_types {
+                        items.push(CompletionItem {
+                            label: var_name.clone(),
+                            kind: Some(CompletionItemKind::VARIABLE),
+                            detail: Some(var_type.clone()),
+                            sort_text: Some(format!("0{}", var_name)), // Sort before keywords
+                            ..Default::default()
+                        });
+                    }
                 }
                 
                 // Keywords
@@ -1098,6 +1173,7 @@ impl LanguageServer for WispLanguageServer {
                     items.push(CompletionItem {
                         label: kw.to_string(),
                         kind: Some(CompletionItemKind::KEYWORD),
+                        sort_text: Some(format!("3{}", kw)), // After variables, functions, structs
                         ..Default::default()
                     });
                 }
@@ -1107,6 +1183,7 @@ impl LanguageServer for WispLanguageServer {
                     items.push(CompletionItem {
                         label: ty.to_string(),
                         kind: Some(CompletionItemKind::TYPE_PARAMETER),
+                        sort_text: Some(format!("4{}", ty)), // Last priority
                         ..Default::default()
                     });
                 }
@@ -1163,12 +1240,6 @@ impl LanguageServer for WispLanguageServer {
     async fn code_action(&self, params: CodeActionParams) -> Result<Option<CodeActionResponse>> {
         let uri = &params.text_document.uri;
         
-        self.client.log_message(MessageType::INFO, format!(
-            "LSP: code_action called with {} diagnostics, range: {:?}", 
-            params.context.diagnostics.len(),
-            params.range
-        )).await;
-        
         // Clone the data we need before doing any awaits to avoid holding the RwLock
         let (source, std_symbols, imported_symbols, stored_diagnostics) = if let Ok(docs) = self.documents.read() {
             if let Some(doc) = docs.get(uri) {
@@ -1179,21 +1250,6 @@ impl LanguageServer for WispLanguageServer {
         } else {
             return Ok(None);
         };
-        
-        self.client.log_message(MessageType::INFO, format!(
-            "LSP: Found document, {} std_symbols available, {} imported, {} stored diagnostics", 
-            std_symbols.len(),
-            imported_symbols.len(),
-            stored_diagnostics.len()
-        )).await;
-        
-        // Log some example std_symbols
-        for (symbol, path) in std_symbols.iter().take(3) {
-            self.client.log_message(MessageType::INFO, format!(
-                "LSP:   std_symbol: {} -> {}", 
-                symbol, path
-            )).await;
-        }
         
         let mut actions = Vec::new();
         
@@ -1208,16 +1264,8 @@ impl LanguageServer for WispLanguageServer {
         };
         
         if diagnostics_to_check.is_empty() {
-            self.client.log_message(MessageType::INFO, 
-                "LSP: No diagnostics in range for code actions".to_string()
-            ).await;
             return Ok(None);
         }
-        
-        self.client.log_message(MessageType::INFO, format!(
-            "LSP: Checking {} diagnostics for code actions", 
-            diagnostics_to_check.len()
-        )).await;
         
         // First, parse existing imports to find what modules are already imported
         let mut existing_imports: HashMap<String, (usize, usize, bool, Vec<String>)> = HashMap::new(); 
@@ -1262,11 +1310,6 @@ impl LanguageServer for WispLanguageServer {
             // - "undefined struct 'Point'"
             let message = &diagnostic.message;
             
-            self.client.log_message(MessageType::INFO, format!(
-                "LSP: Processing diagnostic: {}", 
-                message
-            )).await;
-            
             // Extract symbol name from error message
             let symbol_name = if let Some(start) = message.find('\'') {
                 if let Some(end) = message[start+1..].find('\'') {
@@ -1279,28 +1322,11 @@ impl LanguageServer for WispLanguageServer {
             };
             
             if let Some(symbol) = symbol_name {
-                self.client.log_message(MessageType::INFO, format!(
-                    "LSP: Extracted symbol: {}, imported: {}, in std: {}", 
-                    symbol,
-                    imported_symbols.contains(symbol),
-                    std_symbols.contains_key(symbol)
-                )).await;
-                
                 // Check if this symbol is available in std but not imported
                 if !imported_symbols.contains(symbol) {
                     if let Some(module_path) = std_symbols.get(symbol) {
-                        self.client.log_message(MessageType::INFO, format!(
-                            "LSP: Creating code action for {} from {}", 
-                            symbol,
-                            module_path
-                        )).await;
-                        
                         // Check if we already have an import from this module
                         if let Some((line_idx, line_start, has_destructure, existing_items)) = existing_imports.get(module_path) {
-                            self.client.log_message(MessageType::INFO, format!(
-                                "LSP: Found existing import from {} at line {}", 
-                                module_path, line_idx
-                            )).await;
                             
                             // Calculate line end offset
                             let line = source.lines().nth(*line_idx).unwrap();
@@ -1615,25 +1641,27 @@ fn lookup_namespace_path<'a>(namespaces: &'a HashMap<String, NamespaceInfo>, pat
 
 /// Detect if we're in an import statement and return the import path being typed
 fn find_import_context(text: &str) -> Option<String> {
-    let trimmed = text.trim_end();
+    // Get the current line (the last line in the text)
+    let current_line = text.lines().last().unwrap_or("");
+    let trimmed_line = current_line.trim();
     
-    // Check if we're after "import "
-    if let Some(import_pos) = trimmed.rfind("import ") {
-        let after_import = &trimmed[import_pos + 7..]; // Skip "import "
-        
-        // Skip if we're in destructure syntax: import { ... } from
-        if after_import.starts_with('{') {
-            // Check for "from" pattern
-            if let Some(from_pos) = after_import.rfind("from ") {
-                return Some(after_import[from_pos + 5..].trim().to_string());
-            }
-            return None;
-        }
-        
-        return Some(after_import.trim().to_string());
+    // Only match if this line starts with "import "
+    if !trimmed_line.starts_with("import ") {
+        return None;
     }
     
-    None
+    let after_import = &trimmed_line[7..]; // Skip "import "
+    
+    // Skip if we're in destructure syntax: import { ... } from
+    if after_import.starts_with('{') {
+        // Check for "from" pattern
+        if let Some(from_pos) = after_import.rfind("from ") {
+            return Some(after_import[from_pos + 5..].trim().to_string());
+        }
+        return None;
+    }
+    
+    Some(after_import.trim().to_string())
 }
 
 /// Get import suggestions by scanning the filesystem and parsing modules for items
@@ -1979,6 +2007,43 @@ fn get_type_before_dot(source: &str, offset: usize) -> Option<String> {
     }
 }
 
+/// Get variable name before a dot for method completion
+/// e.g., for "point." returns Some("point")
+/// Also handles "point.or" (typing method name) -> returns Some("point")
+fn get_variable_before_dot(source: &str) -> Option<String> {
+    let trimmed = source.trim_end();
+    
+    // Find the last dot in the source
+    let dot_pos = trimmed.rfind('.')?;
+    
+    // Check what's after the dot - must be empty or an identifier (partial method name)
+    let after_dot = &trimmed[dot_pos + 1..];
+    if !after_dot.is_empty() && !after_dot.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+        return None; // Something other than an identifier after dot, e.g., "1.0" or "x.y("
+    }
+    
+    // Find the variable name before the dot
+    let before_dot = &trimmed[..dot_pos].trim_end();
+    let mut end = before_dot.len();
+    let mut start = end;
+    
+    let bytes = before_dot.as_bytes();
+    while start > 0 {
+        let ch = bytes[start - 1];
+        if ch.is_ascii_alphanumeric() || ch == b'_' {
+            start -= 1;
+        } else {
+            break;
+        }
+    }
+    
+    if start < end {
+        Some(before_dot[start..end].to_string())
+    } else {
+        None
+    }
+}
+
 /// Convert LSP Position to byte offset
 fn position_to_offset(source: &str, position: Position) -> usize {
     let mut line = 0u32;
@@ -2154,20 +2219,23 @@ fn collect_named_args_from_expr(
     }
 }
 
-/// Collect variable definitions for go-to-definition (simplified version)
+/// Collect variable definitions and types for go-to-definition and method completion
 fn collect_variable_defs(
     program: &wisp_types::TypedProgram,
     variable_defs: &mut HashMap<String, (usize, usize)>,
+    variable_types: &mut HashMap<String, String>,
+    ctx: &wisp_types::TypeContext,
     source_len: usize,
 ) {
-    // Collect function parameters
+    // Collect function parameters and body variables
     for func in &program.functions {
         if func.span.end > source_len { continue; }
         for param in &func.params {
             variable_defs.insert(param.name.clone(), (param.span.start, param.span.end));
+            variable_types.insert(param.name.clone(), param.ty.display(ctx));
         }
         if let Some(ref body) = func.body {
-            collect_block_variable_defs(body, variable_defs, source_len);
+            collect_block_variable_defs(body, variable_defs, variable_types, ctx, source_len);
         }
     }
     
@@ -2177,9 +2245,10 @@ fn collect_variable_defs(
             if method.span.end > source_len { continue; }
             for param in &method.params {
                 variable_defs.insert(param.name.clone(), (param.span.start, param.span.end));
+                variable_types.insert(param.name.clone(), param.ty.display(ctx));
             }
             if let Some(ref body) = method.body {
-                collect_block_variable_defs(body, variable_defs, source_len);
+                collect_block_variable_defs(body, variable_defs, variable_types, ctx, source_len);
             }
         }
     }
@@ -2188,20 +2257,23 @@ fn collect_variable_defs(
 fn collect_block_variable_defs(
     block: &wisp_types::TypedBlock,
     variable_defs: &mut HashMap<String, (usize, usize)>,
+    variable_types: &mut HashMap<String, String>,
+    ctx: &wisp_types::TypeContext,
     source_len: usize,
 ) {
     for stmt in &block.stmts {
         match stmt {
-            wisp_types::TypedStmt::Let { name, span, init, .. } => {
+            wisp_types::TypedStmt::Let { name, span, init, ty, .. } => {
                 if span.end <= source_len {
                     variable_defs.insert(name.clone(), (span.start, span.end));
+                    variable_types.insert(name.clone(), ty.display(ctx));
                 }
                 if let Some(init) = init {
-                    collect_expr_variable_defs(init, variable_defs, source_len);
+                    collect_expr_variable_defs(init, variable_defs, variable_types, ctx, source_len);
                 }
             }
             wisp_types::TypedStmt::Expr(expr) => {
-                collect_expr_variable_defs(expr, variable_defs, source_len);
+                collect_expr_variable_defs(expr, variable_defs, variable_types, ctx, source_len);
             }
         }
     }
@@ -2210,27 +2282,154 @@ fn collect_block_variable_defs(
 fn collect_expr_variable_defs(
     expr: &wisp_types::TypedExpr,
     variable_defs: &mut HashMap<String, (usize, usize)>,
+    variable_types: &mut HashMap<String, String>,
+    ctx: &wisp_types::TypeContext,
     source_len: usize,
 ) {
     if expr.span.end > source_len { return; }
     
     match &expr.kind {
         wisp_types::TypedExprKind::Block(block) => {
-            collect_block_variable_defs(block, variable_defs, source_len);
+            collect_block_variable_defs(block, variable_defs, variable_types, ctx, source_len);
         }
         wisp_types::TypedExprKind::If { then_block, else_block, .. } => {
-            collect_block_variable_defs(then_block, variable_defs, source_len);
+            collect_block_variable_defs(then_block, variable_defs, variable_types, ctx, source_len);
             if let Some(else_branch) = else_block {
                 match else_branch {
-                    wisp_types::TypedElse::Block(block) => collect_block_variable_defs(block, variable_defs, source_len),
-                    wisp_types::TypedElse::If(if_expr) => collect_expr_variable_defs(if_expr, variable_defs, source_len),
+                    wisp_types::TypedElse::Block(block) => collect_block_variable_defs(block, variable_defs, variable_types, ctx, source_len),
+                    wisp_types::TypedElse::If(if_expr) => collect_expr_variable_defs(if_expr, variable_defs, variable_types, ctx, source_len),
                 }
             }
         }
         wisp_types::TypedExprKind::While { body, .. } => {
-            collect_block_variable_defs(body, variable_defs, source_len);
+            collect_block_variable_defs(body, variable_defs, variable_types, ctx, source_len);
         }
         _ => {}
+    }
+}
+
+/// Collect variable definitions from resolved AST (used when type checking fails)
+/// This gives us at least variable names for completion, even without full type info
+fn collect_variable_defs_from_resolved(
+    resolved: &wisp_hir::ResolvedProgram,
+    variable_defs: &mut HashMap<String, (usize, usize)>,
+    variable_types: &mut HashMap<String, String>,
+    source_len: usize,
+) {
+    // Collect from functions
+    for func in &resolved.functions {
+        if func.span.end > source_len { continue; }
+        
+        // Function parameters
+        for param in &func.params {
+            variable_defs.insert(param.name.clone(), (param.span.start, param.span.end));
+            variable_types.insert(param.name.clone(), resolved_type_to_string(&param.ty));
+        }
+        
+        // Function body
+        if let Some(ref body) = func.body {
+            collect_resolved_block_vars(body, variable_defs, variable_types, source_len);
+        }
+    }
+    
+    // Collect from impl methods
+    for imp in &resolved.impls {
+        for method in &imp.methods {
+            if method.span.end > source_len { continue; }
+            
+            for param in &method.params {
+                variable_defs.insert(param.name.clone(), (param.span.start, param.span.end));
+                variable_types.insert(param.name.clone(), resolved_type_to_string(&param.ty));
+            }
+            
+            if let Some(ref body) = method.body {
+                collect_resolved_block_vars(body, variable_defs, variable_types, source_len);
+            }
+        }
+    }
+}
+
+fn collect_resolved_block_vars(
+    block: &wisp_hir::ResolvedBlock,
+    variable_defs: &mut HashMap<String, (usize, usize)>,
+    variable_types: &mut HashMap<String, String>,
+    source_len: usize,
+) {
+    for stmt in &block.stmts {
+        match stmt {
+            wisp_hir::ResolvedStmt::Let { name, span, ty, init, .. } => {
+                if span.end <= source_len {
+                    variable_defs.insert(name.clone(), (span.start, span.end));
+                    if let Some(ty) = ty {
+                        variable_types.insert(name.clone(), resolved_type_to_string(ty));
+                    }
+                }
+                if let Some(init) = init {
+                    collect_resolved_expr_vars(init, variable_defs, variable_types, source_len);
+                }
+            }
+            wisp_hir::ResolvedStmt::Expr(expr) => {
+                collect_resolved_expr_vars(expr, variable_defs, variable_types, source_len);
+            }
+        }
+    }
+}
+
+fn collect_resolved_expr_vars(
+    expr: &wisp_hir::ResolvedExpr,
+    variable_defs: &mut HashMap<String, (usize, usize)>,
+    variable_types: &mut HashMap<String, String>,
+    source_len: usize,
+) {
+    if expr.span.end > source_len { return; }
+    
+    match &expr.kind {
+        wisp_hir::ResolvedExprKind::Block(block) => {
+            collect_resolved_block_vars(block, variable_defs, variable_types, source_len);
+        }
+        wisp_hir::ResolvedExprKind::If { then_block, else_block, .. } => {
+            collect_resolved_block_vars(then_block, variable_defs, variable_types, source_len);
+            if let Some(else_branch) = else_block {
+                match else_branch {
+                    wisp_hir::ResolvedElse::Block(block) => {
+                        collect_resolved_block_vars(block, variable_defs, variable_types, source_len);
+                    }
+                    wisp_hir::ResolvedElse::If(if_expr) => {
+                        collect_resolved_expr_vars(if_expr, variable_defs, variable_types, source_len);
+                    }
+                }
+            }
+        }
+        wisp_hir::ResolvedExprKind::While { body, .. } => {
+            collect_resolved_block_vars(body, variable_defs, variable_types, source_len);
+        }
+        _ => {}
+    }
+}
+
+fn resolved_type_to_string(ty: &wisp_hir::ResolvedType) -> String {
+    match ty {
+        wisp_hir::ResolvedType::Named { name, type_args, .. } => {
+            if type_args.is_empty() {
+                name.clone()
+            } else {
+                let args: Vec<_> = type_args.iter().map(resolved_type_to_string).collect();
+                format!("{}<{}>", name, args.join(", "))
+            }
+        }
+        wisp_hir::ResolvedType::Ref { is_mut, inner } => {
+            if *is_mut {
+                format!("&mut {}", resolved_type_to_string(inner))
+            } else {
+                format!("&{}", resolved_type_to_string(inner))
+            }
+        }
+        wisp_hir::ResolvedType::Slice { elem } => {
+            format!("[{}]", resolved_type_to_string(elem))
+        }
+        wisp_hir::ResolvedType::Unit => "()".to_string(),
+        wisp_hir::ResolvedType::SelfType => "Self".to_string(),
+        wisp_hir::ResolvedType::Error => "?".to_string(),
     }
 }
 
@@ -2390,6 +2589,14 @@ fn populate_std_symbols_from_dir_sync(std_symbols: &mut HashMap<String, String>,
                                 }
                                 Item::Struct(s) if s.is_pub => {
                                     std_symbols.insert(s.name.name.clone(), module_path.clone());
+                                }
+                                Item::Enum(e) if e.is_pub => {
+                                    // Insert the enum itself
+                                    std_symbols.insert(e.name.name.clone(), module_path.clone());
+                                    // Insert each variant (e.g., Some, None for Option)
+                                    for variant in &e.variants {
+                                        std_symbols.insert(variant.name.name.clone(), module_path.clone());
+                                    }
                                 }
                                 Item::Function(f) if f.is_pub => {
                                     std_symbols.insert(f.name.name.clone(), module_path.clone());

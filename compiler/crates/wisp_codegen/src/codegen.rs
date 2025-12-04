@@ -10,6 +10,7 @@ use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext, Variable};
 use cranelift_module::{Linkage, Module, FuncId, DataDescription, DataId};
 use cranelift_object::{ObjectBuilder, ObjectModule};
 use wisp_mir::*;
+use wisp_mir::{AggregateType, Aggregate};
 use wisp_types::Type;
 use wisp_hir::DefId;
 use std::collections::HashMap;
@@ -234,11 +235,11 @@ impl Codegen {
     fn declare_function(&mut self, func: &MirFunction) -> Result<(), CodegenError> {
         let mut sig = Signature::new(CallConv::SystemV);
         
-        // Check if this function returns a struct (needs sret handling)
-        let returns_struct = matches!(&func.return_type, Type::Struct { .. });
+        // Check if this function returns an aggregate (struct or enum) - needs sret handling
+        let returns_aggregate = matches!(&func.return_type, Type::Struct { .. } | Type::Enum { .. });
         
-        // If returning a struct, add an implicit sret pointer as first parameter
-        if returns_struct {
+        // If returning an aggregate, add an implicit sret pointer as first parameter
+        if returns_aggregate {
             sig.params.push(AbiParam::new(types::I64)); // sret pointer
         }
 
@@ -248,8 +249,8 @@ impl Codegen {
             sig.params.push(AbiParam::new(ty));
         }
 
-        // Add return type (only if not a struct - struct returns via sret)
-        if !returns_struct {
+        // Add return type (only if not an aggregate - aggregates return via sret)
+        if !returns_aggregate {
             // main() always returns i32 for OS exit code, even if declared as () -> ()
             if func.name == "main" && matches!(func.return_type, Type::Unit) {
                 sig.returns.push(AbiParam::new(types::I32));
@@ -300,14 +301,14 @@ impl Codegen {
                 message: format!("Function '{}' not declared", func.name),
             })?;
 
-        // Check if this function returns a struct (needs sret handling)
-        let returns_struct = matches!(&func.return_type, Type::Struct { .. });
+        // Check if this function returns an aggregate (struct or enum) - needs sret handling
+        let returns_aggregate = matches!(&func.return_type, Type::Struct { .. } | Type::Enum { .. });
         
         // Build signature
         let mut sig = Signature::new(CallConv::SystemV);
         
-        // If returning a struct, add an implicit sret pointer as first parameter
-        if returns_struct {
+        // If returning an aggregate, add an implicit sret pointer as first parameter
+        if returns_aggregate {
             sig.params.push(AbiParam::new(types::I64)); // sret pointer
         }
         
@@ -316,8 +317,8 @@ impl Codegen {
             sig.params.push(AbiParam::new(ty));
         }
         
-        // Only add return type if not a struct (struct returns via sret)
-        if !returns_struct {
+        // Only add return type if not an aggregate (aggregates return via sret)
+        if !returns_aggregate {
             // main() always returns i32 for OS exit code, even if declared as () -> ()
             if func.name == "main" && matches!(func.return_type, Type::Unit) {
                 sig.returns.push(AbiParam::new(types::I32));
@@ -387,7 +388,7 @@ impl Codegen {
             &enum_names,
             func_return_types,
             func,
-            returns_struct,
+            returns_aggregate,
         );
 
         compiler.compile()?;
@@ -467,19 +468,17 @@ struct FunctionCompiler<'a, 'b> {
     
     /// Map from MIR local to Cranelift Variable (for scalar types)
     locals: HashMap<u32, Variable>,
-    /// Map from MIR local to (stack slot, struct DefId) for aggregate types
-    struct_slots: HashMap<u32, (cranelift_codegen::ir::StackSlot, DefId)>,
-    /// Map from MIR local to (stack slot, enum DefId) for enum types
-    enum_slots: HashMap<u32, (cranelift_codegen::ir::StackSlot, DefId)>,
+    /// Map from MIR local to (stack slot, DefId, AggregateType) for aggregate types (structs and enums)
+    aggregate_slots: HashMap<u32, (cranelift_codegen::ir::StackSlot, DefId, AggregateType)>,
     /// Map from MIR local to (stack slot, elem type, length) for arrays
     array_slots: HashMap<u32, (cranelift_codegen::ir::StackSlot, Type, usize)>,
     /// Map from MIR block to Cranelift Block
     blocks: HashMap<u32, Block>,
     /// Next variable index
     next_var: usize,
-    /// If function returns struct, this holds the sret pointer variable
+    /// If function returns aggregate (struct/enum), this holds the sret pointer variable
     sret_ptr: Option<Variable>,
-    /// If function returns struct, this holds the struct DefId
+    /// If function returns aggregate, this holds the aggregate DefId
     sret_def_id: Option<DefId>,
     /// Whether this is the main function
     is_main: bool,
@@ -499,13 +498,13 @@ impl<'a, 'b> FunctionCompiler<'a, 'b> {
         enum_names: &'a HashMap<DefId, String>,
         func_return_types: &'a HashMap<String, Type>,
         mir_func: &'a MirFunction,
-        returns_struct: bool,
+        returns_aggregate: bool,
     ) -> Self {
-        let sret_def_id = if returns_struct {
-            if let Type::Struct { def_id, .. } = &mir_func.return_type {
-                Some(*def_id)
-            } else {
-                None
+        let sret_def_id = if returns_aggregate {
+            match &mir_func.return_type {
+                Type::Struct { def_id, .. } => Some(*def_id),
+                Type::Enum { def_id, .. } => Some(*def_id),
+                _ => None,
             }
         } else {
             None
@@ -528,8 +527,7 @@ impl<'a, 'b> FunctionCompiler<'a, 'b> {
             func_return_types,
             mir_func,
             locals: HashMap::new(),
-            struct_slots: HashMap::new(),
-            enum_slots: HashMap::new(),
+            aggregate_slots: HashMap::new(),
             array_slots: HashMap::new(),
             blocks: HashMap::new(),
             sret_ptr: None,
@@ -573,7 +571,7 @@ impl<'a, 'b> FunctionCompiler<'a, 'b> {
             if let Type::Struct { def_id, .. } = &local.ty {
                 // Structs get stack slots
                 if let Some(mir_struct) = self.structs.get(def_id) {
-                    let size = self.struct_size(mir_struct);
+                    let size = mir_struct.total_size();
                     let slot = self.builder.create_sized_stack_slot(
                         cranelift_codegen::ir::StackSlotData::new(
                             cranelift_codegen::ir::StackSlotKind::ExplicitSlot,
@@ -581,7 +579,7 @@ impl<'a, 'b> FunctionCompiler<'a, 'b> {
                             3, // align to 8 bytes (2^3)
                         )
                     );
-                    self.struct_slots.insert(local.id, (slot, *def_id));
+                    self.aggregate_slots.insert(local.id, (slot, *def_id, AggregateType::Struct));
                 }
             } else if let Type::Enum { def_id, .. } = &local.ty {
                 // Enums get stack slots (discriminant + payload)
@@ -597,7 +595,7 @@ impl<'a, 'b> FunctionCompiler<'a, 'b> {
                         3, // align to 8 bytes (2^3)
                     )
                 );
-                self.enum_slots.insert(local.id, (slot, *def_id));
+                self.aggregate_slots.insert(local.id, (slot, *def_id, AggregateType::Enum));
             } else if let Type::Array(elem_ty, len) = &local.ty {
                 // Arrays get stack slots
                 let elem_size = self.type_size(elem_ty);
@@ -630,7 +628,7 @@ impl<'a, 'b> FunctionCompiler<'a, 'b> {
                     // Struct parameters are passed as pointers
                     // Create a stack slot and copy the data from the pointer
                     if let Some(mir_struct) = self.structs.get(def_id) {
-                        let size = self.struct_size(mir_struct);
+                        let size = mir_struct.total_size();
                         let slot = self.builder.create_sized_stack_slot(
                             cranelift_codegen::ir::StackSlotData::new(
                                 cranelift_codegen::ir::StackSlotKind::ExplicitSlot,
@@ -644,7 +642,7 @@ impl<'a, 'b> FunctionCompiler<'a, 'b> {
                         
                         // Copy each field from the source pointer to our stack slot
                         for (field_idx, (_, field_ty)) in mir_struct.fields.iter().enumerate() {
-                            let offset = self.field_offset(mir_struct, field_idx);
+                            let offset = mir_struct.field_offset(field_idx);
                             let cl_ty = self.convert_type(field_ty);
                             // Load from source pointer
                             let val = self.builder.ins().load(cl_ty, cranelift_codegen::ir::MemFlags::new(), ptr_val, offset as i32);
@@ -652,7 +650,7 @@ impl<'a, 'b> FunctionCompiler<'a, 'b> {
                             self.builder.ins().stack_store(val, slot, offset as i32);
                         }
                         
-                        self.struct_slots.insert(param.id, (slot, *def_id));
+                        self.aggregate_slots.insert(param.id, (slot, *def_id, AggregateType::Struct));
                     }
                 }
                 Type::Enum { def_id, .. } => {
@@ -680,7 +678,7 @@ impl<'a, 'b> FunctionCompiler<'a, 'b> {
                         self.builder.ins().stack_store(val, slot, offset as i32);
                     }
                     
-                    self.enum_slots.insert(param.id, (slot, *def_id));
+                    self.aggregate_slots.insert(param.id, (slot, *def_id, AggregateType::Enum));
                 }
                 Type::Ref { inner, .. } if matches!(inner.as_ref(), Type::Struct { .. }) => {
                     // Reference to struct - the parameter IS the pointer, store it as a variable
@@ -718,16 +716,6 @@ impl<'a, 'b> FunctionCompiler<'a, 'b> {
         Ok(())
     }
     
-    /// Calculate the size of a struct in bytes
-    fn struct_size(&self, mir_struct: &MirStruct) -> u32 {
-        let mut size = 0u32;
-        for (_, field_ty) in &mir_struct.fields {
-            size += self.type_size(field_ty);
-        }
-        // Align to 8 bytes
-        (size + 7) & !7
-    }
-    
     /// Get the size of a type in bytes
     fn type_size(&self, ty: &Type) -> u32 {
         match ty {
@@ -737,25 +725,20 @@ impl<'a, 'b> FunctionCompiler<'a, 'b> {
             Type::I64 | Type::U64 | Type::F64 | Type::Ref { .. } | Type::Str => 8,
             Type::Struct { def_id, .. } => {
                 if let Some(s) = self.structs.get(def_id) {
-                    self.struct_size(s)
+                    s.total_size()
                 } else {
                     8 // default
                 }
             }
+            Type::Enum { def_id, .. } => {
+                if let Some(e) = self.enums.get(def_id) {
+                    e.total_size()
+                } else {
+                    16 // default (8 discriminant + 8 payload)
+                }
+            }
             _ => 8,
         }
-    }
-    
-    /// Get the offset of a field in a struct
-    fn field_offset(&self, mir_struct: &MirStruct, field_idx: usize) -> u32 {
-        let mut offset = 0u32;
-        for (i, (_, field_ty)) in mir_struct.fields.iter().enumerate() {
-            if i == field_idx {
-                return offset;
-            }
-            offset += self.type_size(field_ty);
-        }
-        offset
     }
 
     fn compile_block(&mut self, block: &BasicBlock) -> Result<(), CodegenError> {
@@ -783,13 +766,13 @@ impl<'a, 'b> FunctionCompiler<'a, 'b> {
                 // Check if this is a struct aggregate assignment
                 if let Rvalue::Aggregate { kind: AggregateKind::Struct(def_id, _), operands } = rvalue {
                     // Get the destination stack slot
-                    if let Some(&(slot, _)) = self.struct_slots.get(&place.local) {
+                    if let Some(&(slot, _, AggregateType::Struct)) = self.aggregate_slots.get(&place.local) {
                         // Get struct info
                         if let Some(mir_struct) = self.structs.get(def_id) {
                             // Store each field
                             for (i, operand) in operands.iter().enumerate() {
                                 if let Some(val) = self.compile_operand(operand)? {
-                                    let offset = self.field_offset(mir_struct, i);
+                                    let offset = mir_struct.field_offset(i);
                                     let _field_ty = &mir_struct.fields[i].1;
                                     self.builder.ins().stack_store(val, slot, offset as i32);
                                 }
@@ -802,23 +785,30 @@ impl<'a, 'b> FunctionCompiler<'a, 'b> {
                 // Check if this is an enum aggregate assignment
                 if let Rvalue::Aggregate { kind: AggregateKind::Enum(enum_def_id, variant_idx, _), operands } = rvalue {
                     // Get or create the destination enum slot
-                    if let Some(&(slot, _)) = self.enum_slots.get(&place.local) {
-                        // Get enum info
-                        let payload_offset = if let Some(mir_enum) = self.enums.get(enum_def_id) {
-                            mir_enum.payload_offset()
+                    if let Some(&(slot, _, AggregateType::Enum)) = self.aggregate_slots.get(&place.local) {
+                        // Get enum info and use proper field offsets
+                        if let Some(mir_enum) = self.enums.get(enum_def_id) {
+                            // Store discriminant (variant index)
+                            let discr_val = self.builder.ins().iconst(types::I64, *variant_idx as i64);
+                            self.builder.ins().stack_store(discr_val, slot, 0);
+                            
+                            // Store payload fields using proper offsets
+                            // Note: payload fields are indexed starting at 1 (after discriminant)
+                            for (i, operand) in operands.iter().enumerate() {
+                                if let Some(val) = self.compile_operand(operand)? {
+                                    let field_offset = mir_enum.field_offset(i + 1); // i + 1 because field 0 is discriminant
+                                    self.builder.ins().stack_store(val, slot, field_offset as i32);
+                                }
+                            }
                         } else {
-                            8u32 // Default: discriminant is 8 bytes
-                        };
-                        
-                        // Store discriminant (variant index)
-                        let discr_val = self.builder.ins().iconst(types::I64, *variant_idx as i64);
-                        self.builder.ins().stack_store(discr_val, slot, 0);
-                        
-                        // Store payload fields
-                        for (i, operand) in operands.iter().enumerate() {
-                            if let Some(val) = self.compile_operand(operand)? {
-                                let field_offset = payload_offset as i32 + (i as i32 * 8);
-                                self.builder.ins().stack_store(val, slot, field_offset);
+                            // Fallback: default layout
+                            let discr_val = self.builder.ins().iconst(types::I64, *variant_idx as i64);
+                            self.builder.ins().stack_store(discr_val, slot, 0);
+                            for (i, operand) in operands.iter().enumerate() {
+                                if let Some(val) = self.compile_operand(operand)? {
+                                    let field_offset = 8 + (i as i32 * 8); // discriminant + field index * 8
+                                    self.builder.ins().stack_store(val, slot, field_offset);
+                                }
                             }
                         }
                     }
@@ -827,19 +817,20 @@ impl<'a, 'b> FunctionCompiler<'a, 'b> {
                 
                 // Check if this is an enum field access (extracting payload)
                 if let Rvalue::Use(Operand::Copy(src_place) | Operand::Move(src_place)) = rvalue {
-                    if let Some(&(src_slot, src_def_id)) = self.enum_slots.get(&src_place.local) {
+                    if let Some(&(src_slot, src_def_id, AggregateType::Enum)) = self.aggregate_slots.get(&src_place.local) {
                         // Check if there's a field projection
                         for proj in &src_place.projections {
-                            if let PlaceProjection::Field(_idx, _) = proj {
+                            if let PlaceProjection::Field(idx, _) = proj {
                                 // Get the destination type to determine how to load
                                 let dest_ty = self.mir_func.locals.iter()
                                     .find(|l| l.id == place.local)
                                     .map(|l| &l.ty);
                                 
-                                let payload_offset = if let Some(mir_enum) = self.enums.get(&src_def_id) {
-                                    mir_enum.payload_offset()
+                                // Use proper field offset from the aggregate trait
+                                let field_offset = if let Some(mir_enum) = self.enums.get(&src_def_id) {
+                                    mir_enum.field_offset(*idx)
                                 } else {
-                                    8u32
+                                    8 + (*idx as u32 * 8) // fallback
                                 };
                                 
                                 // Load using the destination type
@@ -849,7 +840,7 @@ impl<'a, 'b> FunctionCompiler<'a, 'b> {
                                     types::I64
                                 };
                                 
-                                let val = self.builder.ins().stack_load(cl_ty, src_slot, payload_offset as i32);
+                                let val = self.builder.ins().stack_load(cl_ty, src_slot, field_offset as i32);
                                 self.store_to_place(place, val)?;
                                 return Ok(());
                             }
@@ -858,36 +849,37 @@ impl<'a, 'b> FunctionCompiler<'a, 'b> {
                 }
                 
                 if let Rvalue::Use(Operand::Copy(src_place) | Operand::Move(src_place)) = rvalue {
-                    // Check if this is a struct copy
-                    if let Some(&(src_slot, src_def_id)) = self.struct_slots.get(&src_place.local) {
-                        if let Some(&(dst_slot, _)) = self.struct_slots.get(&place.local) {
-                            // Copy struct by copying each field using the stored def_id
-                            if let Some(mir_struct) = self.structs.get(&src_def_id) {
-                                for (i, (_, field_ty)) in mir_struct.fields.iter().enumerate() {
-                                    let offset = self.field_offset(mir_struct, i);
-                                    let cl_ty = self.convert_type(field_ty);
-                                    let val = self.builder.ins().stack_load(cl_ty, src_slot, offset as i32);
-                                    self.builder.ins().stack_store(val, dst_slot, offset as i32);
+                    // Check if this is an aggregate copy (struct or enum)
+                    if let Some(&(src_slot, src_def_id, agg_type)) = self.aggregate_slots.get(&src_place.local) {
+                        if let Some(&(dst_slot, _, _)) = self.aggregate_slots.get(&place.local) {
+                            match agg_type {
+                                AggregateType::Struct => {
+                                    // Copy struct by copying each field
+                                    if let Some(mir_struct) = self.structs.get(&src_def_id) {
+                                        for (i, (_, field_ty)) in mir_struct.fields.iter().enumerate() {
+                                            let offset = mir_struct.field_offset(i);
+                                            let cl_ty = self.convert_type(field_ty);
+                                            let val = self.builder.ins().stack_load(cl_ty, src_slot, offset as i32);
+                                            self.builder.ins().stack_store(val, dst_slot, offset as i32);
+                                        }
+                                    }
+                                    return Ok(());
+                                }
+                                AggregateType::Enum => {
+                                    // Copy enum by copying discriminant + payload
+                                    let enum_size = if let Some(mir_enum) = self.enums.get(&src_def_id) {
+                                        mir_enum.total_size()
+                                    } else {
+                                        16u32
+                                    };
+                                    // Copy 8 bytes at a time
+                                    for offset in (0..enum_size).step_by(8) {
+                                        let val = self.builder.ins().stack_load(types::I64, src_slot, offset as i32);
+                                        self.builder.ins().stack_store(val, dst_slot, offset as i32);
+                                    }
+                                    return Ok(());
                                 }
                             }
-                            return Ok(());
-                        }
-                    }
-                    // Check if this is an enum copy
-                    if let Some(&(src_slot, src_def_id)) = self.enum_slots.get(&src_place.local) {
-                        if let Some(&(dst_slot, _)) = self.enum_slots.get(&place.local) {
-                            // Copy enum by copying discriminant + payload
-                            let enum_size = if let Some(mir_enum) = self.enums.get(&src_def_id) {
-                                mir_enum.total_size()
-                            } else {
-                                16u32
-                            };
-                            // Copy 8 bytes at a time
-                            for offset in (0..enum_size).step_by(8) {
-                                let val = self.builder.ins().stack_load(types::I64, src_slot, offset as i32);
-                                self.builder.ins().stack_store(val, dst_slot, offset as i32);
-                            }
-                            return Ok(());
                         }
                     }
                     // Check if this is an array copy
@@ -1011,25 +1003,42 @@ impl<'a, 'b> FunctionCompiler<'a, 'b> {
 
             Rvalue::Ref { place, .. } => {
                 // Compute the address of the place
-                // For locals, we use stack_addr; for struct fields, we compute the offset
-                if let Some(&(slot, def_id)) = self.struct_slots.get(&place.local) {
-                    // Reference to a struct or struct field
+                // For locals, we use stack_addr; for struct/enum fields, we compute the offset
+                if let Some(&(slot, def_id, agg_type)) = self.aggregate_slots.get(&place.local) {
+                    // Reference to an aggregate (struct/enum) or its field
                     if place.projections.is_empty() {
-                        // Reference to the whole struct
+                        // Reference to the whole aggregate
                         let addr = self.builder.ins().stack_addr(types::I64, slot, 0);
                         Ok(Some(addr))
                     } else {
-                        // Reference to a struct field
-                        if let Some(mir_struct) = self.structs.get(&def_id) {
-                            for proj in &place.projections {
-                                if let PlaceProjection::Field(idx, _) = proj {
-                                    let offset = self.field_offset(mir_struct, *idx);
-                                    let addr = self.builder.ins().stack_addr(types::I64, slot, offset as i32);
-                                    return Ok(Some(addr));
+                        match agg_type {
+                            AggregateType::Struct => {
+                                // Reference to a struct field
+                                if let Some(mir_struct) = self.structs.get(&def_id) {
+                                    for proj in &place.projections {
+                                        if let PlaceProjection::Field(idx, _) = proj {
+                                            let offset = mir_struct.field_offset(*idx);
+                                            let addr = self.builder.ins().stack_addr(types::I64, slot, offset as i32);
+                                            return Ok(Some(addr));
+                                        }
+                                    }
                                 }
+                                Ok(None)
+                            }
+                            AggregateType::Enum => {
+                                // Reference to an enum field
+                                if let Some(mir_enum) = self.enums.get(&def_id) {
+                                    for proj in &place.projections {
+                                        if let PlaceProjection::Field(idx, _) = proj {
+                                            let offset = mir_enum.field_offset(*idx);
+                                            let addr = self.builder.ins().stack_addr(types::I64, slot, offset as i32);
+                                            return Ok(Some(addr));
+                                        }
+                                    }
+                                }
+                                Ok(None)
                             }
                         }
-                        Ok(None)
                     }
                 } else if let Some(&var) = self.locals.get(&place.local) {
                     // Check if this is a reference to a struct field through a pointer
@@ -1049,7 +1058,7 @@ impl<'a, 'b> FunctionCompiler<'a, 'b> {
                                     // Handle field projections
                                     for proj in &place.projections {
                                         if let PlaceProjection::Field(idx, _) = proj {
-                                            let offset = self.field_offset(mir_struct, *idx);
+                                            let offset = mir_struct.field_offset( *idx);
                                             // Compute address of field within the struct
                                             let field_addr = self.builder.ins().iadd_imm(ptr, offset as i64);
                                             return Ok(Some(field_addr));
@@ -1119,7 +1128,7 @@ impl<'a, 'b> FunctionCompiler<'a, 'b> {
                     AggregateKind::Struct(struct_def_id, _name) => {
                         // Struct aggregate - similar to enum but no discriminant
                         if let Some(mir_struct) = self.structs.get(struct_def_id) {
-                            let size = self.struct_size(mir_struct);
+                            let size = mir_struct.total_size();
                             let slot = self.builder.create_sized_stack_slot(
                                 cranelift_codegen::ir::StackSlotData::new(
                                     cranelift_codegen::ir::StackSlotKind::ExplicitSlot,
@@ -1130,7 +1139,7 @@ impl<'a, 'b> FunctionCompiler<'a, 'b> {
                             
                             for (i, operand) in operands.iter().enumerate() {
                                 if let Some(val) = self.compile_operand(operand)? {
-                                    let offset = self.field_offset(mir_struct, i);
+                                    let offset = mir_struct.field_offset( i);
                                     self.builder.ins().stack_store(val, slot, offset as i32);
                                 }
                             }
@@ -1277,42 +1286,44 @@ impl<'a, 'b> FunctionCompiler<'a, 'b> {
     }
 
     fn load_from_place(&mut self, place: &Place) -> Result<Option<Value>, CodegenError> {
-        // Check if this is a struct field access (use stored def_id)
-        if let Some(&(slot, def_id)) = self.struct_slots.get(&place.local) {
-            if let Some(mir_struct) = self.structs.get(&def_id) {
-                // Handle field projections
-                for proj in &place.projections {
-                    if let PlaceProjection::Field(idx, _) = proj {
-                        let offset = self.field_offset(mir_struct, *idx);
-                        let field_ty = &mir_struct.fields[*idx].1;
-                        let cl_ty = self.convert_type(field_ty);
-                        let val = self.builder.ins().stack_load(cl_ty, slot, offset as i32);
-                        return Ok(Some(val));
+        // Check if this is an aggregate (struct or enum) access
+        if let Some(&(slot, def_id, agg_type)) = self.aggregate_slots.get(&place.local) {
+            match agg_type {
+                AggregateType::Struct => {
+                    if let Some(mir_struct) = self.structs.get(&def_id) {
+                        // Handle field projections
+                        for proj in &place.projections {
+                            if let PlaceProjection::Field(idx, _) = proj {
+                                let offset = mir_struct.field_offset(*idx);
+                                let field_ty = &mir_struct.fields[*idx].1;
+                                let cl_ty = self.convert_type(field_ty);
+                                let val = self.builder.ins().stack_load(cl_ty, slot, offset as i32);
+                                return Ok(Some(val));
+                            }
+                        }
                     }
+                    // Loading whole struct - return address
+                    let addr = self.builder.ins().stack_addr(types::I64, slot, 0);
+                    return Ok(Some(addr));
+                }
+                AggregateType::Enum => {
+                    if let Some(mir_enum) = self.enums.get(&def_id) {
+                        // Handle field projections on enum (e.g., _3._0 to get payload)
+                        for proj in &place.projections {
+                            if let PlaceProjection::Field(idx, _) = proj {
+                                // Use proper field offset from the aggregate trait
+                                let field_offset = mir_enum.field_offset(*idx);
+                                // For now, assume payload is i64 (we'd need type info for exact type)
+                                let val = self.builder.ins().stack_load(types::I64, slot, field_offset as i32);
+                                return Ok(Some(val));
+                            }
+                        }
+                    }
+                    // Loading whole enum for switchInt - load the discriminant (first 8 bytes)
+                    let discr_val = self.builder.ins().stack_load(types::I64, slot, 0);
+                    return Ok(Some(discr_val));
                 }
             }
-            // Loading whole struct - return address
-            let addr = self.builder.ins().stack_addr(types::I64, slot, 0);
-            return Ok(Some(addr));
-        }
-        
-        // Check if this is an enum access
-        if let Some(&(slot, def_id)) = self.enum_slots.get(&place.local) {
-            if let Some(mir_enum) = self.enums.get(&def_id) {
-                // Handle field projections on enum (e.g., _3._0 to get payload)
-                for proj in &place.projections {
-                    if let PlaceProjection::Field(idx, _) = proj {
-                        // Field 0 is the payload (after discriminant)
-                        let payload_offset = mir_enum.payload_offset();
-                        // For now, assume payload is i64 (we'd need type info for exact type)
-                        let val = self.builder.ins().stack_load(types::I64, slot, payload_offset as i32);
-                        return Ok(Some(val));
-                    }
-                }
-            }
-            // Loading whole enum for switchInt - load the discriminant (first 8 bytes)
-            let discr_val = self.builder.ins().stack_load(types::I64, slot, 0);
-            return Ok(Some(discr_val));
         }
         
         // Check if this is an array access
@@ -1365,7 +1376,7 @@ impl<'a, 'b> FunctionCompiler<'a, 'b> {
                                 // Handle field projections on struct references
                                 for proj in &place.projections {
                                     if let PlaceProjection::Field(idx, _) = proj {
-                                        let offset = self.field_offset(mir_struct, *idx);
+                                        let offset = mir_struct.field_offset( *idx);
                                         let field_ty = &mir_struct.fields[*idx].1;
                                         let cl_ty = self.convert_type(field_ty);
                                         let val = self.builder.ins().load(cl_ty, cranelift_codegen::ir::MemFlags::new(), ptr, offset as i32);
@@ -1396,37 +1407,39 @@ impl<'a, 'b> FunctionCompiler<'a, 'b> {
     }
 
     fn store_to_place(&mut self, place: &Place, value: Value) -> Result<(), CodegenError> {
-        // Check if this is a struct field store (use stored def_id)
-        if let Some(&(slot, def_id)) = self.struct_slots.get(&place.local) {
-            if let Some(mir_struct) = self.structs.get(&def_id) {
-                for proj in &place.projections {
-                    if let PlaceProjection::Field(idx, _) = proj {
-                        let offset = self.field_offset(mir_struct, *idx);
-                        self.builder.ins().stack_store(value, slot, offset as i32);
-                        return Ok(());
+        // Check if this is an aggregate (struct or enum) store
+        if let Some(&(slot, def_id, agg_type)) = self.aggregate_slots.get(&place.local) {
+            match agg_type {
+                AggregateType::Struct => {
+                    if let Some(mir_struct) = self.structs.get(&def_id) {
+                        for proj in &place.projections {
+                            if let PlaceProjection::Field(idx, _) = proj {
+                                let offset = mir_struct.field_offset(*idx);
+                                self.builder.ins().stack_store(value, slot, offset as i32);
+                                return Ok(());
+                            }
+                        }
                     }
+                    // Storing to whole struct slot not supported this way
+                    return Ok(());
+                }
+                AggregateType::Enum => {
+                    if let Some(mir_enum) = self.enums.get(&def_id) {
+                        for proj in &place.projections {
+                            if let PlaceProjection::Field(idx, _) = proj {
+                                // Use proper field offset
+                                let field_offset = mir_enum.field_offset(*idx);
+                                self.builder.ins().stack_store(value, slot, field_offset as i32);
+                                return Ok(());
+                            }
+                        }
+                    }
+                    // Storing to whole enum - the value should be discriminant or we're copying
+                    // For now, assume value is discriminant
+                    self.builder.ins().stack_store(value, slot, 0);
+                    return Ok(());
                 }
             }
-            // Storing to whole struct slot not supported this way
-            return Ok(());
-        }
-        
-        // Check if this is an enum store
-        if let Some(&(slot, def_id)) = self.enum_slots.get(&place.local) {
-            if let Some(mir_enum) = self.enums.get(&def_id) {
-                for proj in &place.projections {
-                    if let PlaceProjection::Field(idx, _) = proj {
-                        // Field 0 is the payload (after discriminant)
-                        let payload_offset = mir_enum.payload_offset();
-                        self.builder.ins().stack_store(value, slot, payload_offset as i32);
-                        return Ok(());
-                    }
-                }
-            }
-            // Storing to whole enum - the value should be discriminant or we're copying
-            // For now, assume value is discriminant
-            self.builder.ins().stack_store(value, slot, 0);
-            return Ok(());
         }
         
         // Check if this is an array element store
@@ -1476,7 +1489,7 @@ impl<'a, 'b> FunctionCompiler<'a, 'b> {
                             if let Type::Ref { inner, .. } = &local.ty {
                                 if let Type::Struct { def_id, .. } = inner.as_ref() {
                                     if let Some(mir_struct) = self.structs.get(def_id) {
-                                        offset += self.field_offset(mir_struct, *idx) as i32;
+                                        offset += mir_struct.field_offset( *idx) as i32;
                                     }
                                 }
                             }
@@ -1486,7 +1499,7 @@ impl<'a, 'b> FunctionCompiler<'a, 'b> {
                             if let Type::Ref { inner, .. } = &param.ty {
                                 if let Type::Struct { def_id, .. } = inner.as_ref() {
                                     if let Some(mir_struct) = self.structs.get(def_id) {
-                                        offset += self.field_offset(mir_struct, *idx) as i32;
+                                        offset += mir_struct.field_offset( *idx) as i32;
                                     }
                                 }
                             }
@@ -1553,12 +1566,12 @@ impl<'a, 'b> FunctionCompiler<'a, 'b> {
                 // Check if we're returning a struct via sret
                 if let (Some(sret_var), Some(def_id)) = (self.sret_ptr, self.sret_def_id) {
                     // Copy the return struct to the sret pointer
-                    if let Some(&(slot, _)) = self.struct_slots.get(&0) {
+                    if let Some(&(slot, _, AggregateType::Struct)) = self.aggregate_slots.get(&0) {
                         // Copy from local _0's stack slot to sret pointer
                         if let Some(mir_struct) = self.structs.get(&def_id) {
                             let sret_ptr = self.builder.use_var(sret_var);
                             for (field_idx, (_, field_ty)) in mir_struct.fields.iter().enumerate() {
-                                let offset = self.field_offset(mir_struct, field_idx);
+                                let offset = mir_struct.field_offset(field_idx);
                                 let cl_ty = self.convert_type(field_ty);
                                 let val = self.builder.ins().stack_load(cl_ty, slot, offset as i32);
                                 self.builder.ins().store(cranelift_codegen::ir::MemFlags::new(), val, sret_ptr, offset as i32);
@@ -1622,27 +1635,27 @@ impl<'a, 'b> FunctionCompiler<'a, 'b> {
                     _ => (None, None),
                 };
                 
-                // Check if the callee returns a struct (using name, not DefId, for monomorphized fns)
-                let mut callee_returns_struct = callee_name.as_ref()
+                // Check if the callee returns an aggregate (using name, not DefId, for monomorphized fns)
+                let mut callee_returns_aggregate = callee_name.as_ref()
                     .and_then(|name| self.func_return_types.get(name))
-                    .map(|ty| matches!(ty, Type::Struct { .. }))
+                    .map(|ty| matches!(ty, Type::Struct { .. } | Type::Enum { .. }))
                     .unwrap_or(false);
                 
-                // For trait method calls, we don't have def_id, so check if destination is a struct
-                if !callee_returns_struct {
+                // For trait method calls, we don't have def_id, so check if destination is an aggregate
+                if !callee_returns_aggregate {
                     if let Some(local) = self.mir_func.locals.iter().find(|l| l.id == destination.local) {
-                        if matches!(local.ty, Type::Struct { .. }) {
-                            callee_returns_struct = true;
+                        if matches!(local.ty, Type::Struct { .. } | Type::Enum { .. }) {
+                            callee_returns_aggregate = true;
                         }
                     }
                 }
                 
-                // Compile arguments - handle struct args specially (pass as pointers)
+                // Compile arguments - handle aggregate args specially (pass as pointers)
                 let mut arg_vals = Vec::new();
                 
-                // If callee returns struct, pass destination's address as first arg (sret)
-                if callee_returns_struct {
-                    if let Some(&(slot, _)) = self.struct_slots.get(&destination.local) {
+                // If callee returns aggregate, pass destination's address as first arg (sret)
+                if callee_returns_aggregate {
+                    if let Some(&(slot, _, _)) = self.aggregate_slots.get(&destination.local) {
                         let addr = self.builder.ins().stack_addr(types::I64, slot, 0);
                         arg_vals.push(addr);
                     }
@@ -1653,12 +1666,8 @@ impl<'a, 'b> FunctionCompiler<'a, 'b> {
                         Operand::Copy(place) | Operand::Move(place) => {
                             // Check if this is a whole struct/enum argument (no projections)
                             if place.projections.is_empty() {
-                                if let Some(&(slot, _)) = self.struct_slots.get(&place.local) {
-                                    // Pass the address of the struct
-                                    let addr = self.builder.ins().stack_addr(types::I64, slot, 0);
-                                    arg_vals.push(addr);
-                                } else if let Some(&(slot, _)) = self.enum_slots.get(&place.local) {
-                                    // Pass the address of the enum
+                                if let Some(&(slot, _, _)) = self.aggregate_slots.get(&place.local) {
+                                    // Pass the address of the aggregate (struct or enum)
                                     let addr = self.builder.ins().stack_addr(types::I64, slot, 0);
                                     arg_vals.push(addr);
                                 } else if let Some(val) = self.compile_operand(arg).ok().flatten() {
@@ -1701,8 +1710,8 @@ impl<'a, 'b> FunctionCompiler<'a, 'b> {
                     // Direct call
                     let call = self.builder.ins().call(func_ref, &arg_vals);
                     
-                    // Get the return value (if any) - skip for struct returns (handled via sret)
-                    if !callee_returns_struct {
+                    // Get the return value (if any) - skip for aggregate returns (handled via sret)
+                    if !callee_returns_aggregate {
                         let results = self.builder.inst_results(call);
                         if !results.is_empty() {
                             if let Some(&var) = self.locals.get(&destination.local) {

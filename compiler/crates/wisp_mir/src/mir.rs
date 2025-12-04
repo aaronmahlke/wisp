@@ -81,12 +81,87 @@ impl Default for MirProgram {
     }
 }
 
+/// Trait for aggregate types (structs, enums)
+/// Provides unified interface for size/offset calculations
+pub trait Aggregate {
+    fn def_id(&self) -> DefId;
+    fn name(&self) -> &str;
+    fn total_size(&self) -> u32;
+    fn field_offset(&self, field_idx: usize) -> u32;
+    fn field_type(&self, field_idx: usize) -> Option<&Type>;
+}
+
+/// Discriminant between struct and enum aggregates
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AggregateType {
+    Struct,
+    Enum,
+}
+
 /// A MIR struct definition
 #[derive(Debug, Clone)]
 pub struct MirStruct {
     pub def_id: DefId,
     pub name: String,
     pub fields: Vec<(String, Type)>,
+}
+
+impl MirStruct {
+    /// Calculate field offset based on preceding fields' sizes and alignment
+    pub fn compute_field_offset(&self, field_idx: usize) -> u32 {
+        let mut offset = 0u32;
+        for i in 0..field_idx {
+            if i < self.fields.len() {
+                let field_size = type_size(&self.fields[i].1);
+                // Align to natural alignment (min of size and 8)
+                let align = field_size.min(8);
+                offset = (offset + align - 1) / align * align;
+                offset += field_size;
+            }
+        }
+        // Align final offset
+        if field_idx < self.fields.len() {
+            let field_size = type_size(&self.fields[field_idx].1);
+            let align = field_size.min(8);
+            offset = (offset + align - 1) / align * align;
+        }
+        offset
+    }
+    
+    /// Calculate total struct size with proper alignment
+    pub fn compute_total_size(&self) -> u32 {
+        if self.fields.is_empty() {
+            return 0;
+        }
+        let last_idx = self.fields.len() - 1;
+        let last_offset = self.compute_field_offset(last_idx);
+        let last_size = type_size(&self.fields[last_idx].1);
+        // Round up to 8-byte alignment
+        let total = last_offset + last_size;
+        (total + 7) / 8 * 8
+    }
+}
+
+impl Aggregate for MirStruct {
+    fn def_id(&self) -> DefId {
+        self.def_id
+    }
+    
+    fn name(&self) -> &str {
+        &self.name
+    }
+    
+    fn total_size(&self) -> u32 {
+        self.compute_total_size()
+    }
+    
+    fn field_offset(&self, field_idx: usize) -> u32 {
+        self.compute_field_offset(field_idx)
+    }
+    
+    fn field_type(&self, field_idx: usize) -> Option<&Type> {
+        self.fields.get(field_idx).map(|(_, ty)| ty)
+    }
 }
 
 /// A MIR enum definition
@@ -115,7 +190,7 @@ impl MirEnum {
     }
     
     /// Total enum size: discriminant + max payload (aligned)
-    pub fn total_size(&self) -> u32 {
+    pub fn compute_total_size(&self) -> u32 {
         let disc = self.discriminant_size();
         let payload = self.max_payload_size();
         // Align payload to 8 bytes
@@ -126,10 +201,47 @@ impl MirEnum {
     pub fn payload_offset(&self) -> u32 {
         self.discriminant_size()
     }
+    
+    /// Get field offset for enum fields
+    /// In MIR, field 0 is the discriminant, field 1+ are payload fields
+    pub fn compute_field_offset(&self, field_idx: usize) -> u32 {
+        if field_idx == 0 {
+            // Field 0 is the discriminant, at offset 0
+            0
+        } else {
+            // Field 1+ are payload fields, starting after discriminant
+            let payload_field_idx = field_idx - 1;
+            self.discriminant_size() + (payload_field_idx as u32 * 8)
+        }
+    }
 }
 
-/// Helper to get type size (basic approximation)
-fn type_size(ty: &Type) -> u32 {
+impl Aggregate for MirEnum {
+    fn def_id(&self) -> DefId {
+        self.def_id
+    }
+    
+    fn name(&self) -> &str {
+        &self.name
+    }
+    
+    fn total_size(&self) -> u32 {
+        self.compute_total_size()
+    }
+    
+    fn field_offset(&self, field_idx: usize) -> u32 {
+        self.compute_field_offset(field_idx)
+    }
+    
+    fn field_type(&self, _field_idx: usize) -> Option<&Type> {
+        // For enums, we'd need to know which variant to get the field type
+        // For now, return None (caller should handle this case)
+        None
+    }
+}
+
+/// Helper to get type size
+pub fn type_size(ty: &Type) -> u32 {
     match ty {
         Type::I8 | Type::U8 | Type::Bool => 1,
         Type::I16 | Type::U16 => 2,
@@ -139,7 +251,7 @@ fn type_size(ty: &Type) -> u32 {
         Type::F64 => 8,
         Type::Ref { .. } => 8, // Pointers are 8 bytes
         Type::Struct { .. } | Type::Enum { .. } => 8, // Passed as pointers
-        Type::TypeParam(_, _) => 8, // Assume pointer-sized for generics
+        Type::TypeParam { .. } => 8, // Assume pointer-sized for generics
         _ => 8, // Default to 8
     }
 }

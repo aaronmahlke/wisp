@@ -1,0 +1,151 @@
+---
+alwaysApply: false
+description: Use when working on compiler crates (wisp_ast, wisp_parser, wisp_hir, wisp_types, wisp_borrowck, wisp_mir, wisp_codegen, wisp_lsp, wisp_driver)
+---
+
+# Wisp Compiler Architecture
+
+## Compilation Pipeline
+
+```
+Source (.ws) → Lexer → Parser → HIR (Resolver) → Type Checker → Borrow Checker → MIR → Codegen → Object → Executable
+```
+
+Each phase is handled by a separate crate in `compiler/crates/`.
+
+## Crate Structure
+
+| Crate           | Purpose                                            |
+| --------------- | -------------------------------------------------- |
+| `wisp_ast`      | Abstract Syntax Tree - raw parsed structure        |
+| `wisp_parser`   | Lexer + Parser - source to AST                     |
+| `wisp_hir`      | High-level IR - name resolution, DefIds assigned   |
+| `wisp_types`    | Type checker - type inference, trait resolution    |
+| `wisp_borrowck` | Borrow checker - ownership/lifetime validation     |
+| `wisp_mir`      | Mid-level IR - lowered representation for codegen  |
+| `wisp_codegen`  | Code generation - MIR to Cranelift to machine code |
+| `wisp_lsp`      | Language server protocol implementation            |
+| `wisp_driver`   | CLI entry point, orchestrates compilation          |
+
+## Key Data Structures
+
+### DefId
+
+Unique identifier for any definition (function, struct, enum, variable, type param, etc.). Created in resolver, used everywhere.
+
+```rust
+pub struct DefId(pub u32);
+```
+
+### Type (in wisp_types)
+
+```rust
+pub enum Type {
+    I32, I64, Bool, Str, // primitives
+    Struct { def_id: DefId, type_args: Vec<Type> },
+    Enum { def_id: DefId, type_args: Vec<Type> },
+    Function { params: Vec<Type>, ret: Box<Type> },
+    // Generic type parameter - uses index-based substitution like Rust's ParamTy
+    TypeParam { index: u32, name: String, def_id: DefId },
+    Ref { is_mut: bool, inner: Box<Type> },
+    // ... more variants
+}
+```
+
+### TypedExpr (in wisp_types)
+
+Type-annotated expression after type checking. Has `kind: TypedExprKind`, `ty: Type`, `span: Span`.
+
+### MirFunction / MirProgram (in wisp_mir)
+
+Lowered representation with:
+
+- Basic blocks (`Vec<BasicBlock>`)
+- Locals with explicit types
+- Terminators (Call, Return, SwitchInt, Goto)
+- Rvalues (BinaryOp, Aggregate, Ref, etc.)
+
+## Monomorphization Pipeline
+
+Generic functions are monomorphized (specialized for concrete types):
+
+1. Type checker records `GenericInstantiation { func_def_id, type_args }` when a generic is called
+2. MIR lowering (`lower.rs`) generates specialized versions via `lower_monomorphized_function`
+3. Codegen compiles each monomorphized version with mangled names like `add<i32>`
+
+**Known Issue:** Impl block methods need separate handling - `generic_methods` map + `lower_monomorphized_impl_method`.
+
+## Aggregate Types (Structs/Enums)
+
+Unified via `Aggregate` trait in `wisp_mir/src/mir.rs`:
+
+```rust
+pub trait Aggregate {
+    fn def_id(&self) -> DefId;
+    fn name(&self) -> &str;
+    fn total_size(&self) -> u32;
+    fn field_offset(&self, field_idx: usize) -> u32;
+    fn field_type(&self, field_idx: usize) -> Option<&Type>;
+}
+```
+
+Both `MirStruct` and `MirEnum` implement this trait. In codegen, `aggregate_slots: HashMap<u32, (StackSlot, DefId, AggregateType)>` handles both.
+
+Enum memory layout (tagged union):
+
+- Bytes 0-7: discriminant (i64, variant index)
+- Bytes 8+: payload (largest variant size, 8-byte aligned)
+
+Field offsets:
+
+- For structs: cumulative based on field types and alignment
+- For enums: field 0 = discriminant (offset 0), field 1+ = payload fields (offset 8+)
+
+## Known Gotchas
+
+### Type Parameter Substitution (Index-Based)
+
+Type parameters use **index-based** substitution, inspired by Rust's `ParamTy`:
+
+```rust
+TypeParam { index: u32, name: String, def_id: DefId }
+```
+
+The `index` is the position in the generics list. When substituting in `lower.rs`:
+
+```rust
+Type::TypeParam { index, .. } => {
+    // Use index to look up the concrete type argument
+    type_args.get(*index as usize).cloned().unwrap_or(ty.clone())
+}
+```
+
+This means `T` at index 0 in `Option<T>` matches `T` at index 0 in `impl<T> Option<T>`, regardless of DefId differences. Works correctly for multi-param generics like `HashMap<K, V>`.
+
+The `def_id` is kept for looking up type param info (like trait bounds) but is not used for substitution.
+
+### Self by-value vs by-reference
+
+Methods taking `self` (by value) vs `&self` (by reference) need different lowering. Check method's first parameter type to determine which.
+
+### Aggregate Passing Convention
+
+Structs and enums are passed as pointers to functions, then copied into local stack slots by the callee.
+
+## Common Patterns
+
+### Adding a new expression type
+
+1. Add variant to `ExprKind` in `wisp_ast`
+2. Parse it in `wisp_parser`
+3. Resolve names in `wisp_hir` resolver
+4. Type check in `wisp_types` checker
+5. Lower to MIR in `wisp_mir` lowerer
+6. Generate code in `wisp_codegen`
+
+### Adding a new type
+
+1. Add variant to `Type` enum
+2. Update `TypeContext` methods (unify, display, etc.)
+3. Handle in MIR lowering
+4. Handle in codegen (`convert_type`, size calculations, etc.)

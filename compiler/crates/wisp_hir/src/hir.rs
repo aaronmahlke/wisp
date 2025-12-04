@@ -364,6 +364,7 @@ pub struct ResolvedImpl {
 #[derive(Debug, Clone)]
 pub struct ResolvedTypeParam {
     pub def_id: DefId,
+    pub index: u32,  // Position in the generics list (like Rust's ParamTy.index)
     pub name: String,
     pub bounds: Vec<ResolvedType>,
     pub default: Option<ResolvedType>,
