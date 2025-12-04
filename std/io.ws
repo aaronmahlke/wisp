@@ -96,8 +96,13 @@ impl Display for bool {
 // Implement Display for String
 impl Display for String {
     fn to_string(&self) -> String {
-        // Return a copy of the string using the public clone method
-        self.clone()
+        // Workaround: inline clone logic to avoid codegen issue with
+        // method calls returning structs when receiver is &self
+        let one: i64 = 1;
+        let cap = self.len + one;
+        let ptr = malloc(cap);
+        let _ = memcpy(ptr, self.ptr, self.len + one);
+        String { ptr: ptr, len: self.len, cap: cap }
     }
 }
 

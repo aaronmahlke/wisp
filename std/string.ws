@@ -150,7 +150,7 @@ impl String {
 }
 
 // Import ops for Add trait
-import std.ops
+import std.ops.Add
 
 // Implement Add for String concatenation
 impl Add for String {

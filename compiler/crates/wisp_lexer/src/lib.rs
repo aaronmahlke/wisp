@@ -1,5 +1,35 @@
 use logos::Logos;
 
+/// Process escape sequences in a string literal
+fn process_escape_sequences(s: &str) -> String {
+    let mut result = String::with_capacity(s.len());
+    let mut chars = s.chars().peekable();
+    
+    while let Some(c) = chars.next() {
+        if c == '\\' {
+            match chars.next() {
+                Some('n') => result.push('\n'),
+                Some('t') => result.push('\t'),
+                Some('r') => result.push('\r'),
+                Some('\\') => result.push('\\'),
+                Some('"') => result.push('"'),
+                Some('\'') => result.push('\''),
+                Some('0') => result.push('\0'),
+                Some(other) => {
+                    // Unknown escape - keep as-is
+                    result.push('\\');
+                    result.push(other);
+                }
+                None => result.push('\\'),
+            }
+        } else {
+            result.push(c);
+        }
+    }
+    
+    result
+}
+
 /// Span in source code (byte offsets)
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Span {
@@ -89,7 +119,8 @@ pub enum Token {
 
     #[regex(r#""([^"\\]|\\.)*""#, |lex| {
         let s = lex.slice();
-        Some(s[1..s.len()-1].to_string())
+        let inner = &s[1..s.len()-1];
+        Some(process_escape_sequences(inner))
     })]
     StringLiteral(String),
 

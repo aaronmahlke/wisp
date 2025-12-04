@@ -1,6 +1,8 @@
 //! Borrow checking pass
 
 use crate::state::{BorrowConflict, BorrowState, Place};
+use std::collections::HashSet;
+use wisp_hir::DefId;
 use wisp_lexer::Span;
 use wisp_types::{Type, TypedProgram, TypedFunction, TypedExpr, TypedExprKind, TypedStmt, TypedBlock, TypedElse};
 
@@ -30,6 +32,8 @@ pub struct BorrowChecker<'a> {
     errors: Vec<BorrowError>,
     /// Current function being checked
     current_fn: Option<String>,
+    /// Types that implement Copy (from type checker)
+    copy_types: &'a HashSet<DefId>,
 }
 
 impl<'a> BorrowChecker<'a> {
@@ -39,6 +43,7 @@ impl<'a> BorrowChecker<'a> {
             state: BorrowState::new(),
             errors: Vec::new(),
             current_fn: None,
+            copy_types: &program.copy_types,
         }
     }
 
@@ -496,11 +501,25 @@ impl<'a> BorrowChecker<'a> {
 
     /// Check if an expression has a Copy type
     fn is_copy_type(&self, expr: &TypedExpr) -> bool {
-        match &expr.ty {
+        self.is_type_copy(&expr.ty)
+    }
+    
+    /// Check if a type is Copy (can be implicitly copied)
+    fn is_type_copy(&self, ty: &Type) -> bool {
+        match ty {
+            // Primitives are always Copy
             Type::I8 | Type::I16 | Type::I32 | Type::I64 | Type::I128 |
             Type::U8 | Type::U16 | Type::U32 | Type::U64 | Type::U128 |
-            Type::F32 | Type::F64 | Type::Bool | Type::Char => true,
-            Type::Ref { .. } => true, // References are Copy
+            Type::F32 | Type::F64 | Type::Bool | Type::Char | Type::Unit => true,
+            // References are Copy (they're just pointers)
+            Type::Ref { .. } => true,
+            // Structs are Copy if they have impl Copy
+            Type::Struct { def_id, .. } => self.copy_types.contains(def_id),
+            // Enums are Copy if they have impl Copy
+            Type::Enum { def_id, .. } => self.copy_types.contains(def_id),
+            // Never type - vacuously Copy (unreachable code)
+            Type::Never => true,
+            // Everything else is not Copy
             _ => false,
         }
     }

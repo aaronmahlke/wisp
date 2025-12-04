@@ -87,3 +87,14 @@ pub trait PartialLe<Rhs = Self> {
 pub trait PartialGe<Rhs = Self> {
     fn ge(&self, rhs: &Rhs) -> bool
 }
+
+// Marker trait for types that can be implicitly copied
+// Primitives (i32, bool, etc.) are Copy by default
+// Structs can implement Copy if ALL their fields are Copy types
+pub trait Copy {}
+
+// Trait for explicit cloning (deep copy)
+// Implement this for types that need heap allocation or can't be Copy
+pub trait Clone {
+    fn clone(&self) -> Self
+}

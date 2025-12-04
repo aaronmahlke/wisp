@@ -8,6 +8,8 @@ struct Point {
     y: i32
 }
 
+impl Copy for Point {}
+
 impl Point {
     fn rotate(self) -> Point {
         self * 2
@@ -41,8 +43,7 @@ fn main() {
     let a_point = Point { x: 3, y: 8 }
     let b_point = Point { x: 5, y: 7 }
     let point = add(a_point, b_point);
-
-    print(&point.or(b_point))
+    let another_point = add(a_point, b_point);
 
     print(&point.or(a_point))
 }

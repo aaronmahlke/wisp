@@ -690,6 +690,16 @@ impl<'a, 'b> FunctionCompiler<'a, 'b> {
                     self.builder.def_var(var, param_val);
                     self.locals.insert(param.id, var);
                 }
+                Type::Ref { inner, .. } if matches!(inner.as_ref(), Type::Enum { .. }) => {
+                    // Reference to enum - the parameter IS the pointer, store it as a variable
+                    // When dereferencing (*self), we'll load through this pointer
+                    let var = Variable::from_u32(self.next_var as u32);
+                    self.next_var += 1;
+                    self.builder.declare_var(var, types::I64); // pointer type
+                    let param_val = self.builder.block_params(entry_block)[block_param_idx];
+                    self.builder.def_var(var, param_val);
+                    self.locals.insert(param.id, var);
+                }
                 _ => {
                     // Scalar parameters
                     let var = Variable::from_u32(self.next_var as u32);
@@ -897,6 +907,44 @@ impl<'a, 'b> FunctionCompiler<'a, 'b> {
                             return Ok(());
                         }
                     }
+                    // Check if this is copying from a dereferenced enum reference to an aggregate slot
+                    // e.g., _2 = move (*_1) where _1: &Option<T> and _2: Option<T>
+                    let has_deref = src_place.projections.iter().any(|p| matches!(p, PlaceProjection::Deref));
+                    if has_deref {
+                        if let Some(&(dst_slot, dst_def_id, AggregateType::Enum)) = self.aggregate_slots.get(&place.local) {
+                            // Check if source is a reference to an enum
+                            let src_ty = self.mir_func.params.iter()
+                                .find(|p| p.id == src_place.local)
+                                .map(|p| &p.ty)
+                                .or_else(|| self.mir_func.locals.iter().find(|l| l.id == src_place.local).map(|l| &l.ty));
+                            
+                            if let Some(Type::Ref { inner, .. }) = src_ty {
+                                if let Type::Enum { def_id: src_enum_id, .. } = inner.as_ref() {
+                                    if let Some(&var) = self.locals.get(&src_place.local) {
+                                        // Get the pointer from the variable
+                                        let ptr = self.builder.use_var(var);
+                                        
+                                        // Copy enum data from pointer to destination slot
+                                        let enum_size = if let Some(mir_enum) = self.enums.get(src_enum_id) {
+                                            mir_enum.total_size()
+                                        } else if let Some(mir_enum) = self.enums.get(&dst_def_id) {
+                                            mir_enum.total_size()
+                                        } else {
+                                            16u32
+                                        };
+                                        
+                                        // Copy 8 bytes at a time
+                                        for offset in (0..enum_size).step_by(8) {
+                                            let val = self.builder.ins().load(types::I64, cranelift_codegen::ir::MemFlags::new(), ptr, offset as i32);
+                                            self.builder.ins().stack_store(val, dst_slot, offset as i32);
+                                        }
+                                        return Ok(());
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    
                     // Fall through to normal handling
                     let value = self.compile_rvalue(rvalue)?;
                     if let Some(value) = value {
@@ -1161,9 +1209,51 @@ impl<'a, 'b> FunctionCompiler<'a, 'b> {
                 }
             }
 
-            Rvalue::Discriminant(_) => {
-                // Not fully implemented yet
-                Ok(Some(self.builder.ins().iconst(types::I32, 0)))
+            Rvalue::Discriminant(place) => {
+                // Load the discriminant from an enum
+                // The discriminant is the first field (8 bytes) of the enum
+                
+                // First, get the type of this place to understand what we're dealing with
+                let local_ty = self.mir_func.params.iter()
+                    .find(|p| p.id == place.local)
+                    .map(|p| &p.ty)
+                    .or_else(|| self.mir_func.locals.iter().find(|l| l.id == place.local).map(|l| &l.ty));
+                
+                // Check for Deref projection (e.g., *self where self: &Option<T>)
+                let has_deref = place.projections.iter().any(|p| matches!(p, PlaceProjection::Deref));
+                
+                // Case 1: Deref on a reference to enum (e.g., *o where o: &Option<T>)
+                if has_deref {
+                    if let Some(&var) = self.locals.get(&place.local) {
+                        let ptr = self.builder.use_var(var);
+                        let discr = self.builder.ins().load(types::I64, cranelift_codegen::ir::MemFlags::new(), ptr, 0);
+                        return Ok(Some(discr));
+                    }
+                }
+                
+                // Case 2: Direct enum in aggregate slot (e.g., x where x: Option<T>)
+                if let Some(&(slot, _def_id, AggregateType::Enum)) = self.aggregate_slots.get(&place.local) {
+                    let discr = self.builder.ins().stack_load(types::I64, slot, 0);
+                    return Ok(Some(discr));
+                }
+                
+                // Case 3: The place is a local variable that's a reference to an enum
+                if let Some(&var) = self.locals.get(&place.local) {
+                    if let Some(Type::Ref { inner, .. }) = local_ty {
+                        if matches!(inner.as_ref(), Type::Enum { .. }) {
+                            let ptr = self.builder.use_var(var);
+                            let discr = self.builder.ins().load(types::I64, cranelift_codegen::ir::MemFlags::new(), ptr, 0);
+                            return Ok(Some(discr));
+                        }
+                    }
+                    
+                    // For other cases, use the variable directly
+                    let val = self.builder.use_var(var);
+                    return Ok(Some(val));
+                }
+                
+                // Fallback: return 0
+                Ok(Some(self.builder.ins().iconst(types::I64, 0)))
             }
             
             Rvalue::Cast { operand, ty } => {
@@ -1381,6 +1471,28 @@ impl<'a, 'b> FunctionCompiler<'a, 'b> {
                                         let cl_ty = self.convert_type(field_ty);
                                         let val = self.builder.ins().load(cl_ty, cranelift_codegen::ir::MemFlags::new(), ptr, offset as i32);
                                         return Ok(Some(val));
+                                    }
+                                }
+                            }
+                        }
+                        Type::Enum { def_id, .. } => {
+                            if let Some(mir_enum) = self.enums.get(def_id) {
+                                // Handle deref of enum references - for match *self { ... }
+                                // We need to return the pointer to the enum data for match to work
+                                for proj in &place.projections {
+                                    if let PlaceProjection::Deref = proj {
+                                        // For enum deref, just return the pointer - match will
+                                        // load the discriminant from it
+                                        return Ok(Some(ptr));
+                                    }
+                                    if let PlaceProjection::Field(idx, _) = proj {
+                                        let offset = mir_enum.field_offset(*idx);
+                                        let field_ty = mir_enum.field_type(*idx);
+                                        if let Some(ty) = field_ty {
+                                            let cl_ty = self.convert_type(ty);
+                                            let val = self.builder.ins().load(cl_ty, cranelift_codegen::ir::MemFlags::new(), ptr, offset as i32);
+                                            return Ok(Some(val));
+                                        }
                                     }
                                 }
                             }

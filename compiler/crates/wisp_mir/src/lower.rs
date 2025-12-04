@@ -22,6 +22,9 @@ fn has_type_param(ty: &Type) -> bool {
         Type::Function { params, ret } => {
             params.iter().any(has_type_param) || has_type_param(ret)
         }
+        // Check type_args in generic structs/enums
+        Type::Struct { type_args, .. } => type_args.iter().any(has_type_param),
+        Type::Enum { type_args, .. } => type_args.iter().any(has_type_param),
         _ => false,
     }
 }
@@ -1316,8 +1319,15 @@ impl<'a> FunctionLowerer<'a> {
                 
                 let otherwise = arm_blocks.last().copied().unwrap_or(merge_bb);
                 
+                // Extract discriminant explicitly - SwitchInt needs the tag value, not the whole enum
+                let discr_temp = self.new_temp(Type::I64);
+                self.assign(
+                    Place::local(discr_temp),
+                    Rvalue::Discriminant(Place::local(scrut_local))
+                );
+                
                 self.terminate(Terminator::SwitchInt {
-                    discr: Operand::Copy(Place::local(scrut_local)),
+                    discr: Operand::Copy(Place::local(discr_temp)),
                     targets: targets[..targets.len().saturating_sub(1)].to_vec(),
                     otherwise,
                 });

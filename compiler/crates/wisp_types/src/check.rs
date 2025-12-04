@@ -71,6 +71,10 @@ pub struct TypeChecker {
     trait_by_name: HashMap<String, DefId>,
     /// Type parameters for structs and enums: DefId -> [(param DefId, param name)]
     type_type_params: HashMap<DefId, Vec<(DefId, String)>>,
+    /// Types that implement the Copy trait (can be implicitly copied)
+    copy_types: HashSet<DefId>,
+    /// The Copy trait's DefId (if found)
+    copy_trait_id: Option<DefId>,
 }
 
 impl TypeChecker {
@@ -93,6 +97,8 @@ impl TypeChecker {
             primitive_trait_impls: HashSet::new(),
             trait_by_name: HashMap::new(),
             type_type_params: HashMap::new(),
+            copy_types: HashSet::new(),
+            copy_trait_id: None,
         }
     }
 
@@ -231,6 +237,11 @@ impl TypeChecker {
             self.ctx.register_type_name(t.def_id, t.name.clone());
             self.trait_by_name.insert(t.name.clone(), t.def_id);
             
+            // Track the Copy trait's DefId for later validation
+            if t.name == "Copy" {
+                self.copy_trait_id = Some(t.def_id);
+            }
+            
             // Collect trait method signatures
             let mut methods = Vec::new();
             for m in &t.methods {
@@ -346,6 +357,27 @@ impl TypeChecker {
             if let Some(trait_def) = imp.trait_def {
                 if let Some(struct_id) = target_struct_id {
                     self.trait_impls.insert((struct_id, trait_def), impl_methods);
+                    
+                    // If this is impl Copy for T, validate all fields are Copy types
+                    if Some(trait_def) == self.copy_trait_id {
+                        if let Some(fields) = self.ctx.get_struct_fields(struct_id) {
+                            for (field_name, field_type) in fields {
+                                if !self.is_copy_type(&field_type) {
+                                    self.errors.push(TypeError {
+                                        message: format!(
+                                            "the trait `Copy` cannot be implemented for struct because field `{}` is not `Copy`",
+                                            field_name
+                                        ),
+                                        span: imp.span,
+                                    });
+                                }
+                            }
+                            // If no errors, register this type as Copy
+                            if self.errors.is_empty() {
+                                self.copy_types.insert(struct_id);
+                            }
+                        }
+                    }
                 } else if let Some(ref prim_name) = primitive_name {
                     // Primitive trait impl
                     self.primitive_trait_impls.insert((prim_name.clone(), trait_def));
@@ -442,6 +474,7 @@ impl TypeChecker {
             extern_statics: typed_extern_statics,
             impls: typed_impls,
             generic_instantiations: std::mem::take(&mut self.generic_instantiations),
+            copy_types: std::mem::take(&mut self.copy_types),
         }
     }
 
@@ -468,6 +501,28 @@ impl TypeChecker {
         Type::Function {
             params,
             ret: Box::new(ret),
+        }
+    }
+
+    /// Check if a type is Copy (can be implicitly copied without moving)
+    fn is_copy_type(&self, ty: &Type) -> bool {
+        match ty {
+            // Primitives are always Copy
+            Type::I8 | Type::I16 | Type::I32 | Type::I64 | Type::I128 |
+            Type::U8 | Type::U16 | Type::U32 | Type::U64 | Type::U128 |
+            Type::F32 | Type::F64 | Type::Bool | Type::Char | Type::Unit => true,
+            // References are Copy (they're just pointers)
+            Type::Ref { .. } => true,
+            // Structs are Copy if they have impl Copy (checked via copy_types set)
+            Type::Struct { def_id, .. } => self.copy_types.contains(def_id),
+            // Enums are Copy if they have impl Copy
+            Type::Enum { def_id, .. } => self.copy_types.contains(def_id),
+            // Type parameters - conservatively not Copy unless bounded
+            Type::TypeParam { .. } => false,
+            // Never type - vacuously Copy (unreachable code)
+            Type::Never => true,
+            // Everything else (functions, etc.) is not Copy
+            _ => false,
         }
     }
 
@@ -2580,6 +2635,8 @@ pub struct TypedProgram {
     pub impls: Vec<TypedImpl>,
     /// Collected generic instantiations for monomorphization
     pub generic_instantiations: HashSet<GenericInstantiation>,
+    /// Types that implement Copy (can be implicitly copied)
+    pub copy_types: HashSet<DefId>,
 }
 
 /// Typed extern function declaration
