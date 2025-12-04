@@ -389,9 +389,15 @@ impl Resolver {
                 .unwrap_or_default()
         };
         
-        // Create the namespace if it doesn't exist
-        if !ns_name.is_empty() && !import.destructure_only {
+        // Create the namespace (even for destructure imports, so we can look up items)
+        if !ns_name.is_empty() {
             self.namespaces.entry(ns_name.clone()).or_insert_with(Namespace::new);
+            
+            // Only mark as accessible for non-destructure imports
+            if !import.destructure_only {
+                self.accessible_namespaces.insert(ns_name.clone());
+            }
+            
             // Set current namespace so define_global adds items to it
             self.current_namespace = Some(ns_name);
         }
@@ -439,7 +445,7 @@ impl Resolver {
     }
 
     fn lookup(&self, name: &str) -> Option<DefId> {
-        // First check the local scope (function locals, parameters)
+        // First check the local scope (function locals, parameters, type params)
         if let Some(id) = self.scope.lookup(name) {
             return Some(id);
         }
@@ -449,6 +455,11 @@ impl Resolver {
             if let Some(id) = module_scope.lookup(name) {
                 return Some(id);
             }
+        }
+        
+        // Finally check globals (enum variants, etc.)
+        if let Some(id) = self.globals.get(name) {
+            return Some(*id);
         }
         
         None
@@ -483,7 +494,32 @@ impl Resolver {
                     self.define_global(s.name.name.clone(), DefKind::Struct, s.span, s.is_pub);
                 }
                 Item::Enum(e) => {
-                    self.define_global(e.name.name.clone(), DefKind::Enum, e.span, e.is_pub);
+                    let enum_def_id = self.define_global(e.name.name.clone(), DefKind::Enum, e.span, e.is_pub);
+                    
+                    // Also define variants in globals and namespace
+                    for variant in &e.variants {
+                        let variant_id = self.fresh_id();
+                        let variant_info = DefInfo {
+                            id: variant_id,
+                            name: variant.name.name.clone(),
+                            kind: DefKind::EnumVariant,
+                            span: variant.span,
+                            parent: Some(enum_def_id),
+                            module_id: self.current_module,
+                            is_pub: e.is_pub,
+                        };
+                        self.defs.insert(variant_id, variant_info);
+                        self.globals.insert(variant.name.name.clone(), variant_id);
+                        
+                        // Add to namespace if we're processing an import
+                        if let Some(ref ns_name) = self.current_namespace {
+                            if e.is_pub {
+                                if let Some(ns) = self.namespaces.get_mut(ns_name) {
+                                    ns.define(variant.name.name.clone(), variant_id);
+                                }
+                            }
+                        }
+                    }
                 }
                 Item::Trait(t) => {
                     self.define_global(t.name.name.clone(), DefKind::Trait, t.span, t.is_pub);
@@ -597,15 +633,14 @@ impl Resolver {
                 ns_to_module.insert(ns_name.clone(), module_id);
             }
             
-            // Create namespace if not destructure-only
-            // For transitive imports, we still create the namespace internally
-            // but it won't be accessible at the top level - only through parent namespaces
-            if !ns_name.is_empty() && !module.import.destructure_only {
+            // Create namespace for the module (needed for looking up items during destructure)
+            // For destructure-only imports, we create the namespace but don't mark it as accessible
+            if !ns_name.is_empty() {
                 self.namespaces.entry(ns_name.clone()).or_insert_with(Namespace::new);
                 self.current_namespace = Some(ns_name.clone());
                 
-                // Only mark as accessible if not a transitive import
-                if !module.is_transitive {
+                // Only mark as accessible if not a transitive import and not destructure-only
+                if !module.is_transitive && !module.import.destructure_only {
                     self.accessible_namespaces.insert(ns_name.clone());
                 }
             }
@@ -669,12 +704,42 @@ impl Resolver {
                         }
                     }
                     Item::Enum(e) => {
-                        if !self.globals.contains_key(&e.name.name) {
-                            self.define_global(e.name.name.clone(), DefKind::Enum, e.span, e.is_pub);
-                        } else if let Some(ref ns_name) = self.current_namespace {
-                            if let Some(&def_id) = self.globals.get(&e.name.name) {
-                                if let Some(ns) = self.namespaces.get_mut(ns_name) {
-                                    ns.define(e.name.name.clone(), def_id);
+                        let enum_def_id = if !self.globals.contains_key(&e.name.name) {
+                            self.define_global(e.name.name.clone(), DefKind::Enum, e.span, e.is_pub)
+                        } else {
+                            if let Some(ref ns_name) = self.current_namespace {
+                                if let Some(&def_id) = self.globals.get(&e.name.name) {
+                                    if let Some(ns) = self.namespaces.get_mut(ns_name) {
+                                        ns.define(e.name.name.clone(), def_id);
+                                    }
+                                }
+                            }
+                            *self.globals.get(&e.name.name).unwrap()
+                        };
+                        
+                        // Also define variants in globals and namespace
+                        for variant in &e.variants {
+                            if !self.globals.contains_key(&variant.name.name) {
+                                let variant_id = self.fresh_id();
+                                let variant_info = DefInfo {
+                                    id: variant_id,
+                                    name: variant.name.name.clone(),
+                                    kind: DefKind::EnumVariant,
+                                    span: variant.span,
+                                    parent: Some(enum_def_id),
+                                    module_id: self.current_module,
+                                    is_pub: e.is_pub, // Variants inherit visibility from enum
+                                };
+                                self.defs.insert(variant_id, variant_info);
+                                self.globals.insert(variant.name.name.clone(), variant_id);
+                                
+                                // Add to namespace if we're processing an import
+                                if let Some(ref ns_name) = self.current_namespace {
+                                    if e.is_pub {
+                                        if let Some(ns) = self.namespaces.get_mut(ns_name) {
+                                            ns.define(variant.name.name.clone(), variant_id);
+                                        }
+                                    }
                                 }
                             }
                         }
@@ -951,9 +1016,51 @@ impl Resolver {
     fn resolve_enum(&mut self, e: &EnumDef) -> Option<ResolvedEnum> {
         let def_id = self.globals.get(&e.name.name).copied()?;
         
+        // Push scope for enum type parameters
+        self.push_scope();
+        
+        // Register enum type parameters in scope
+        let mut type_params = Vec::new();
+        for param in &e.type_params {
+            let param_id = self.fresh_id();
+            let param_info = DefInfo {
+                id: param_id,
+                name: param.name.name.clone(),
+                kind: DefKind::TypeParam,
+                span: param.span,
+                parent: Some(def_id),
+                module_id: self.current_module,
+                is_pub: false,
+            };
+            self.defs.insert(param_id, param_info);
+            self.scope.define(param.name.name.clone(), param_id);
+            
+            // Resolve bounds
+            let bounds: Vec<_> = param.bounds.iter()
+                .map(|b| self.resolve_type(b))
+                .collect();
+            
+            type_params.push(ResolvedTypeParam {
+                def_id: param_id,
+                name: param.name.name.clone(),
+                bounds,
+                default: None,
+                span: param.span,
+            });
+        }
+        
         let mut variants = Vec::new();
         for variant in &e.variants {
-            let variant_id = self.fresh_id();
+            // Reuse existing variant DefId if it was registered in first pass
+            let variant_id = if let Some(&existing_id) = self.globals.get(&variant.name.name) {
+                existing_id
+            } else {
+                // Create new if not found (shouldn't happen normally)
+                let id = self.fresh_id();
+                self.globals.insert(variant.name.name.clone(), id);
+                id
+            };
+            
             let variant_info = DefInfo {
                 id: variant_id,
                 name: variant.name.name.clone(),
@@ -965,7 +1072,7 @@ impl Resolver {
             };
             self.defs.insert(variant_id, variant_info);
             
-            // Also add variant to global scope for pattern matching
+            // Add to current scope for immediate access
             self.scope.define(variant.name.name.clone(), variant_id);
             
             let mut fields = Vec::new();
@@ -999,9 +1106,13 @@ impl Resolver {
             });
         }
 
+        // Pop enum type params scope
+        self.pop_scope();
+        
         Some(ResolvedEnum {
             def_id,
             name: e.name.name.clone(),
+            type_params,
             variants,
             span: e.span,
         })
@@ -1052,6 +1163,39 @@ impl Resolver {
     }
 
     fn resolve_impl(&mut self, i: &ImplBlock) -> Option<ResolvedImpl> {
+        // Push scope for impl type parameters (e.g., impl<T> Option<T>)
+        self.push_scope();
+        
+        // Register impl type parameters in scope and collect as ResolvedTypeParam
+        let mut type_params = Vec::new();
+        for param in &i.type_params {
+            let param_id = self.fresh_id();
+            let param_info = DefInfo {
+                id: param_id,
+                name: param.name.name.clone(),
+                kind: DefKind::TypeParam,
+                span: param.span,
+                parent: None,
+                module_id: self.current_module,
+                is_pub: false,
+            };
+            self.defs.insert(param_id, param_info.clone());
+            self.scope.define(param.name.name.clone(), param_id);
+            
+            // Resolve bounds
+            let bounds: Vec<_> = param.bounds.iter()
+                .map(|b| self.resolve_type(b))
+                .collect();
+            
+            type_params.push(ResolvedTypeParam {
+                def_id: param_id,
+                name: param.name.name.clone(),
+                bounds,
+                default: None,
+                span: param.span,
+            });
+        }
+        
         let trait_def = i.trait_name.as_ref().and_then(|name| {
             self.lookup(&name.name).or_else(|| {
                 self.error(format!("undefined trait '{}'", name.name), name.span);
@@ -1119,10 +1263,12 @@ impl Resolver {
             }
         }
         
-        self.pop_scope();
+        self.pop_scope();  // Pop method scope
         self.self_type = None;
+        self.pop_scope();  // Pop impl type params scope
 
         Some(ResolvedImpl {
+            type_params,
             trait_def,
             trait_type_args,
             target_type: target_type.clone(),
@@ -1864,7 +2010,7 @@ fn is_primitive(name: &str) -> bool {
         "i8" | "i16" | "i32" | "i64" | "i128" |
         "u8" | "u16" | "u32" | "u64" | "u128" |
         "f32" | "f64" |
-        "bool" | "char" | "str"
+        "bool" | "char" | "str" | "Never"
     )
 }
 

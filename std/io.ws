@@ -5,7 +5,9 @@ import std.string
 // Internal C FFI - not exported
 extern fn putchar(c: i32) -> i32
 extern fn fputs(s: str, stream: i64) -> i32
+extern fn exit(code: i32) -> Never
 extern static __stdoutp: i64
+extern static __stderrp: i64
 
 // Display trait - types that can be printed and converted to String
 pub trait Display {
@@ -104,4 +106,12 @@ pub fn print<T: Display>(value: &T) {
     let s = value.to_string();
     let _ = fputs(s.ptr as str, __stdoutp);
     let _ = putchar(10);
+}
+
+// Panic function - prints message to stderr and exits
+pub fn panic(msg: str) -> Never {
+    let _ = fputs("panic: ", __stderrp);
+    let _ = fputs(msg, __stderrp);
+    let _ = putchar(10);
+    exit(1)
 }

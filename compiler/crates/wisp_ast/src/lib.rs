@@ -202,6 +202,7 @@ pub struct TraitDef {
 /// Impl block
 #[derive(Debug, Clone)]
 pub struct ImplBlock {
+    pub type_params: Vec<GenericParam>,  // Generic parameters: impl<T, U>
     pub trait_name: Option<Ident>,  // None for inherent impl
     pub trait_type_args: Vec<TypeExpr>,  // Type arguments for trait (e.g., Add<i32>)
     pub target_type: TypeExpr,

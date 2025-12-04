@@ -1108,15 +1108,47 @@ impl<'src> Parser<'src> {
 
     fn parse_struct_fields_in_parens(&mut self) -> ParseResult<Vec<StructField>> {
         let mut fields = Vec::new();
+        let mut field_index = 0u32;
         
         while !self.check(&Token::RParen) && !self.is_at_end() {
             let start = self.peek_span();
-            let name = self.expect_ident()?;
-            self.expect(Token::Colon)?;
-            let ty = self.parse_type()?;
+            
+            // Try to parse as named field (name: Type) or positional field (just Type)
+            // First, check if we have an identifier followed by a colon
+            let (name, ty) = if let Token::Ident(ident_name) = self.peek().clone() {
+                // Look ahead to see if there's a colon
+                let saved_pos = self.pos;
+                self.advance(); // consume the identifier
+                
+                if self.check(&Token::Colon) {
+                    // Named field: name: Type
+                    self.advance(); // consume the colon
+                    let ty = self.parse_type()?;
+                    let name = Ident { name: ident_name, span: self.tokens[saved_pos].span };
+                    (name, ty)
+                } else {
+                    // Positional field - the identifier was actually a type name
+                    self.pos = saved_pos; // backtrack
+                    let ty = self.parse_type()?;
+                    let name = Ident { 
+                        name: format!("_{}", field_index), 
+                        span: start,
+                    };
+                    (name, ty)
+                }
+            } else {
+                // Not an identifier, must be a type (e.g., &T or [T; n])
+                let ty = self.parse_type()?;
+                let name = Ident { 
+                    name: format!("_{}", field_index), 
+                    span: start,
+                };
+                (name, ty)
+            };
             
             let span = Span::new(start.start, ty.span.end);
             fields.push(StructField { name, ty, span });
+            field_index += 1;
             
             if !self.check(&Token::RParen) {
                 self.expect(Token::Comma)?;
@@ -1163,6 +1195,13 @@ impl<'src> Parser<'src> {
         let start = self.peek_span();
         self.expect(Token::Impl)?;
         
+        // Parse optional generic parameters: impl<T, U: Clone>
+        let type_params = if self.check(&Token::Lt) {
+            self.parse_generic_params()?
+        } else {
+            Vec::new()
+        };
+        
         let first_type = self.parse_type()?;
         
         // Check for "for Type" (trait impl)
@@ -1199,7 +1238,7 @@ impl<'src> Parser<'src> {
         let end = self.expect(Token::RBrace)?;
         let span = Span::new(start.start, end.span.end);
         
-        Ok(ImplBlock { trait_name, trait_type_args, target_type, methods, span })
+        Ok(ImplBlock { type_params, trait_name, trait_type_args, target_type, methods, span })
     }
 
     fn parse_type(&mut self) -> ParseResult<TypeExpr> {

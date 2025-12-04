@@ -69,6 +69,8 @@ pub struct TypeChecker {
     primitive_trait_impls: HashSet<(String, DefId)>,
     /// Trait name to DefId lookup
     trait_by_name: HashMap<String, DefId>,
+    /// Type parameters for structs and enums: DefId -> [(param DefId, param name)]
+    type_type_params: HashMap<DefId, Vec<(DefId, String)>>,
 }
 
 impl TypeChecker {
@@ -90,6 +92,7 @@ impl TypeChecker {
             primitive_methods: HashMap::new(),
             primitive_trait_impls: HashSet::new(),
             trait_by_name: HashMap::new(),
+            type_type_params: HashMap::new(),
         }
     }
 
@@ -146,12 +149,12 @@ impl TypeChecker {
         // First pass: register all type names and struct/enum info
         for s in &program.structs {
             self.ctx.register_type_name(s.def_id, s.name.clone());
-            self.ctx.register_def_type(s.def_id, Type::Struct(s.def_id));
+            self.ctx.register_def_type(s.def_id, Type::Struct { def_id: s.def_id, type_args: vec![] });
         }
         
         for e in &program.enums {
             self.ctx.register_type_name(e.def_id, e.name.clone());
-            self.ctx.register_def_type(e.def_id, Type::Enum(e.def_id));
+            self.ctx.register_def_type(e.def_id, Type::Enum { def_id: e.def_id, type_args: vec![] });
         }
 
         // Second pass: register struct fields and enum variants
@@ -170,11 +173,45 @@ impl TypeChecker {
         }
 
         for e in &program.enums {
+            // Register enum type parameters first
+            let mut enum_type_params = Vec::new();
+            let mut enum_type_args = Vec::new();
+            for tp in &e.type_params {
+                self.ctx.register_type_param(tp.def_id, tp.name.clone());
+                enum_type_params.push((tp.def_id, tp.name.clone()));
+                // Create TypeParam as placeholder for the return type
+                enum_type_args.push(Type::TypeParam(tp.def_id, tp.name.clone()));
+            }
+            // Store type params for this enum
+            if !enum_type_params.is_empty() {
+                self.type_type_params.insert(e.def_id, enum_type_params.clone());
+            }
+            
+            // The enum type with type params as placeholders (for variant constructors)
+            let enum_type_with_params = Type::Enum { def_id: e.def_id, type_args: enum_type_args };
             let variants: Vec<_> = e.variants.iter()
                 .map(|v| {
                     let field_types: Vec<_> = v.fields.iter()
                         .map(|f| self.resolve_type(&f.ty))
                         .collect();
+                    
+                    // Register a constructor type for this variant
+                    // For generic enums, use type params as placeholders in return type
+                    let variant_type = if field_types.is_empty() {
+                        enum_type_with_params.clone()
+                    } else {
+                        Type::Function {
+                            params: field_types.clone(),
+                            ret: Box::new(enum_type_with_params.clone()),
+                        }
+                    };
+                    self.ctx.register_def_type(v.def_id, variant_type);
+                    
+                    // Also store variant -> enum mapping for type inference
+                    if !enum_type_params.is_empty() {
+                        self.type_type_params.insert(v.def_id, enum_type_params.clone());
+                    }
+                    
                     (v.name.clone(), v.def_id, field_types)
                 })
                 .collect();
@@ -239,12 +276,27 @@ impl TypeChecker {
         }
         
         for imp in &program.impls {
+            // Register impl type parameters first (e.g., the T in impl<T> Option<T>)
+            let impl_type_params: Vec<(DefId, String)> = imp.type_params.iter()
+                .map(|tp| {
+                    self.ctx.register_type_param(tp.def_id, tp.name.clone());
+                    (tp.def_id, tp.name.clone())
+                })
+                .collect();
+            
             // Get the target type info
             let (target_struct_id, primitive_name) = match &imp.target_type {
                 ResolvedType::Named { name, def_id: Some(id), .. } => (Some(*id), None),
                 ResolvedType::Named { name, def_id: None, .. } => (None, Some(name.clone())), // Primitive type
                 _ => (None, None),
             };
+            
+            // Register impl type params for the target type (for method call substitution)
+            if !impl_type_params.is_empty() {
+                if let Some(struct_id) = target_struct_id {
+                    self.type_type_params.insert(struct_id, impl_type_params.clone());
+                }
+            }
             
             // Set current_self_type so function_type can resolve &self correctly
             let target_type = self.resolve_type(&imp.target_type);
@@ -415,7 +467,7 @@ impl TypeChecker {
         match ty {
             ResolvedType::Named { name, def_id, type_args } => {
                 // Resolve type arguments
-                let _resolved_args: Vec<_> = type_args.iter()
+                let resolved_args: Vec<_> = type_args.iter()
                     .map(|arg| self.resolve_type(arg))
                     .collect();
                 
@@ -427,10 +479,20 @@ impl TypeChecker {
                     if self.ctx.is_type_param(*id) {
                         Type::TypeParam(*id, name.clone())
                     } else if let Some(existing) = self.ctx.get_def_type(*id) {
-                        // TODO: Apply type arguments to generic types
-                        existing.clone()
+                        // Apply type arguments to generic types
+                        match existing {
+                            Type::Struct { def_id, .. } => Type::Struct { 
+                                def_id: *def_id, 
+                                type_args: resolved_args 
+                            },
+                            Type::Enum { def_id, .. } => Type::Enum { 
+                                def_id: *def_id, 
+                                type_args: resolved_args 
+                            },
+                            other => other.clone(),
+                        }
                     } else {
-                        Type::Struct(*id) // Default to struct
+                        Type::Struct { def_id: *id, type_args: resolved_args } // Default to struct
                     }
                 } else {
                     Type::Error
@@ -899,7 +961,7 @@ impl TypeChecker {
                 
                 // Get the type name for mangling (using effective type, after auto-deref)
                 let left_type_name: Option<String> = match &effective_left_ty {
-                    Type::Struct(def_id) | Type::Enum(def_id) => self.ctx.get_type_name(*def_id),
+                    Type::Struct { def_id, .. } | Type::Enum { def_id, .. } => self.ctx.get_type_name(*def_id),
                     Type::I8 => Some("i8".to_string()),
                     Type::I16 => Some("i16".to_string()),
                     Type::I32 => Some("i32".to_string()),
@@ -1115,7 +1177,7 @@ impl TypeChecker {
                     // Check if receiver is a type name (for associated function calls like Point.new())
                     if let ResolvedExprKind::Var { def_id, .. } = &receiver.kind {
                         // Check if this def_id refers to a struct type
-                        if let Some(Type::Struct(struct_id)) = self.ctx.get_def_type(*def_id) {
+                        if let Some(Type::Struct { def_id: struct_id, .. }) = self.ctx.get_def_type(*def_id) {
                             let struct_id = *struct_id; // Copy the DefId
                             // This is potentially an associated function call
                             if let Some((fn_def_id, fn_type)) = self.associated_functions.get(&(struct_id, method_name.clone())).cloned() {
@@ -1170,17 +1232,18 @@ impl TypeChecker {
                     // First, check the receiver type
                     let receiver_typed = self.check_expr(receiver);
                     
-                    // Get the struct id (with auto-deref for references)
-                    let struct_id = match &receiver_typed.ty {
-                        Type::Struct(id) => Some(*id),
+                    // Get the struct/enum id and type args (with auto-deref for references)
+                    let (struct_id, receiver_type_args) = match &receiver_typed.ty {
+                        Type::Struct { def_id, type_args } => (Some(*def_id), type_args.clone()),
+                        Type::Enum { def_id, type_args } => (Some(*def_id), type_args.clone()),
                         Type::Ref { inner, .. } => {
-                            if let Type::Struct(id) = inner.as_ref() {
-                                Some(*id)
-                            } else {
-                                None
+                            match inner.as_ref() {
+                                Type::Struct { def_id, type_args } => (Some(*def_id), type_args.clone()),
+                                Type::Enum { def_id, type_args } => (Some(*def_id), type_args.clone()),
+                                _ => (None, vec![]),
                             }
                         }
-                        _ => None,
+                        _ => (None, vec![]),
                     };
                     
                     // Check if receiver is a type parameter with trait bounds
@@ -1199,14 +1262,25 @@ impl TypeChecker {
                         _ => None,
                     };
                     
-                    // Look up method on struct
+                    // Look up method on struct/enum
                     if let Some(struct_id) = struct_id {
                         if let Some((method_def_id, method_type)) = self.methods.get(&(struct_id, method_name.clone())).cloned() {
                             // This is a method call!
                             // TODO: Handle named arguments for methods
                             let args_typed: Vec<_> = args.iter().map(|a| self.check_expr(&a.value)).collect();
                             
-                            let (result_type, is_mut_self) = if let Type::Function { params, ret } = &method_type {
+                            // Apply type parameter substitution if the receiver has type args
+                            let substituted_method_type = if !receiver_type_args.is_empty() {
+                                if let Some(type_params) = self.type_type_params.get(&struct_id).cloned() {
+                                    self.substitute_type_params(&method_type, &type_params, &receiver_type_args)
+                                } else {
+                                    method_type.clone()
+                                }
+                            } else {
+                                method_type.clone()
+                            };
+                            
+                            let (result_type, is_mut_self) = if let Type::Function { params, ret } = &substituted_method_type {
                                 // Method's first param is &self or &mut self
                                 // Check remaining args against remaining params
                                 let method_params = &params[1..]; // Skip self param
@@ -1239,6 +1313,14 @@ impl TypeChecker {
                                 let sig = format!("fn {}({}) -> {}", method_name, params_str.join(", "), ret.display(&self.ctx));
                                 self.ctx.record_span_type(method_span.start, method_span.end, sig);
                                 self.ctx.record_span_definition(method_span.start, method_span.end, method_def_id);
+                            }
+                            
+                            // Record generic instantiation for method if receiver has type args
+                            if !receiver_type_args.is_empty() {
+                                self.generic_instantiations.insert(GenericInstantiation {
+                                    func_def_id: method_def_id,
+                                    type_args: receiver_type_args.clone(),
+                                });
                             }
                             
                             return TypedExpr {
@@ -1396,9 +1478,13 @@ impl TypeChecker {
                             self.argument_count_error(callee_def_id, params.len(), args_typed.len(), expr.span);
                             (Type::Error, None)
                         } else {
-                            // For generic functions, infer type arguments
+                            // For generic functions or variant constructors, infer type arguments
                             let inferred_type_args = if let Some(def_id) = callee_def_id {
-                                if let Some(type_params) = self.generic_functions.get(&def_id).cloned() {
+                                // Check generic functions first, then variant constructors (type_type_params)
+                                let type_params_opt = self.generic_functions.get(&def_id).cloned()
+                                    .map(|tps| tps.iter().map(|tp| (tp.def_id, tp.name.clone())).collect::<Vec<_>>())
+                                    .or_else(|| self.type_type_params.get(&def_id).cloned());
+                                if let Some(type_params) = type_params_opt {
                                     // Create a mapping from TypeParam DefId to concrete type
                                     let mut type_arg_map: HashMap<DefId, Type> = HashMap::new();
                                     
@@ -1409,22 +1495,24 @@ impl TypeChecker {
                                     
                                     // Build the type args vector in order
                                     let type_args: Vec<Type> = type_params.iter()
-                                        .map(|tp_info| {
-                                            type_arg_map.get(&tp_info.def_id).cloned().unwrap_or(Type::Error)
+                                        .map(|(tp_def_id, _)| {
+                                            type_arg_map.get(tp_def_id).cloned().unwrap_or(Type::Error)
                                         })
                                         .collect();
                                     
-                                    // Check trait bounds are satisfied
-                                    for (tp_info, concrete_type) in type_params.iter().zip(type_args.iter()) {
-                                        for &trait_def_id in &tp_info.bounds {
-                                            if !self.type_implements_trait(concrete_type, trait_def_id) {
-                                                let trait_name = self.ctx.get_type_name(trait_def_id)
-                                                    .unwrap_or_else(|| format!("trait#{}", trait_def_id.0));
-                                                self.error(
-                                                    format!("type {} does not implement trait {}", 
-                                                        concrete_type.display(&self.ctx), trait_name),
-                                                    expr.span
-                                                );
+                                    // Check trait bounds are satisfied (only for generic functions, not variants)
+                                    if let Some(gf_params) = self.generic_functions.get(&def_id).cloned() {
+                                        for (tp_info, concrete_type) in gf_params.iter().zip(type_args.iter()) {
+                                            for &trait_def_id in &tp_info.bounds {
+                                                if !self.type_implements_trait(concrete_type, trait_def_id) {
+                                                    let trait_name = self.ctx.get_type_name(trait_def_id)
+                                                        .unwrap_or_else(|| format!("trait#{}", trait_def_id.0));
+                                                    self.error(
+                                                        format!("type {} does not implement trait {}", 
+                                                            concrete_type.display(&self.ctx), trait_name),
+                                                        expr.span
+                                                    );
+                                                }
                                             }
                                         }
                                     }
@@ -1458,11 +1546,12 @@ impl TypeChecker {
                             // Substitute type parameters in return type
                             let final_ret = if let Some(ref type_args) = inferred_type_args {
                                 if let Some(def_id) = callee_def_id {
-                                    if let Some(type_params) = self.generic_functions.get(&def_id) {
-                                        // Extract just (DefId, String) pairs for substitution
-                                        let tp_pairs: Vec<_> = type_params.iter()
-                                            .map(|tp| (tp.def_id, tp.name.clone()))
-                                            .collect();
+                                    // Check generic functions first, then variant constructors
+                                    let tp_pairs_opt = self.generic_functions.get(&def_id)
+                                        .map(|tps| tps.iter().map(|tp| (tp.def_id, tp.name.clone())).collect::<Vec<_>>())
+                                        .or_else(|| self.type_type_params.get(&def_id).cloned());
+                                    
+                                    if let Some(tp_pairs) = tp_pairs_opt {
                                         self.substitute_type_params(ret, &tp_pairs, type_args)
                                     } else {
                                         (**ret).clone()
@@ -1512,7 +1601,7 @@ impl TypeChecker {
                 let base_typed = self.check_expr(base);
                 
                 let field_type = match &base_typed.ty {
-                    Type::Struct(struct_id) => {
+                    Type::Struct { def_id: struct_id, .. } => {
                         self.ctx.get_struct_field(*struct_id, field)
                             .cloned()
                             .unwrap_or_else(|| {
@@ -1522,7 +1611,7 @@ impl TypeChecker {
                     }
                     Type::Ref { inner, .. } => {
                         // Auto-deref for field access
-                        if let Type::Struct(struct_id) = inner.as_ref() {
+                        if let Type::Struct { def_id: struct_id, .. } = inner.as_ref() {
                             self.ctx.get_struct_field(*struct_id, field)
                                 .cloned()
                                 .unwrap_or_else(|| {
@@ -1549,7 +1638,7 @@ impl TypeChecker {
             }
             
             ResolvedExprKind::StructLit { struct_def, fields } => {
-                let struct_type = Type::Struct(*struct_def);
+                let struct_type = Type::Struct { def_id: *struct_def, type_args: vec![] };
                 
                 // Check field types
                 let mut typed_fields = Vec::new();
@@ -2083,8 +2172,8 @@ impl TypeChecker {
         
         // Get the type's DefId for concrete types
         let type_def_id = match ty {
-            Type::Struct(id) => Some(*id),
-            Type::Enum(id) => Some(*id),
+            Type::Struct { def_id, .. } => Some(*def_id),
+            Type::Enum { def_id, .. } => Some(*def_id),
             _ => None,
         }?;
         
@@ -2108,7 +2197,7 @@ impl TypeChecker {
             .unwrap_or(Type::Str);
         
         let string_def_id = match &string_type {
-            Type::Struct(id) => Some(*id),
+            Type::Struct { def_id, .. } => Some(*def_id),
             _ => None,
         };
         
@@ -2222,11 +2311,39 @@ impl TypeChecker {
                 TypedPattern::Literal(typed)
             }
             ResolvedPatternKind::Variant { variant_def, fields } => {
-                // TODO: check variant fields match
+                // Get the expected enum's type args for substitution
+                let (enum_def_id, type_args) = match expected {
+                    Type::Enum { def_id, type_args } => (Some(*def_id), type_args.clone()),
+                    _ => (None, vec![]),
+                };
+                
+                // Get the variant's field types and substitute type params
+                let variant_field_types: Vec<Type> = if let Some(enum_id) = enum_def_id {
+                    if let Some(type_params) = self.type_type_params.get(&enum_id).cloned() {
+                        // Get variant info from the enum
+                        if let Some(variants) = self.ctx.get_enum_variants(enum_id) {
+                            if let Some((_, _, field_types)) = variants.iter().find(|(_, vid, _)| *vid == *variant_def) {
+                                // Substitute type params in field types
+                                field_types.iter()
+                                    .map(|ft| self.substitute_type_params(ft, &type_params, &type_args))
+                                    .collect()
+                            } else {
+                                vec![]
+                            }
+                        } else {
+                            vec![]
+                        }
+                    } else {
+                        vec![]
+                    }
+                } else {
+                    vec![]
+                };
+                
                 let mut typed_fields = Vec::new();
-                for p in fields {
-                    let var = self.ctx.fresh_var();
-                    typed_fields.push(self.check_pattern(p, &var));
+                for (i, p) in fields.iter().enumerate() {
+                    let field_type = variant_field_types.get(i).cloned().unwrap_or_else(|| self.ctx.fresh_var());
+                    typed_fields.push(self.check_pattern(p, &field_type));
                 }
                 TypedPattern::Variant {
                     variant_def: *variant_def,
@@ -2307,6 +2424,18 @@ impl TypeChecker {
                 params: params.iter().map(|p| self.substitute_type_params(p, type_params, type_args)).collect(),
                 ret: Box::new(self.substitute_type_params(ret, type_params, type_args)),
             },
+            Type::Struct { def_id, type_args: struct_type_args } => Type::Struct {
+                def_id: *def_id,
+                type_args: struct_type_args.iter()
+                    .map(|t| self.substitute_type_params(t, type_params, type_args))
+                    .collect(),
+            },
+            Type::Enum { def_id, type_args: enum_type_args } => Type::Enum {
+                def_id: *def_id,
+                type_args: enum_type_args.iter()
+                    .map(|t| self.substitute_type_params(t, type_params, type_args))
+                    .collect(),
+            },
             _ => ty.clone(),
         }
     }
@@ -2319,11 +2448,11 @@ impl TypeChecker {
     /// Check if a type implements a trait
     fn type_implements_trait(&self, ty: &Type, trait_def_id: DefId) -> bool {
         match ty {
-            Type::Struct(struct_def_id) => {
+            Type::Struct { def_id: struct_def_id, .. } => {
                 // Check if there's an impl for this (struct, trait) pair
                 self.trait_impls.contains_key(&(*struct_def_id, trait_def_id))
             }
-            Type::Enum(enum_def_id) => {
+            Type::Enum { def_id: enum_def_id, .. } => {
                 self.trait_impls.contains_key(&(*enum_def_id, trait_def_id))
             }
             // Numeric primitives implicitly implement operator traits

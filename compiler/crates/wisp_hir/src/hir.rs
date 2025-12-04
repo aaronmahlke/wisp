@@ -326,6 +326,7 @@ pub struct ResolvedField {
 pub struct ResolvedEnum {
     pub def_id: DefId,
     pub name: String,
+    pub type_params: Vec<ResolvedTypeParam>,
     pub variants: Vec<ResolvedVariant>,
     pub span: Span,
 }
@@ -351,6 +352,7 @@ pub struct ResolvedTrait {
 /// Resolved impl block
 #[derive(Debug, Clone)]
 pub struct ResolvedImpl {
+    pub type_params: Vec<ResolvedTypeParam>,  // Generic parameters: impl<T, U>
     pub trait_def: Option<DefId>,
     pub trait_type_args: Vec<ResolvedType>,  // Type arguments for trait
     pub target_type: ResolvedType,

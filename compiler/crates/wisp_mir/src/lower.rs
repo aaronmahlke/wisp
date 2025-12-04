@@ -2,7 +2,7 @@
 
 use crate::mir::*;
 use wisp_hir::DefId;
-use wisp_types::{Type, TypeContext, TypedBlock, TypedElse, TypedExpr, TypedExprKind, TypedFunction, TypedLambdaParam, TypedProgram, TypedStmt};
+use wisp_types::{Type, TypeContext, TypedBlock, TypedElse, TypedExpr, TypedExprKind, TypedFunction, TypedLambdaParam, TypedPattern, TypedProgram, TypedStmt};
 use std::collections::HashMap;
 
 /// Generate a mangled name for a monomorphized generic function
@@ -29,12 +29,17 @@ fn has_type_param(ty: &Type) -> bool {
 /// Substitute type parameters with concrete types
 fn substitute_type(ty: &Type, type_args: &[Type], type_param_ids: &[DefId]) -> Type {
     match ty {
-        Type::TypeParam(def_id, _) => {
-            // Find the index of this type param
+        Type::TypeParam(def_id, name) => {
+            // First try exact DefId match
             for (i, tp_id) in type_param_ids.iter().enumerate() {
                 if tp_id == def_id {
                     return type_args.get(i).cloned().unwrap_or(ty.clone());
                 }
+            }
+            // If there's only one type param and one type arg, assume they match
+            // This handles cases where the body uses different DefIds than the signature
+            if type_param_ids.len() == 1 && type_args.len() == 1 {
+                return type_args[0].clone();
             }
             ty.clone()
         }
@@ -53,6 +58,14 @@ fn substitute_type(ty: &Type, type_args: &[Type], type_param_ids: &[DefId]) -> T
         Type::Function { params, ret } => Type::Function {
             params: params.iter().map(|p| substitute_type(p, type_args, type_param_ids)).collect(),
             ret: Box::new(substitute_type(ret, type_args, type_param_ids)),
+        },
+        Type::Enum { def_id, type_args: enum_type_args } => Type::Enum {
+            def_id: *def_id,
+            type_args: enum_type_args.iter().map(|t| substitute_type(t, type_args, type_param_ids)).collect(),
+        },
+        Type::Struct { def_id, type_args: struct_type_args } => Type::Struct {
+            def_id: *def_id,
+            type_args: struct_type_args.iter().map(|t| substitute_type(t, type_args, type_param_ids)).collect(),
         },
         _ => ty.clone(),
     }
@@ -78,8 +91,22 @@ fn mangle_type(ty: &Type) -> String {
         Type::Str => "str".to_string(),
         Type::Unit => "unit".to_string(),
         Type::Never => "never".to_string(),
-        Type::Struct(def_id) => format!("S{}", def_id.0),
-        Type::Enum(def_id) => format!("E{}", def_id.0),
+        Type::Struct { def_id, type_args } => {
+            if type_args.is_empty() {
+                format!("S{}", def_id.0)
+            } else {
+                let args: Vec<_> = type_args.iter().map(|t| mangle_type(t)).collect();
+                format!("S{}<{}>", def_id.0, args.join(","))
+            }
+        }
+        Type::Enum { def_id, type_args } => {
+            if type_args.is_empty() {
+                format!("E{}", def_id.0)
+            } else {
+                let args: Vec<_> = type_args.iter().map(|t| mangle_type(t)).collect();
+                format!("E{}<{}>", def_id.0, args.join(","))
+            }
+        }
         Type::Ref { is_mut, inner } => {
             let m = if *is_mut { "m" } else { "" };
             format!("R{}{}", m, mangle_type(inner))
@@ -113,6 +140,22 @@ pub fn lower_program(program: &TypedProgram) -> MirProgram {
             def_id: s.def_id,
             name: s.name.clone(),
             fields,
+        });
+    }
+    
+    // Register enums
+    for e in &program.enums {
+        let variants: Vec<_> = e.variants.iter().map(|v| {
+            let field_types: Vec<Type> = v.fields.iter().map(|f| {
+                // Get the resolved type for this field
+                program.ctx.get_def_type(f.def_id).cloned().unwrap_or(Type::Unit)
+            }).collect();
+            (v.name.clone(), v.def_id, field_types)
+        }).collect();
+        mir.enums.insert(e.def_id, MirEnum {
+            def_id: e.def_id,
+            name: e.name.clone(),
+            variants,
         });
     }
 
@@ -158,12 +201,40 @@ pub fn lower_program(program: &TypedProgram) -> MirProgram {
     }
 
     // Lower impl methods - mangle names with the impl type
+    // Also collect generic methods for monomorphization
+    let mut generic_methods: HashMap<DefId, (&TypedFunction, String)> = HashMap::new();
+    
     for imp in &program.impls {
         // Get the type name for name mangling
         let impl_type_name = get_type_name(&imp.target_type, &program.ctx);
         
         for method in &imp.methods {
-            if let Some(result) = lower_function(method, &program.ctx, &extern_statics, Some(&impl_type_name)) {
+            // Check if this method has type parameters (is generic)
+            let is_generic = method.params.iter().any(|p| has_type_param(&p.ty)) 
+                || has_type_param(&method.return_type);
+            
+            if is_generic {
+                // Store for potential monomorphization
+                generic_methods.insert(method.def_id, (method, impl_type_name.clone()));
+            } else {
+                if let Some(result) = lower_function(method, &program.ctx, &extern_statics, Some(&impl_type_name)) {
+                    mir.functions.push(result.main_function);
+                    mir.functions.extend(result.lambda_functions);
+                }
+            }
+        }
+    }
+    
+    // Monomorphize generic impl methods
+    for inst in &program.generic_instantiations {
+        if let Some((method, impl_type_name)) = generic_methods.get(&inst.func_def_id) {
+            if let Some(result) = lower_monomorphized_impl_method(
+                method, 
+                &inst.type_args,
+                impl_type_name,
+                &program.ctx, 
+                &extern_statics
+            ) {
                 mir.functions.push(result.main_function);
                 mir.functions.extend(result.lambda_functions);
             }
@@ -195,11 +266,23 @@ pub fn lower_program(program: &TypedProgram) -> MirProgram {
 /// Get a display name for a type (for name mangling)
 fn get_type_name(ty: &Type, ctx: &TypeContext) -> String {
     match ty {
-        Type::Struct(def_id) => {
-            ctx.get_type_name(*def_id).unwrap_or_else(|| format!("struct_{}", def_id.0))
+        Type::Struct { def_id, type_args } => {
+            let name = ctx.get_type_name(*def_id).unwrap_or_else(|| format!("struct_{}", def_id.0));
+            if type_args.is_empty() {
+                name
+            } else {
+                let args: Vec<_> = type_args.iter().map(|t| get_type_name(t, ctx)).collect();
+                format!("{}<{}>", name, args.join(", "))
+            }
         }
-        Type::Enum(def_id) => {
-            ctx.get_type_name(*def_id).unwrap_or_else(|| format!("enum_{}", def_id.0))
+        Type::Enum { def_id, type_args } => {
+            let name = ctx.get_type_name(*def_id).unwrap_or_else(|| format!("enum_{}", def_id.0));
+            if type_args.is_empty() {
+                name
+            } else {
+                let args: Vec<_> = type_args.iter().map(|t| get_type_name(t, ctx)).collect();
+                format!("{}<{}>", name, args.join(", "))
+            }
         }
         // Primitive types
         Type::I8 => "i8".to_string(),
@@ -266,6 +349,32 @@ fn lower_monomorphized_function(
     })
 }
 
+/// Lower a monomorphized version of a generic impl method
+fn lower_monomorphized_impl_method(
+    method: &TypedFunction, 
+    type_args: &[Type],
+    impl_type_name: &str,
+    ctx: &TypeContext, 
+    extern_statics: &HashMap<DefId, (String, Type)>
+) -> Option<LowerResult> {
+    let body = method.body.as_ref()?;
+
+    // Create substitution info
+    let subst = TypeSubstitution {
+        type_args: type_args.to_vec(),
+        type_param_ids: extract_type_param_ids(method),
+    };
+
+    let mut lowerer = FunctionLowerer::new(method, ctx, extern_statics, Some(impl_type_name), Some(subst));
+    lowerer.lower_body(body);
+
+    let lambda_functions = std::mem::take(&mut lowerer.lambda_functions);
+    Some(LowerResult {
+        main_function: lowerer.finish(),
+        lambda_functions,
+    })
+}
+
 /// Extract type parameter DefIds from a function's signature
 fn extract_type_param_ids(func: &TypedFunction) -> Vec<DefId> {
     let mut ids = Vec::new();
@@ -296,6 +405,11 @@ fn collect_type_param_ids(ty: &Type, ids: &mut Vec<DefId>) {
                 collect_type_param_ids(p, ids);
             }
             collect_type_param_ids(ret, ids);
+        }
+        Type::Enum { type_args, .. } | Type::Struct { type_args, .. } => {
+            for t in type_args {
+                collect_type_param_ids(t, ids);
+            }
         }
         _ => {}
     }
@@ -535,7 +649,7 @@ impl<'a> FunctionLowerer<'a> {
                 
                 // For struct types, the + operator should call the Add::add method
                 // This happens when monomorphizing generic functions with operator trait bounds
-                if let Type::Struct(struct_def_id) = &left_ty {
+                if let Type::Struct { def_id: struct_def_id, .. } = &left_ty {
                     let method_name = match op {
                         wisp_ast::BinOp::Add => Some("add"),
                         wisp_ast::BinOp::Sub => Some("sub"),
@@ -622,6 +736,23 @@ impl<'a> FunctionLowerer<'a> {
             }
 
             TypedExprKind::Call { callee, args } => {
+                // Check if this is an enum variant constructor
+                if let TypedExprKind::Var { def_id, .. } = &callee.kind {
+                    if let Some((enum_def_id, variant_idx)) = self.ctx.is_enum_variant(*def_id) {
+                        // This is an enum variant constructor - generate Aggregate instead of Call
+                        let arg_ops: Vec<_> = args.iter().map(|a| self.lower_expr(a)).collect();
+                        let temp = self.new_temp(expr.ty.clone());
+                        self.assign(
+                            Place::local(temp),
+                            Rvalue::Aggregate {
+                                kind: AggregateKind::Enum(enum_def_id, variant_idx, *def_id),
+                                operands: arg_ops,
+                            }
+                        );
+                        return Operand::Copy(Place::local(temp));
+                    }
+                }
+                
                 let func_op = self.lower_expr(callee);
                 let arg_ops: Vec<_> = args.iter().map(|a| self.lower_expr(a)).collect();
 
@@ -642,6 +773,20 @@ impl<'a> FunctionLowerer<'a> {
             }
             
             TypedExprKind::GenericCall { func_def_id, type_args, args } => {
+                // Check if this is a generic enum variant constructor (e.g., Some<i32>(42))
+                if let Some((enum_def_id, variant_idx)) = self.ctx.is_enum_variant(*func_def_id) {
+                    let arg_ops: Vec<_> = args.iter().map(|a| self.lower_expr(a)).collect();
+                    let temp = self.new_temp(expr.ty.clone());
+                    self.assign(
+                        Place::local(temp),
+                        Rvalue::Aggregate {
+                            kind: AggregateKind::Enum(enum_def_id, variant_idx, *func_def_id),
+                            operands: arg_ops,
+                        }
+                    );
+                    return Operand::Copy(Place::local(temp));
+                }
+                
                 // Generate a mangled name for the monomorphized function
                 let base_name = self.ctx.get_type_name(*func_def_id).unwrap_or_default();
                 let mangled_name = mangle_generic_name(&base_name, type_args);
@@ -671,46 +816,72 @@ impl<'a> FunctionLowerer<'a> {
                 // Lower the receiver
                 let receiver_op = self.lower_expr(receiver);
                 
-                // Create a reference to the receiver for &self or &mut self parameter
-                // The receiver needs to be a place to take a reference
-                let receiver_ref = match receiver_op {
-                    Operand::Copy(place) | Operand::Move(place) => {
-                        // Create a temp to hold the reference
-                        let ref_ty = Type::Ref { 
-                            is_mut: *is_mut_self, 
-                            inner: Box::new(receiver.ty.clone()) 
-                        };
-                        let ref_temp = self.new_temp(ref_ty);
-                        self.assign(
-                            Place::local(ref_temp),
-                            Rvalue::Ref { is_mut: *is_mut_self, place }
-                        );
-                        Operand::Copy(Place::local(ref_temp))
+                // Check if method takes self by value or by reference
+                let takes_ref_self = self.ctx.get_def_type(*method_def_id)
+                    .map(|t| {
+                        if let Type::Function { params, .. } = t {
+                            params.first().map(|p| matches!(p, Type::Ref { .. })).unwrap_or(false)
+                        } else {
+                            false
+                        }
+                    })
+                    .unwrap_or(false);
+                
+                // Create receiver argument based on method signature
+                let receiver_arg = if takes_ref_self {
+                    // Method takes &self or &mut self - create a reference
+                    match receiver_op {
+                        Operand::Copy(place) | Operand::Move(place) => {
+                            let ref_ty = Type::Ref { 
+                                is_mut: *is_mut_self, 
+                                inner: Box::new(receiver.ty.clone()) 
+                            };
+                            let ref_temp = self.new_temp(ref_ty);
+                            self.assign(
+                                Place::local(ref_temp),
+                                Rvalue::Ref { is_mut: *is_mut_self, place }
+                            );
+                            Operand::Copy(Place::local(ref_temp))
+                        }
+                        Operand::Constant(_) => {
+                            // Constants can't be referenced directly - store to temp first
+                            let temp = self.new_temp(receiver.ty.clone());
+                            self.assign(Place::local(temp), Rvalue::Use(receiver_op));
+                            let ref_ty = Type::Ref { 
+                                is_mut: *is_mut_self, 
+                                inner: Box::new(receiver.ty.clone()) 
+                            };
+                            let ref_temp = self.new_temp(ref_ty);
+                            self.assign(
+                                Place::local(ref_temp),
+                                Rvalue::Ref { is_mut: *is_mut_self, place: Place::local(temp) }
+                            );
+                            Operand::Copy(Place::local(ref_temp))
+                        }
                     }
-                    Operand::Constant(_) => {
-                        // Constants can't be referenced directly - store to temp first
-                        let temp = self.new_temp(receiver.ty.clone());
-                        self.assign(Place::local(temp), Rvalue::Use(receiver_op));
-                        let ref_ty = Type::Ref { 
-                            is_mut: *is_mut_self, 
-                            inner: Box::new(receiver.ty.clone()) 
-                        };
-                        let ref_temp = self.new_temp(ref_ty);
-                        self.assign(
-                            Place::local(ref_temp),
-                            Rvalue::Ref { is_mut: *is_mut_self, place: Place::local(temp) }
-                        );
-                        Operand::Copy(Place::local(ref_temp))
-                    }
+                } else {
+                    // Method takes self by value - pass directly
+                    receiver_op
                 };
                 
                 // Lower the other arguments
-                let mut arg_ops: Vec<_> = vec![receiver_ref];
+                let mut arg_ops: Vec<_> = vec![receiver_arg];
                 arg_ops.extend(args.iter().map(|a| self.lower_expr(a)));
                 
                 // Get method name for the function reference
                 let method_name = self.ctx.get_type_name(*method_def_id).unwrap_or_default();
-                let func_op = Operand::Constant(Constant::FnPtr(*method_def_id, method_name));
+                
+                // Check if receiver has type arguments - if so, we need a monomorphized function call
+                let func_op = match &receiver.ty {
+                    Type::Enum { type_args, .. } | Type::Struct { type_args, .. } if !type_args.is_empty() => {
+                        // This is a generic type instantiation - use monomorphized function
+                        let mangled_name = mangle_generic_name(&method_name, type_args);
+                        Operand::Constant(Constant::MonomorphizedFn(*method_def_id, mangled_name, type_args.clone()))
+                    }
+                    _ => {
+                        Operand::Constant(Constant::FnPtr(*method_def_id, method_name))
+                    }
+                };
 
                 let temp = self.new_temp(expr.ty.clone());
                 
@@ -1175,12 +1346,16 @@ impl<'a> FunctionLowerer<'a> {
             }
 
             TypedExprKind::Match { scrutinee, arms } => {
+                // Lower scrutinee and store it in a temp so we can extract fields
                 let scrut_op = self.lower_expr(scrutinee);
+                let scrut_ty = self.subst_type(&scrutinee.ty);
+                let scrut_local = self.new_temp(scrut_ty.clone());
+                self.assign(Place::local(scrut_local), Rvalue::Use(scrut_op));
+                
                 let result = self.new_temp(expr.ty.clone());
                 let merge_bb = self.new_block();
                 
                 // For now, simple pattern matching on enum discriminants
-                // This is a simplified version - full pattern matching is complex
                 let mut targets = Vec::new();
                 let mut arm_blocks = Vec::new();
                 
@@ -1193,13 +1368,34 @@ impl<'a> FunctionLowerer<'a> {
                 let otherwise = arm_blocks.last().copied().unwrap_or(merge_bb);
                 
                 self.terminate(Terminator::SwitchInt {
-                    discr: scrut_op,
+                    discr: Operand::Copy(Place::local(scrut_local)),
                     targets: targets[..targets.len().saturating_sub(1)].to_vec(),
                     otherwise,
                 });
                 
                 for (i, arm) in arms.iter().enumerate() {
                     self.switch_to_block(arm_blocks[i]);
+                    
+                    // Handle pattern bindings - extract fields from variant
+                    if let TypedPattern::Variant { fields, .. } = &arm.pattern {
+                        for (field_idx, field_pattern) in fields.iter().enumerate() {
+                            if let TypedPattern::Binding { def_id, ty, .. } = field_pattern {
+                                // Create a local for the binding
+                                let binding_local = self.new_temp(self.subst_type(ty));
+                                self.def_to_local.insert(*def_id, binding_local);
+                                
+                                // Extract the field from the scrutinee
+                                // For enums, field 0 is the discriminant, so payload starts at field 1
+                                let field_place = Place::local(scrut_local)
+                                    .field(field_idx + 1, format!("_{}", field_idx));
+                                self.assign(
+                                    Place::local(binding_local),
+                                    Rvalue::Use(Operand::Copy(field_place))
+                                );
+                            }
+                        }
+                    }
+                    
                     let arm_val = self.lower_expr(&arm.body);
                     self.assign(Place::local(result), Rvalue::Use(arm_val));
                     self.terminate(Terminator::Goto { target: merge_bb });
@@ -1262,9 +1458,9 @@ impl<'a> FunctionLowerer<'a> {
     fn get_field_index(&self, ty: &Type, field_name: &str) -> Option<usize> {
         // Handle both direct struct types and references to structs
         let struct_def_id = match ty {
-            Type::Struct(def_id) => Some(*def_id),
+            Type::Struct { def_id, .. } => Some(*def_id),
             Type::Ref { inner, .. } => {
-                if let Type::Struct(def_id) = inner.as_ref() {
+                if let Type::Struct { def_id, .. } = inner.as_ref() {
                     Some(*def_id)
                 } else {
                     None

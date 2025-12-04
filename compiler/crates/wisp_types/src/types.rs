@@ -26,10 +26,10 @@ pub enum Type {
     /// Never type (for diverging expressions)
     Never,
     
-    /// User-defined struct
-    Struct(DefId),
-    /// User-defined enum
-    Enum(DefId),
+    /// User-defined struct with type arguments
+    Struct { def_id: DefId, type_args: Vec<Type> },
+    /// User-defined enum with type arguments
+    Enum { def_id: DefId, type_args: Vec<Type> },
     
     /// Reference type
     Ref { is_mut: bool, inner: Box<Type> },
@@ -126,8 +126,24 @@ impl Type {
             Type::Str => "str".to_string(),
             Type::Unit => "()".to_string(),
             Type::Never => "!".to_string(),
-            Type::Struct(id) => ctx.get_type_name(*id).unwrap_or_else(|| format!("struct#{}", id.0)),
-            Type::Enum(id) => ctx.get_type_name(*id).unwrap_or_else(|| format!("enum#{}", id.0)),
+            Type::Struct { def_id, type_args } => {
+                let name = ctx.get_type_name(*def_id).unwrap_or_else(|| format!("struct#{}", def_id.0));
+                if type_args.is_empty() {
+                    name
+                } else {
+                    let args: Vec<_> = type_args.iter().map(|t| t.display(ctx)).collect();
+                    format!("{}<{}>", name, args.join(", "))
+                }
+            }
+            Type::Enum { def_id, type_args } => {
+                let name = ctx.get_type_name(*def_id).unwrap_or_else(|| format!("enum#{}", def_id.0));
+                if type_args.is_empty() {
+                    name
+                } else {
+                    let args: Vec<_> = type_args.iter().map(|t| t.display(ctx)).collect();
+                    format!("{}<{}>", name, args.join(", "))
+                }
+            }
             Type::Ref { is_mut, inner } => {
                 let mut_str = if *is_mut { "mut " } else { "" };
                 format!("&{}{}", mut_str, inner.display(ctx))
@@ -276,7 +292,7 @@ impl TypeContext {
             if type_name == name {
                 // Check if this is a struct
                 if self.struct_fields.contains_key(def_id) {
-                    return Some(Type::Struct(*def_id));
+                    return Some(Type::Struct { def_id: *def_id, type_args: vec![] });
                 }
             }
         }
@@ -319,6 +335,18 @@ impl TypeContext {
     /// Get enum variants
     pub fn get_enum_variants(&self, enum_id: DefId) -> Option<&[(String, DefId, Vec<Type>)]> {
         self.enum_variants.get(&enum_id).map(|v| v.as_slice())
+    }
+    
+    /// Check if a DefId is an enum variant constructor, and if so return (enum_def_id, variant_index)
+    pub fn is_enum_variant(&self, variant_def_id: DefId) -> Option<(DefId, usize)> {
+        for (&enum_id, variants) in &self.enum_variants {
+            for (idx, (_, vdef_id, _)) in variants.iter().enumerate() {
+                if *vdef_id == variant_def_id {
+                    return Some((enum_id, idx));
+                }
+            }
+        }
+        None
     }
 
     /// Create a fresh type variable
@@ -383,6 +411,9 @@ impl TypeContext {
             // Error type unifies with anything
             (Type::Error, _) | (_, Type::Error) => Ok(()),
             
+            // Never type unifies with anything (diverging code can have any type)
+            (Type::Never, _) | (_, Type::Never) => Ok(()),
+            
             // Reference types
             (Type::Ref { is_mut: m1, inner: i1 }, Type::Ref { is_mut: m2, inner: i2 }) => {
                 if m1 != m2 {
@@ -426,6 +457,34 @@ impl TypeContext {
                 self.unify(r1, r2)
             }
             
+            // Struct types with type arguments
+            (Type::Struct { def_id: d1, type_args: a1 }, Type::Struct { def_id: d2, type_args: a2 }) => {
+                if d1 != d2 {
+                    return Err(format!("struct mismatch: {:?} vs {:?}", d1, d2));
+                }
+                if a1.len() != a2.len() {
+                    return Err(format!("type argument count mismatch: {} vs {}", a1.len(), a2.len()));
+                }
+                for (arg1, arg2) in a1.iter().zip(a2.iter()) {
+                    self.unify(arg1, arg2)?;
+                }
+                Ok(())
+            }
+            
+            // Enum types with type arguments
+            (Type::Enum { def_id: d1, type_args: a1 }, Type::Enum { def_id: d2, type_args: a2 }) => {
+                if d1 != d2 {
+                    return Err(format!("enum mismatch: {:?} vs {:?}", d1, d2));
+                }
+                if a1.len() != a2.len() {
+                    return Err(format!("type argument count mismatch: {} vs {}", a1.len(), a2.len()));
+                }
+                for (arg1, arg2) in a1.iter().zip(a2.iter()) {
+                    self.unify(arg1, arg2)?;
+                }
+                Ok(())
+            }
+            
             // Mismatch
             _ => Err(format!("type mismatch: {} vs {}", a.display(self), b.display(self))),
         }
@@ -456,6 +515,7 @@ pub fn parse_type_name(name: &str) -> Option<Type> {
         "bool" => Some(Type::Bool),
         "char" => Some(Type::Char),
         "str" => Some(Type::Str),
+        "Never" => Some(Type::Never),
         _ => None,
     }
 }

@@ -4,4 +4,5 @@
 pub import std.io as io
 pub import std.string as string
 pub import std.ops as ops
+pub import std.option as option
 

@@ -11,6 +11,7 @@ pub struct MirProgram {
     pub extern_functions: Vec<MirExternFunction>,
     pub extern_statics: Vec<MirExternStatic>,
     pub structs: HashMap<DefId, MirStruct>,
+    pub enums: HashMap<DefId, MirEnum>,
 }
 
 /// A MIR extern function declaration
@@ -37,6 +38,7 @@ impl MirProgram {
             extern_functions: Vec::new(),
             extern_statics: Vec::new(),
             structs: HashMap::new(),
+            enums: HashMap::new(),
         }
     }
 
@@ -85,6 +87,61 @@ pub struct MirStruct {
     pub def_id: DefId,
     pub name: String,
     pub fields: Vec<(String, Type)>,
+}
+
+/// A MIR enum definition
+#[derive(Debug, Clone)]
+pub struct MirEnum {
+    pub def_id: DefId,
+    pub name: String,
+    /// Variants: (name, variant_def_id, field_types)
+    pub variants: Vec<(String, DefId, Vec<Type>)>,
+}
+
+impl MirEnum {
+    /// Get the size of the discriminant (always i64 for simplicity)
+    pub fn discriminant_size(&self) -> u32 {
+        8 // Use i64 for discriminant
+    }
+    
+    /// Get the size of the largest variant's payload
+    pub fn max_payload_size(&self) -> u32 {
+        self.variants.iter()
+            .map(|(_, _, fields)| {
+                fields.iter().map(|ty| type_size(ty)).sum::<u32>()
+            })
+            .max()
+            .unwrap_or(0)
+    }
+    
+    /// Total enum size: discriminant + max payload (aligned)
+    pub fn total_size(&self) -> u32 {
+        let disc = self.discriminant_size();
+        let payload = self.max_payload_size();
+        // Align payload to 8 bytes
+        disc + ((payload + 7) / 8) * 8
+    }
+    
+    /// Get payload offset (after discriminant)
+    pub fn payload_offset(&self) -> u32 {
+        self.discriminant_size()
+    }
+}
+
+/// Helper to get type size (basic approximation)
+fn type_size(ty: &Type) -> u32 {
+    match ty {
+        Type::I8 | Type::U8 | Type::Bool => 1,
+        Type::I16 | Type::U16 => 2,
+        Type::I32 | Type::U32 | Type::Char => 4,
+        Type::I64 | Type::U64 | Type::Str => 8,
+        Type::F32 => 4,
+        Type::F64 => 8,
+        Type::Ref { .. } => 8, // Pointers are 8 bytes
+        Type::Struct { .. } | Type::Enum { .. } => 8, // Passed as pointers
+        Type::TypeParam(_, _) => 8, // Assume pointer-sized for generics
+        _ => 8, // Default to 8
+    }
 }
 
 /// A MIR function
@@ -290,6 +347,8 @@ pub enum AggregateKind {
     Tuple,
     Array,
     Struct(DefId, String),
+    /// Enum variant: (enum DefId, variant index, variant DefId)
+    Enum(DefId, usize, DefId),
 }
 
 /// An operand (value that can be used)
